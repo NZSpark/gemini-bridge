@@ -2,6 +2,7 @@
 
 from typing import Any, Dict, List, Optional
 
+from . import config
 from .models import ChatMessage
 from .toolcalls import format_tool_call_emphasis, format_tools_instruction
 
@@ -94,13 +95,39 @@ def _last_assistant_index(messages: List[ChatMessage]) -> int:
     return last
 
 
+def _is_harness_noise(m: ChatMessage) -> bool:
+    """harness 注入的元提示（如 Codex 的“生成任务标题”请求）与环境包装块
+    都不是真实对话内容，播种/增量时都不应重放。"""
+    from .tasks import _is_environment_wrapper, _is_meta_prompt
+
+    text = _content_to_text(m.content)
+    return _is_meta_prompt(text) or _is_environment_wrapper(text)
+
+
 def _run_messages(messages: List[ChatMessage]) -> List[ChatMessage]:
-    """取出“最后一条 assistant 之后”的新增消息。"""
+    """取出“最后一条 assistant 之后”的新增消息。
+
+    harness（Codex / Pi）每轮会把完整系统提示作为 system 消息重新发来，也会
+    内联“生成任务标题”之类的元提示与 ``<environment_context>`` 环境块。这些
+    都不是用户真正说的话，增量发送时必须丢弃，否则每轮都会把它们当成新指令
+    重发一遍。
+    """
     last_assistant = _last_assistant_index(messages)
     delta = messages[last_assistant + 1:] if last_assistant >= 0 else messages
+    # 增量模式下 system 消息一律丢弃：harness 每轮重发完整系统提示，而网页
+    # 会话早已带着它，没必要也不应该把上万字的系统提示当新指令再发一遍。
+    delta = [
+        m
+        for m in delta
+        if m.role != "system" and not _is_harness_noise(m)
+    ]
     if not delta:
-        # 兜底：没有新消息时，退回最后一条 user 消息
-        delta = [m for m in messages if m.role == "user"][-1:]
+        # 兜底：没有新消息时，退回最后一条真实 user 消息
+        delta = [
+            m
+            for m in messages
+            if m.role == "user" and not _is_harness_noise(m)
+        ][-1:]
     return delta
 
 
@@ -112,12 +139,35 @@ def _seed_messages(messages: List[ChatMessage], max_chars: int):
 
     :return: (system 消息, 保留的其余消息, 是否发生了截断)
     """
-    systems = [m for m in messages if m.role == "system"]
-    rest = [m for m in messages if m.role != "system"]
+    systems = [m for m in messages if m.role == "system" and not _is_harness_noise(m)]
+    rest = [m for m in messages if m.role != "system" and not _is_harness_noise(m)]
+
+    truncated = False
+
+    # system 消息同样计入预算。harness（Codex / Pi）每轮都把完整系统提示作为
+    # system 消息发来，常达上万字；若像以前那样“原样全发”，播种 prompt 就会被
+    # 这段系统提示灌满，用户的真实请求被淹没。这里逐条按 SEED_SYSTEM_MAX_CHARS
+    # 截断，并从最旧的开始丢弃，直到 system 总量不超过总预算的一半。
+    system_budget = max_chars // 2
+    per_system_limit = config.SEED_SYSTEM_MAX_CHARS
+    systems = list(reversed(systems))  # 保留最近的 system
+    kept_systems: List[ChatMessage] = []
+    system_used = 0
+    for message in systems:
+        text = _content_to_text(message.content)
+        if per_system_limit and len(text) > per_system_limit:
+            text = text[:per_system_limit] + "…（系统提示已截断）"
+            truncated = True
+        size = len(text)
+        if kept_systems and system_used + size > system_budget:
+            truncated = True
+            break
+        kept_systems.append(ChatMessage(role="system", content=text))
+        system_used += size
+    kept_systems.reverse()
 
     kept: List[ChatMessage] = []
-    used = sum(len(_content_to_text(m.content)) for m in systems)
-    truncated = False
+    used = system_used
     for message in reversed(rest):
         size = len(_content_to_text(message.content))
         if kept and used + size > max_chars:
@@ -126,7 +176,7 @@ def _seed_messages(messages: List[ChatMessage], max_chars: int):
         kept.append(message)
         used += size
     kept.reverse()
-    return systems, kept, truncated
+    return kept_systems, kept, truncated
 
 
 def build_prompt(

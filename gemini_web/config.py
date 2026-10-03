@@ -149,6 +149,10 @@ BUCKET_LOCK_TIMEOUT_S = env_float("BUCKET_LOCK_TIMEOUT_S", 0)
 READY_TIMEOUT_MS = env_int("READY_TIMEOUT_MS", 15000)
 # 播种（新会话时重放历史）的最大字符数预算；超出时保留最近的消息
 SEED_MAX_CHARS = env_int("SEED_MAX_CHARS", 12000)
+# 播种时**单条 system 消息**的最大字符数。harness（Codex / Pi）每轮都会把
+# 完整的系统提示作为 system 消息发来，动辄上万字；播种时若原样重放，
+# 会把简单请求灌成一大段系统提示。超出即截断。0 = 不限制（不推荐）。
+SEED_SYSTEM_MAX_CHARS = env_int("SEED_SYSTEM_MAX_CHARS", 2000)
 # 网页会话超过以下任一阈值后，下一轮自动轮转到新会话（0 表示禁用该维度）
 SESSION_MAX_TURNS = env_int("SESSION_MAX_TURNS", 60)
 SESSION_MAX_TOKENS = env_int("SESSION_MAX_TOKENS", 60000)

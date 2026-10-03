@@ -98,7 +98,19 @@ def _is_environment_wrapper(text: str) -> bool:
 # 一旦被存成 goal，新 bucket 播种时会以「任务目标：」的口吻重新注入，
 # 模型就会转去写摘要 JSON，真实任务因此中断。
 _META_PROMPT_RE = re.compile(
-    r"write a brief catch-up|return json with summary|\bnext_action\b",
+    r"write a brief catch-up"
+    r"|return json with summary"
+    r"|\bnext_action\b"
+    # Codex CLI 每轮会先发一条“生成任务标题”的元提示；它不是用户意图，
+    # 一旦被当成 goal 存下，播种时会以「任务目标：」口吻重新注入，污染任务。
+    r"|generate a concise,? single-line task title"
+    r"|single-line task title"
+    r"|do not answer the request"
+    r"|只生成.*标题|生成.*任务标题"
+    # “只回复/仅输出 N 个字”这类输出约束通常是 harness 自测/元任务的残留，
+    # 不是用户的真实任务；一旦被存成 goal，播种时会以「任务目标：」口吻注入，
+    # 与真实请求冲突（模型会照着字数约束只回一句话）。
+    r"|只回复|仅回复|只输出|仅输出|只回复\S{0,4}字|回复\S{0,4}字",
     re.IGNORECASE,
 )
 

@@ -262,6 +262,61 @@ async def debug_dom():
     }
 
 
+@app.get("/debug/snippet", include_in_schema=False)
+async def debug_snippet():
+    """临时诊断：dump 最新回复节点里代码块 (pre/code) 的结构与复制按钮。
+
+    仅 GEMINI_DEBUG=1 时可用。用于定位 Gemini 把 tool_call 渲染成 Code snippet 后，
+    究竟把原始 JSON 放在哪里（inner_text / textContent / 复制按钮的剪贴板）。
+    """
+    if not config.DEBUG:
+        raise HTTPException(status_code=404, detail="调试端点默认关闭")
+    if driver.page is None:
+        raise HTTPException(status_code=503, detail="浏览器尚未初始化")
+
+    js = r"""
+    (selectors) => {
+      const nodes = document.querySelectorAll(selectors);
+      let last = null;
+      for (let i = nodes.length - 1; i >= 0; i--) {
+        const t = (nodes[i].innerText || '').trim();
+        if (t) { last = nodes[i]; break; }
+      }
+      if (!last) return {found: false};
+      const pres = last.querySelectorAll('pre');
+      const blocks = [];
+      for (const pre of pres) {
+        const code = pre.querySelector('code');
+        const target = code || pre;
+        // 收集 pre/code 附近（其父级往上两层内）的所有按钮类控件
+        const scope = pre.closest('div') || pre.parentElement || pre;
+        const btns = [];
+        const cand = scope.querySelectorAll('button,[role=button],mat-icon,[aria-label],[data-test-id]');
+        for (const b of cand) {
+          btns.push({
+            tag: b.tagName.toLowerCase(),
+            cls: b.className || '',
+            aria: b.getAttribute('aria-label') || '',
+            title: b.getAttribute('title') || '',
+            dataTestId: b.getAttribute('data-test-id') || '',
+            text: (b.innerText || '').trim().slice(0, 40),
+          });
+        }
+        blocks.push({
+          codeClass: code ? (code.className || '') : null,
+          innerText: target.innerText,
+          textContent: target.textContent,
+          preOuterHead: pre.outerHTML.slice(0, 300),
+          buttons: btns,
+        });
+      }
+      return {found: true, preCount: pres.length, blocks};
+    }
+    """
+    data = await driver.page.evaluate(js, config.RESPONSE_SELECTORS)
+    return data
+
+
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def chat_completions(
     request: ChatCompletionRequest,
