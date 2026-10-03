@@ -106,7 +106,7 @@ class ChatIOMixin:
                 if lang_match:
                     lang = lang_match.group(1)
 
-            code_content = await (code_tag or code_el).inner_text()
+            code_content = await self._complete_text(code_tag or code_el)
             clean_code = re.sub(
                 r'^(?:' + lang + r'|bash|python|json|html|javascript)?\s*(?:Copy|Download)\s*\n',
                 '', code_content, flags=re.IGNORECASE
@@ -114,6 +114,75 @@ class ChatIOMixin:
 
             extracted.append({"lang": lang, "code": clean_code})
         return extracted
+
+    # 读取回复节点完整文本的 JS：Gemini 把流式回复按 token 渲染成一串
+    # <span class="animating">，带逐字显现动画。Playwright 的 inner_text() 遵循
+    # **渲染后**可见性，动画未走完的 token 取不到——表现为文本在引号/冒号处被截断
+    # （TOOL_CALL 的 JSON 参数被切掉半截）。这里在克隆节点上移除动画类与 animation
+    # 样式，挂到屏幕外再读 innerText，既拿到完整文本，又保留块级换行。
+    _COMPLETE_TEXT_JS = """
+    (node) => {
+      const clone = node.cloneNode(true);
+      clone.querySelectorAll('.animating, .pending, .revealing, .fade-in')
+        .forEach(e => e.classList.remove('animating', 'pending', 'revealing', 'fade-in'));
+      clone.querySelectorAll('[style]').forEach(e => {
+        e.style.animation = 'none';
+        e.style.opacity = '1';
+        e.style.visibility = 'visible';
+        e.style.filter = 'none';
+        e.style.transform = 'none';
+      });
+      const holder = document.createElement('div');
+      holder.style.position = 'absolute';
+      holder.style.left = '-99999px';
+      holder.style.top = '0';
+      holder.appendChild(clone);
+      document.body.appendChild(holder);
+      const text = clone.innerText || clone.textContent || '';
+      holder.remove();
+      return text;
+    }
+    """
+
+    async def _complete_text(self, node) -> str:
+        """读取回复节点的完整文本（绕过 Gemini 逐 token 显现动画导致的截断）。
+
+        失败时退回 text_content（无块级换行但一定完整），再退回 inner_text。
+        """
+        if node is None:
+            return ""
+        try:
+            text = await node.evaluate(self._COMPLETE_TEXT_JS)
+            if text and text.strip():
+                return text
+        except Exception:
+            pass
+        try:
+            text = await node.text_content()
+            if text and text.strip():
+                return text
+        except Exception:
+            pass
+        try:
+            return await node.inner_text()
+        except Exception:
+            return ""
+
+    async def _has_pending_tokens(self, node) -> bool:
+        """回复节点里是否还有尚未显现的 token（span.pending 等）。
+
+        Gemini 流式渲染时，未显现 token 带 .pending / .animating 类，
+        虽已进入 DOM 但 inner_text 取不到。停止按钮消失不代表这些 token
+        已经显现完毕——若此时收尾，会拿到被截断的半截 JSON。
+        """
+        if node is None:
+            return False
+        try:
+            return bool(await node.evaluate(
+                "(n) => !!n.querySelector('.pending, .animating')"
+            ))
+        except Exception:
+            return False
 
     async def _send_chat_locked(self, prompt: str, on_delta=None,
                                 key: Optional[str] = None) -> tuple[str, List[dict]]:
@@ -154,7 +223,7 @@ class ChatIOMixin:
                 before_nodes = await page.query_selector_all(config.RESPONSE_SELECTORS)
                 before_count = len(before_nodes)
                 if before_nodes:
-                    before_text = (await before_nodes[-1].inner_text()).strip()
+                    before_text = (await self._complete_text(before_nodes[-1])).strip()
             except Exception:
                 before_text = ""
 
@@ -191,7 +260,7 @@ class ChatIOMixin:
                 # 恒为空——若直接取 [-1] 会永远读到空串，导致轮询空转到超时。
                 for node in reversed(responses):
                     try:
-                        node_text = await node.inner_text()
+                        node_text = await self._complete_text(node)
                     except Exception:
                         continue
                     if node_text and node_text.strip():
@@ -235,10 +304,17 @@ class ChatIOMixin:
                     if generating:
                         saw_generating = True
                     elif generating is False and saw_generating and normalized:
-                        last_text = current_text
-                        if config.DEBUG:
-                            print(f"[debug] poll={poll} 停止按钮已消失，判定结束")
-                        break
+                        # 停止按钮消失也要确认没有尚未显现的 token，
+                        # 否则会读到被截断的半截回复（如 TOOL_CALL 的 JSON 参数）。
+                        if await self._has_pending_tokens(latest_node):
+                            if config.DEBUG:
+                                print(f"[debug] poll={poll} 停止按钮已消失，但仍有 pending token，继续等待")
+                            # 落到下面的稳定判定 / 下一轮轮询
+                        else:
+                            last_text = current_text
+                            if config.DEBUG:
+                                print(f"[debug] poll={poll} 停止按钮已消失且无 pending，判定结束")
+                            break
 
                     # 2.2 兜底判定：文本一模一样算一轮不变；
                     #     仅长度不再增长也算，但要更保守（多等几轮），

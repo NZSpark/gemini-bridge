@@ -144,6 +144,95 @@ class ParseToolCallsTests(unittest.TestCase):
         calls = parse_tool_calls(text)
         self.assertEqual(calls[0]["arguments"], {"y": 2})
 
+    def test_unescaped_inner_quotes_repaired(self):
+        # 模型把 shell 命令里的引号原样写进 JSON 字符串（未转义），
+        # 标准 json.loads 会失败；解析器应尽力修复并保留引号原意。
+        text = (
+            'TOOL_CALL: {"name": "exec_command", "arguments": '
+            '{"cmd": "git commit -m "Update logic" && git push"}}'
+        )
+        calls = parse_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0]["arguments"]["cmd"],
+            'git commit -m "Update logic" && git push',
+        )
+
+    def test_unescaped_inner_quotes_repaired_full_command(self):
+        text = (
+            'TOOL_CALL: {"name": "exec_command", "arguments": {"cmd": '
+            '"git add a.py b.py && git commit -m "msg here" && git push"}}'
+        )
+        calls = parse_tool_calls(text)
+        self.assertEqual(calls[0]["name"], "exec_command")
+        self.assertEqual(
+            calls[0]["arguments"]["cmd"],
+            'git add a.py b.py && git commit -m "msg here" && git push',
+        )
+
+    def test_wellformed_json_still_parses(self):
+        # 修复逻辑只在解析失败时触发，合法输入不受影响。
+        text = 'TOOL_CALL: {"name": "a", "arguments": {"cmd": "echo \\"hi\\""}}'
+        calls = parse_tool_calls(text)
+        self.assertEqual(calls[0]["arguments"]["cmd"], 'echo "hi"')
+
+    def test_markdown_escaped_marker_recovered(self):
+        # Gemini 网页版 markdown 渲染会插入反斜杠：TOOL\_CALL / exec\_command
+        text = 'TOOL\\_CALL: {"name": "exec\\_command", "arguments": {"cmd": "mkdir -p doc"}}'
+        calls = parse_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["name"], "exec_command")
+        self.assertEqual(calls[0]["arguments"]["cmd"], "mkdir -p doc")
+
+    def test_properly_escaped_inner_quotes(self):
+        # 注入指令要求模型把值内双引号转义为 \" ；这是首选、合法的形态。
+        text = (
+            'TOOL_CALL: {"name": "exec_command", "arguments": '
+            '{"cmd": "python -c \\"import os\\""}}'
+        )
+        calls = parse_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["arguments"]["cmd"], 'python -c "import os"')
+
+    def test_redundant_boundary_quotes_stripped(self):
+        # 模型给值又包了一层引号："cmd": ""git status""；应还原为无多余引号。
+        text = (
+            'TOOL_CALL: {"name": "exec_command", "arguments": '
+            '{"cmd": ""git status && git log -n 5 --oneline""}}'
+        )
+        calls = parse_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0]["arguments"]["cmd"],
+            'git status && git log -n 5 --oneline',
+        )
+
+    def test_single_stray_open_quote_recovered(self):
+        # 值开头多一个引号（平衡扫描会失败）："cmd": ""git status"
+        text = (
+            'TOOL_CALL: {"name": "exec_command", "arguments": '
+            '{"cmd": ""git status && git log -n 5 --oneline"}}'
+        )
+        calls = parse_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0]["arguments"]["cmd"],
+            'git status && git log -n 5 --oneline',
+        )
+
+    def test_single_stray_close_quote_recovered(self):
+        # 值结尾多一个引号："cmd": "git status""
+        text = (
+            'TOOL_CALL: {"name": "exec_command", "arguments": '
+            '{"cmd": "git status && git log -n 5 --oneline""}}'
+        )
+        calls = parse_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0]["arguments"]["cmd"],
+            'git status && git log -n 5 --oneline',
+        )
+
 
 class ToToolCallModelsTests(unittest.TestCase):
     def test_arguments_serialized_as_json_string(self):

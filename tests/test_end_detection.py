@@ -34,10 +34,31 @@ class FakeKeyboard:
 
 
 class FakeNode:
-    def __init__(self, text):
+    """假回复节点。
+
+    ``pending`` 模拟 Gemini 逐 token 显现动画：尚未显现的 token 带 .pending，
+    inner_text 取不到它们（只有显现后的前缀），但 text_content 能拿到全文——
+    正是生产环境踩到的截断根因。
+    """
+
+    def __init__(self, text, pending=False):
         self._text = text
+        self._pending = pending
 
     async def inner_text(self):
+        # 模拟：有 pending token 时只能读到已显现的前缀。
+        if self._pending:
+            return self._text[: max(1, len(self._text) // 2)]
+        return self._text
+
+    async def text_content(self):
+        return self._text
+
+    async def evaluate(self, script):
+        # _has_pending_tokens 的探测脚本形如 "(n) => !!n.querySelector('.pending...')"
+        if "querySelector('.pending" in script:
+            return self._pending
+        # _complete_text 的 JS 返回完整文本
         return self._text
 
     async def query_selector_all(self, selector):
@@ -69,9 +90,18 @@ class FakePage:
         index = self.query_calls
         self.query_calls += 1
         if index == 0:
-            return [FakeNode(text) for text in self.baseline]
+            out = []
+            for item in self.baseline:
+                out.append(FakeNode(item[0], pending=item[1]) if isinstance(item, tuple) else FakeNode(item))
+            return out
         texts = self.script[min(index - 1, len(self.script) - 1)]
-        return [FakeNode(text) for text in texts]
+        nodes = []
+        for item in texts:
+            if isinstance(item, tuple):
+                nodes.append(FakeNode(item[0], pending=item[1]))
+            else:
+                nodes.append(FakeNode(item))
+        return nodes
 
     async def evaluate(self, script):
         # 生成中探测脚本返回 bool；上下文到顶探测脚本返回页面文本（这里恒为空串）。
@@ -159,6 +189,38 @@ class GeneratingStateTests(EndDetectionTestCase):
                 with self.assertRaises(GeminiTimeoutError):
                     self.run_chat(driver)
 
+
+
+class PendingTokenTests(EndDetectionTestCase):
+    """真实故障回归：Gemini 逐 token 显现动画导致回复被截断。
+
+    现象：停止按钮一消失就收尾，但此时后面还有 .pending token 未显现，
+    inner_text 只读到半截 JSON（如 TOOL_CALL 的 arguments 被切掉）。
+    修复：1) 读文本走 _complete_text（克隆节点去动画类后取全文）；
+         2) 停止按钮消失时若仍有 pending token 则继续等待。
+    """
+
+    def test_pending_tokens_delay_finish_until_revealed(self):
+        # poll1/2: 仍有 pending，停止按钮已消失也不能收尾；
+        # poll3: pending 清除，读到完整文本。
+        page = FakePage(
+            baseline=["旧"],
+            script=[
+                [("TOOL_CALL: {\"cmd\":", True)],
+                [("TOOL_CALL: {\"cmd\":", True)],
+                [("TOOL_CALL: {\"cmd\": \"echo hi\"}", False)],
+            ],
+            generating=[True, False, False, False],
+        )
+        text, _ = self.run_chat(self.driver_for(page))
+        self.assertEqual(text, 'TOOL_CALL: {"cmd": "echo hi"}')
+
+    def test_complete_text_reads_full_text_when_pending(self):
+        # 即便节点还有 pending，_complete_text 也应拿到全文（text_content 兜底）。
+        driver = self.driver_for(FakePage(baseline=["x"], script=[["x"]]))
+        node = FakeNode("a " + chr(34) + "b" + chr(34) + " c", pending=True)
+        out = asyncio.run(driver._complete_text(node))
+        self.assertEqual(out, "a " + chr(34) + "b" + chr(34) + " c")
 
 if __name__ == "__main__":
     unittest.main()

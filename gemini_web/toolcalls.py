@@ -20,6 +20,11 @@ _TOOL_CALL_LINE_RE = re.compile(r"^[ \t]*TOOL_CALL\s*:\s*", re.IGNORECASE | re.M
 # 仅匹配 "tool_call" / "tool-call" 围栏，避免误伤普通 ```json 代码块。
 # 允许围栏被 DOM/引用符号包裹： ``> ```tool_call `` 这类形态也要能识别。
 _TOOL_CALL_FENCE_RE = re.compile(r"```\s*(tool[-_]call)\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+# Gemini 网页版 markdown 渲染会在标识符里插入转义反斜杠：
+#   TOOL_CALL -> TOOL\_CALL, exec_command -> exec\_command
+# 取回 inner_text 时就带着这些反斜杠。解析前先去掉“反斜杠 + 下划线”的转义，
+# 否则行首标记正则匹配不到，整条调用被丢弃。
+_MD_ESCAPED_CHAR_RE = re.compile(r"\\([_*`~\[\]()#+.!\-])")
 # "json" 围栏仅在内容明显是工具调用时才采纳（兜底，兼容模型不听话的情况）
 _JSON_FENCE_RE = re.compile(r"```json\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 # 网页版偶尔会输出 DSML 风格的工具调用 XML（全角竖线 ｜｜ 包裹的标签），
@@ -79,8 +84,9 @@ def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
         "需要调用工具时，只输出一个或多个如下格式的**纯文本行**（不要用代码围栏、"
         "不要加 ```）：",
         "TOOL_CALL: {\"name\": \"工具名\", \"arguments\": {参数对象}}",
-        "一行一个调用，arguments 必须是合法 JSON；",
-        "一次可输出多行以并行调用多个工具；TOOL_CALL 行之外不要输出多余解释。",
+        "arguments 必须是合法 JSON：字符串里的双引号必须转义成 \\\"（反斜杠+引号），"
+        "不能直接写裸的双引号；",
+        "一行一个调用；一次可输出多行以并行调用多个工具；TOOL_CALL 行之外不要输出多余解释。",
         "如果不需要调用任何工具，请直接给出最终回答，不要输出 TOOL_CALL 行。",
     ]
     return "\n".join(lines)
@@ -96,6 +102,8 @@ def format_tool_call_emphasis() -> str:
         "[输出格式强调] 这是一个新会话（或刚被重置），以下规则本会话持续有效：",
         "需要调用工具时，只输出如下格式的**纯文本行**（不要用代码围栏、不要加 ```）：",
         "TOOL_CALL: {\"name\": \"工具名\", \"arguments\": {参数对象}}",
+        "arguments 必须是合法 JSON：字符串里的双引号必须转义成 \\\"（反斜杠+引号），"
+        "不能直接写裸的双引号；否则网页端会把内容当代码渲染、导致参数被截断。",
         "工具名必须逐字使用 [工具调用说明] 中列出的名字，不要自造 bash / shell 之类的通用名。",
         "禁止输出 <｜DSML｜ ...>、<invoke>/<parameter>、<tool_calls> 等 XML/DSL 标记——它们不会被执行。",
     ])
@@ -211,19 +219,71 @@ def _tool_names(tools: Optional[List[Dict[str, Any]]]) -> set:
     return names
 
 
+def _strip_redundant_value_quotes(raw: str) -> str:
+    """折叠字符串值边界上多余的引号：``"cmd": ""git ...""`` -> ``"cmd": "git ..."``。
+
+    模型（尤其 Gemini）常把参数值**又用一对引号包了一层**，或在值首/尾多写一个
+    引号。这类输入括号是平衡的，但 JSON 非法；表现就是参数值被从第一个引号处
+    截断（解析成空串）或整体解析失败。这里只在**值的开头**（``:`` 之后）和
+    **值的结尾**（``,``/``}``/``]`` 之前）各折叠连续引号，正文中的引号不动。
+    """
+    out = []
+    i = 0
+    n = len(raw)
+    while i < n:
+        ch = raw[i]
+        # 值开头：冒号后跳过空白，若连续 >=2 个引号则只留一个（保留真正的开引号）
+        if ch == ":":
+            out.append(ch)
+            i += 1
+            # 跳过空白
+            while i < n and raw[i] in " \t\r\n":
+                out.append(raw[i])
+                i += 1
+            if i < n and raw[i] == '"':
+                j = i
+                while j < n and raw[j] == '"':
+                    j += 1
+                if j - i >= 2:
+                    # 折叠为单个开引号
+                    out.append('"')
+                    i = j
+                    continue
+            continue
+        # 值结尾：连续 >=2 个引号且后面是结构符/结尾，只留一个（真正的闭引号）。
+        # 注意：若前一个输出字符是反斜杠（转义引号），说明这是正文引号，跳过折叠。
+        if ch == '"':
+            j = i
+            while j < n and raw[j] == '"':
+                j += 1
+            run = j - i
+            k = j
+            while k < n and raw[k] in " \t\r\n":
+                k += 1
+            escaped_prefix = bool(out) and out[-1] == "\\"
+            if run >= 2 and (k >= n or raw[k] in ",}]") and not escaped_prefix:
+                out.append('"')
+                i = j
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _repair_json_quotes(raw: str) -> Optional[Any]:
-    """尽力修复模型输出的非法 JSON（最常见：字符串值里未转义的裸引号）。
+    """尽力修复模型输出的非法 JSON。
 
-    背景：要求模型输出 ``TOOL_CALL: {...}`` 时，它常把 shell 命令里的引号
-    原样写进 JSON 字符串，例如：
-        {"cmd": "git commit -m "Update logic" && git push"}
-    这里的内层 " 没有转义，标准 json.loads 直接失败。
+    两类常见损伤：
+      1. 字符串值里未转义的裸引号：
+         {"cmd": "git commit -m "Update logic" && git push"}
+      2. 值边界多余引号（模型给值又包了一层）：
+         {"cmd": ""git status && git log""}
+         表现为参数值从第一个引号处被截断、或整体解析失败。
 
-    做法：逐字符状态机，在**字符串内部**遇到引号时判断它是“真结束符”还是
-    “正文引号”。判定依据是它后面的第一个非空白字符——若为 JSON 结构符
-    （``:``/``,``/``}``/``]``）或已到结尾，则视为结束；否则视为正文引号并转义。
+    处理顺序：先折叠边界冗余引号，再用转义状态机修内层裸引号。
     只在首次 json.loads 失败后调用，避免影响合法输入。
     """
+    raw = _strip_redundant_value_quotes(raw)
     out = []
     in_string = False
     escaped = False
@@ -314,6 +374,10 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
     if not text:
         return []
 
+    # Gemini 网页版 markdown 渲染会在下划线等字符前插入反斜杠（TOOL\_CALL、
+    # exec\_command），取回 inner_text 时带着这些转义。先还原，再解析。
+    text = _MD_ESCAPED_CHAR_RE.sub(r"\1", text)
+
     calls: List[Dict[str, Any]] = []
 
     def _consume(raw: str, allow_bare_object: bool) -> None:
@@ -350,7 +414,12 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
     #    用 _iter_balanced_objects 逐对象解析，一行一个，天然支持多调用。
     for match in _TOOL_CALL_LINE_RE.finditer(text):
         segment = text[match.end():]
-        for obj in _iter_balanced_objects(segment):
+        objs = list(_iter_balanced_objects(segment))
+        if not objs:
+            # 平衡扫描失败：多半是值边界多/少了一个引号，导致字符串状态错乱、
+            # depth 回不到 0。先用边界引号归一化再扫一遍。
+            objs = list(_iter_balanced_objects(_strip_redundant_value_quotes(segment)))
+        for obj in objs:
             _consume(obj, allow_bare_object=True)
             break
 

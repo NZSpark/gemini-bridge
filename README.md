@@ -58,7 +58,7 @@ print(resp.choices[0].message.content)
 
 ### Pi 接入
 
-Pi 通过 `models.json` 做模型发现，走 OpenAI **Chat Completions**（`/v1/chat/completions`）。
+Pi 通过 `~/.pi/agent/models.json` 做模型发现，走 OpenAI **Chat Completions**（`/v1/chat/completions`）。
 
 在 Pi 的 `models.json` 里加一个指向本服务的模型条目（`baseUrl` 指向 `/v1`，`apiKey` 随便填）：
 
@@ -203,7 +203,9 @@ user_data/                浏览器 profile 与状态（gitignore）
 ## 设计要点
 
 - **不恢复旧会话**：每轮播种重放历史，代价是 token 消耗更高，换来对网页版改版的鲁棒性；用 `tasks.py` 快照保住任务目标。
-- **结束判定偏保守**：双阈值（内容 / 长度）避免把生成中途的长停顿误判成结束。
+- **结束判定偏保守**：双阈值（内容 / 长度）避免把生成中途的长停顿误判成结束；
+  且「停止按钮消失」时若回复节点仍有未显现 token（`.pending`/`.animating`），会继续等待，
+  避免读到被截断的半截回复（读取文本走 `_complete_text`，克隆节点去动画后取全文）。
 - **到顶可区分**：用 `CAP_NOTICE_PATTERNS` 与轮次/token 双阈值判定对话长度上限，不伪装成超时。
 - **选择器外置**：全部集中在 `.env`，网页版改版只改配置、不改代码。
 
@@ -212,6 +214,7 @@ user_data/                浏览器 profile 与状态（gitignore）
 | 现象 | 处理 |
 | --- | --- |
 | 一直判不到结束 | 设 `GEMINI_DEBUG=1` 看轮询日志；确认 `RESPONSE_SELECTORS` 命中 |
+| 工具调用参数被截断（如 JSON 只剩半截） | Gemini 逐 token 显现动画会让 `inner_text()` 取不到未显现的 token；代码已改为 `_complete_text`（去动画类后取全文）并在 `.pending` 清空前不收尾。若仍出现，检查页面是否新增了别的动画类名 |
 | 登录态失效 | `HEADLESS=0` 手动重登，profile 存在 `user_data/` |
 | profile 被占用 | 同一时间只允许一个实例，先 `pkill` 旧进程 |
 | Codex 连接断开 | 调大客户端 `stream_idle_timeout_ms`，或调小 `RESPONSES_KEEPALIVE_S` |
