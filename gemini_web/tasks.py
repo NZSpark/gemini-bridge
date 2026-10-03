@@ -58,6 +58,9 @@ resume 时就会看到“目标 = 另一个项目的 cwd”这种串台错觉。
             # 仅作为兜底：整段对话里若只有环境块，才用它，避免 goal 为空
             fallback = fallback or text
             continue
+        if _is_meta_prompt(text):
+            # 元提示（交接/摘要请求）不是任务目标，也不当兜底
+            continue
         return text[: max(1, config.TASK_GOAL_MAX_CHARS)]
     return fallback[: max(1, config.TASK_GOAL_MAX_CHARS)]
 
@@ -78,6 +81,21 @@ def _is_environment_wrapper(text: str) -> bool:
     return "\n" in stripped or stripped.endswith(">")
 
 
+# 客户端注入的“元提示”（上下文压缩 / 交接摘要请求）：以 user 角色出现在历史里，
+# 要求模型输出 {"summary": ..., "next_action": ...}。它不是用户的真实任务；
+# 一旦被存成 goal，新 bucket 播种时会以「任务目标：」的口吻重新注入，
+# 模型就会转去写摘要 JSON，真实任务因此中断。
+_META_PROMPT_RE = re.compile(
+    r"write a brief catch-up|return json with summary|\bnext_action\b",
+    re.IGNORECASE,
+)
+
+
+def _is_meta_prompt(text: str) -> bool:
+    """是否为客户端注入的摘要/交接类元提示（只看开头，避免长正文误伤）。"""
+    return bool(_META_PROMPT_RE.search((text or "")[:800]))
+
+
 def _recent_texts(messages: List[ChatMessage]) -> List[Dict[str, str]]:
     """最近 N 条消息（role + 文本），滚动保留。"""
     keep = max(0, config.TASK_KEEP_MESSAGES)
@@ -85,7 +103,7 @@ def _recent_texts(messages: List[ChatMessage]) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
     for message in picked:
         text = _content_to_text(message.content).strip()
-        if text and not _is_environment_wrapper(text):
+        if text and not _is_environment_wrapper(text) and not _is_meta_prompt(text):
             out.append({"role": message.role, "text": text})
     return out
 
@@ -111,7 +129,11 @@ def record(bucket: str, messages: List[ChatMessage]) -> None:
     if not config.TASK_SNAPSHOT_ENABLED:
         return
     data = load(bucket)
-    goal = data.get("goal") or _goal_from_messages(messages)
+    goal = data.get("goal") or ""
+    if _is_meta_prompt(goal):
+        # 自愈：早先把元提示误存成了 goal，丢弃并重新挑选真实目标
+        goal = ""
+    goal = goal or _goal_from_messages(messages)
     payload = {
         "namespace": _namespace(),
         "bucket": bucket,
@@ -136,6 +158,8 @@ def resume_block(bucket: str) -> str:
     """
     data = load(bucket)
     goal = (data.get("goal") or "").strip()
+    if _is_meta_prompt(goal):
+        goal = ""  # 污染过的 goal 绝不能以「任务目标：」口吻注入，否则会中断任务
     recent = data.get("recent")
     if not goal and not recent:
         return ""

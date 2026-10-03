@@ -23,7 +23,7 @@ from .driver import (
 from .models import ChatCompletionRequest, ChatCompletionResponse, ChatMessage
 from .prompting import build_prompt, estimate_tokens
 from .responses import ResponsesRequest, handle_responses
-from .toolcalls import parse_tool_calls, to_tool_call_models
+from .toolcalls import format_tool_call_emphasis, parse_tool_calls, to_tool_call_models
 
 __all__ = [
     "config",
@@ -38,6 +38,7 @@ __all__ = [
     "SessionState",
     "build_prompt",
     "estimate_tokens",
+    "format_tool_call_emphasis",
     "parse_tool_calls",
     "to_tool_call_models",
     "ResponsesRequest",

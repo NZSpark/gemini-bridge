@@ -3,7 +3,7 @@
 from typing import Any, Dict, List, Optional
 
 from .models import ChatMessage
-from .toolcalls import format_tools_instruction
+from .toolcalls import format_tool_call_emphasis, format_tools_instruction
 
 
 def _content_to_text(content: Any) -> str:
@@ -160,9 +160,14 @@ def build_prompt(
     else:
         parts = [_render_message(m) for m in _run_messages(messages)]
 
+    use_tools = bool(tools) and tool_choice != "none"
+    if seed and use_tools:
+        # 新 bucket / 重置后的第一轮：把带围栏示例的格式强调块放在播种开头，
+        # 模型最容易在这种时候退回原生 DSML 标记，双保险。
+        parts.insert(1, format_tool_call_emphasis())
+
     prompt = "\n\n".join(part for part in parts if part).strip()
 
-    use_tools = bool(tools) and tool_choice != "none"
     if use_tools:
         prompt = (prompt + "\n\n" + format_tools_instruction(tools)).strip()
 

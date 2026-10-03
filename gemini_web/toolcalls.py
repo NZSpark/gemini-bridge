@@ -13,8 +13,13 @@ from typing import Any, Dict, List, Optional
 
 from .models import FunctionCall, ToolCall
 
-# 仅匹配 "tool_call" / "tool-call" 围栏，避免误伤普通 ```json 代码块
-_TOOL_CALL_FENCE_RE = re.compile(r"```(tool[-_]call)\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+# 当前注入格式：行首 ``TOOL_CALL:`` 纯文本标记（大小写不敏感）。
+# 只认行首（允许前导空白），避免正文里偶然出现的 "TOOL_CALL:" 被误触发；
+# 后续 JSON 由 _iter_balanced_objects 从冒号之后开始扫。
+_TOOL_CALL_LINE_RE = re.compile(r"^[ \t]*TOOL_CALL\s*:\s*", re.IGNORECASE | re.MULTILINE)
+# 仅匹配 "tool_call" / "tool-call" 围栏，避免误伤普通 ```json 代码块。
+# 允许围栏被 DOM/引用符号包裹： ``> ```tool_call `` 这类形态也要能识别。
+_TOOL_CALL_FENCE_RE = re.compile(r"```\s*(tool[-_]call)\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 # "json" 围栏仅在内容明显是工具调用时才采纳（兜底，兼容模型不听话的情况）
 _JSON_FENCE_RE = re.compile(r"```json\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 # 网页版偶尔会输出 DSML 风格的工具调用 XML（全角竖线 ｜｜ 包裹的标签），
@@ -26,6 +31,28 @@ _DSML_TOOL_RE = re.compile(
 )
 # 无标签但带 "tool_uses" 键的裸 JSON 对象（DOM 提取后标签可能丢失）
 _TOOL_USES_RE = re.compile(r"tool_uses\s*\"?\s*:", re.IGNORECASE)
+
+# DSML **结构化**形态（Gemini 原生工具 DSL，模型不听指令时会退回这种写法）：
+#   <｜｜DSML｜｜ calls>
+#   <｜｜DSML｜｜ invoke name="bash">
+#   <｜｜DSML｜｜ parameter name="command" string="true">cd /tmp && ls</｜｜DSML｜｜ parameter>
+#   </｜｜DSML｜｜ invoke>
+#   </｜｜DSML｜｜ calls>
+# 竖线数量不固定（DOM 提取后 1~3 个都出现过），标签内允许空白；
+# 闭标签还可能缺失/错位（回复被截断），解析时按开标签切块兜底。
+_BAR = r"[｜|]{1,4}"
+_DSML_INVOKE_OPEN_RE = re.compile(rf"<\s*{_BAR}\s*DSML\s*{_BAR}\s*invoke\b([^>]*)>", re.IGNORECASE)
+_DSML_INVOKE_CLOSE_RE = re.compile(rf"<\s*/\s*{_BAR}\s*DSML\s*{_BAR}\s*invoke\s*>", re.IGNORECASE)
+_DSML_PARAM_OPEN_RE = re.compile(rf"<\s*{_BAR}\s*DSML\s*{_BAR}\s*parameter\b([^>]*)>", re.IGNORECASE)
+_DSML_PARAM_CLOSE_RE = re.compile(rf"<\s*/\s*{_BAR}\s*DSML\s*{_BAR}\s*parameter\s*>", re.IGNORECASE)
+# 参数值的 JSON 标量识别（string="true" 时不参与）
+_DSML_SCALAR_RE = re.compile(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|null", re.IGNORECASE)
+# Gemini 偶尔不用我们的工具名，而用 bash/shell 这类通用名；只有能唯一对应时才映射
+_DSML_GENERIC_NAMES = {
+    "bash", "sh", "shell", "terminal", "command", "cmd", "exec", "execute",
+    "run_command", "run_commands", "execute_command",
+}
+_SHELL_NAME_KEYWORDS = ("shell", "exec", "bash", "command", "term")
 
 
 def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
@@ -43,16 +70,112 @@ def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
         if params:
             lines.append(f"  参数(JSON Schema): {json.dumps(params, ensure_ascii=False)}")
 
+    # 注入格式刻意使用行首纯文本标记 ``TOOL_CALL:``，而不是 markdown 代码围栏。
+    # 历史教训：模型会把 ```tool_call``` 当成 XML/HTML 标签，脑补出闭合的 ``>``，
+    # 输出成 ``tool_call">``；这个畸形串一旦进入会话历史就会被反复模仿、越滚越脏。
+    # 行首标记没有尖括号、没有反引号，模型无从“闭合”，从源头杜绝该污染。
     lines += [
         "",
+        "需要调用工具时，在单独一行以 TOOL_CALL: 开头，紧跟一个 JSON 对象（arguments 必须是合法 JSON）：",
+        'TOOL_CALL: {"name": "工具名", "arguments": {参数对象}}',
+        "一次可输出多个 TOOL_CALL 行以并行调用多个工具；这些行之外不要输出多余解释。",
+        "如果不需要调用任何工具，请直接给出最终回答，不要输出 TOOL_CALL 行。",
+    ]
+    return "\n".join(lines)
+
+
+def format_tool_call_emphasis() -> str:
+    """新会话 / 重置会话时，放在播种 prompt **开头**的格式强调块。
+
+    新 bucket 没有“示范过正确格式”的历史轮次，模型最容易在这时候
+    退回原生 DSML 标记；把带围栏示例的完整格式再点一遍，双保险。
+    """
+    return "\n".join([
+        "[输出格式强调] 这是一个新会话（或刚被重置），以下规则本会话持续有效：",
         "需要调用工具时，只输出一个或多个如下格式的代码块（arguments 必须是合法 JSON）：",
         "```tool_call",
         '{"name": "工具名", "arguments": {参数对象}}',
         "```",
-        "一次可输出多个 tool_call 代码块以并行调用多个工具；代码块之外不要输出多余解释。",
-        "如果不需要调用任何工具，请直接给出最终回答，不要输出 tool_call 代码块。",
-    ]
-    return "\n".join(lines)
+        "工具名必须逐字使用 [工具调用说明] 中列出的名字，不要自造 bash / shell 之类的通用名。",
+        "禁止输出 <｜DSML｜ ...>、<invoke>/<parameter>、<tool_calls> 等 XML/DSL 标记——它们不会被执行。",
+    ])
+
+
+def _dsml_blocks(open_re, close_re, text: str):
+    """按 DSML 开标签切出 (属性串, 块体)。
+
+    闭标签缺失/错位（回复被截断、DOM 吞标签）时，退化为取到下一个开标签或文末。
+    """
+    pos = 0
+    while True:
+        opened = open_re.search(text, pos)
+        if not opened:
+            return
+        start = opened.end()
+        closed = close_re.search(text, start)
+        nxt = open_re.search(text, start)
+        if closed and (nxt is None or closed.start() < nxt.start()):
+            yield opened.group(1), text[start:closed.start()]
+            pos = closed.end()
+        elif nxt:
+            yield opened.group(1), text[start:nxt.start()]
+            pos = nxt.start()
+        else:
+            yield opened.group(1), text[start:]
+            return
+
+
+def _dsml_attr(attrs: str, key: str) -> Optional[str]:
+    """从开标签的属性串里取 ``key="value"``。"""
+    match = re.search(rf'(?:^|\s){re.escape(key)}\s*=\s*"([^"]*)"', attrs)
+    return match.group(1) if match else None
+
+
+def _dsml_param_value(raw: str, string_attr: Optional[str]) -> Any:
+    """DSML parameter 内容 -> Python 值。"""
+    value = raw.strip()
+    if (string_attr or "").strip().lower() == "true":
+        return value
+    if value[:1] in "{[" or _DSML_SCALAR_RE.fullmatch(value):
+        try:
+            return json.loads(value)
+        except Exception:
+            return value
+    return value
+
+
+def _resolve_dsml_name(name: str, valid_names: Optional[set]) -> str:
+    """把 DSML invoke 的工具名对齐到客户端工具名；对不上就原样返回（后续过滤）。"""
+    if not name or not valid_names:
+        return name
+    if name in valid_names:
+        return name
+    lowered = name.strip().lower()
+    for candidate in valid_names:
+        if candidate.lower() == lowered:
+            return candidate
+    if lowered in _DSML_GENERIC_NAMES:
+        hits = [c for c in valid_names if any(k in c.lower() for k in _SHELL_NAME_KEYWORDS)]
+        if len(hits) == 1:
+            return hits[0]
+    return name
+
+
+def _parse_dsml_invokes(text: str, valid_names: Optional[set] = None) -> List[Dict[str, Any]]:
+    """解析 DSML 结构化工具调用（invoke/parameter 形态）。"""
+    calls: List[Dict[str, Any]] = []
+    for attrs, body in _dsml_blocks(_DSML_INVOKE_OPEN_RE, _DSML_INVOKE_CLOSE_RE, text):
+        name = _dsml_attr(attrs, "name")
+        if not name:
+            continue
+        arguments: Dict[str, Any] = {}
+        for pattrs, pvalue in _dsml_blocks(_DSML_PARAM_OPEN_RE, _DSML_PARAM_CLOSE_RE, body):
+            pname = _dsml_attr(pattrs, "name")
+            if not pname:
+                continue
+            arguments[pname] = _dsml_param_value(pvalue, _dsml_attr(pattrs, "string"))
+        calls.append({"name": _resolve_dsml_name(name, valid_names), "arguments": arguments})
+    return calls
 
 
 def _normalize_tool_entry(entry: Any) -> Optional[Dict[str, Any]]:
@@ -120,7 +243,9 @@ def _iter_balanced_objects(text: str):
 def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[str, Any]]:
     """从模型回复中解析出工具调用列表。返回 [{"name": ..., "arguments": {...}}, ...]
 
-    需要兼容两种形态：
+    需要兼容多种形态（新→旧）：
+      0. **首选**：行首 ``TOOL_CALL: {...}`` 纯文本标记（当前注入格式，无尖括号、
+         无围栏，模型无法脑补出 ``>`` 造成历史污染）；
       1. 带围栏的 ```tool_call ... ```代码块（模型直接输出 markdown 时）；
       2. **无围栏**的 ``tool_call`` 标签 + JSON 对象——这是从 Gemini 网页 DOM
          提取 inner_text 后的常见形态：代码块被渲染成 <pre>，围栏退化为标题文字，
@@ -157,13 +282,25 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
             if normalized:
                 calls.append(normalized)
 
-    for match in _TOOL_CALL_FENCE_RE.finditer(text):
-        _consume(match.group(2), allow_bare_object=True)
+    # 0. 首选形态：行首 TOOL_CALL: 后跟一个平衡 JSON 对象。
+    #    用 _iter_balanced_objects 逐对象解析，一行一个，天然支持多调用。
+    for match in _TOOL_CALL_LINE_RE.finditer(text):
+        segment = text[match.end():]
+        for obj in _iter_balanced_objects(segment):
+            _consume(obj, allow_bare_object=True)
+            break
+
+    if not calls:
+        for match in _TOOL_CALL_FENCE_RE.finditer(text):
+            _consume(match.group(2), allow_bare_object=True)
 
     if not calls:
         # DSML 风格 XML 包裹的工具调用（网页版偶发输出）
         for match in _DSML_TOOL_RE.finditer(text):
             _consume(match.group(1), allow_bare_object=True)
+
+    if not calls:
+        calls.extend(_parse_dsml_invokes(text, valid_names))
 
     if not calls:
         for match in _JSON_FENCE_RE.finditer(text):
@@ -177,18 +314,33 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
                 break
 
     if not calls:
-        # 兜底：无围栏的 "tool_call" 标签 + 平衡 JSON 对象（网页 DOM 提取后的形态）
-        marker_re = re.compile(r"tool[-_]?call\b", re.IGNORECASE)
+        # 兜底：无围栏的 "tool_call" 标签 + 平衡 JSON 对象（网页 DOM 提取后的形态）。
+        # Gemini 把 ``` 围栏渲染成 <pre> 后 inner_text 常退化成：
+        #   > tool_call            （markdown 引用/渲染残留）
+        #   tool_call\n{...}
+        #   ｜｜tool_call｜｜\n{...}
+        # 因此 marker 与 JSON 之间可能夹着 > 、竖线、空白等噪声，需要跳过它们再找 JSON。
+        # 不能用 \b：中文/全角字符（如 丨 ｜）在 Python re 里算 \w，
+        # 会让 "tool_call丨" 这种边界匹配失败。改用「后面不是 ASCII 标识符字符」判定。
+        marker_re = re.compile(r"tool[-_]?call(?![A-Za-z0-9_])", re.IGNORECASE)
         pos = 0
         while True:
             match = marker_re.search(text, pos)
             if not match:
                 break
             segment = text[match.end():]
+            # marker 与 JSON 之间可能夹着任意噪声：`">`、`>`、竖线、`` ` ``、
+            # "Copy"/"Download" 渲染文字、空白换行……不要逐种枚举，
+            # 直接跳到第一个 `{`，从那里起用平衡扫描找 JSON 对象。
+            brace = segment.find("{")
+            if brace < 0:
+                pos = match.end()
+                continue
+            probe = segment[brace:]
             parsed = False
-            for obj in _iter_balanced_objects(segment):
+            for obj in _iter_balanced_objects(probe):
                 _consume(obj, allow_bare_object=True)
-                pos = match.end() + segment.index(obj) + len(obj)
+                pos = match.end() + brace + probe.index(obj) + len(obj)
                 parsed = True
                 break
             if not parsed:
