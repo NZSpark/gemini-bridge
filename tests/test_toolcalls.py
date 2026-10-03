@@ -234,6 +234,45 @@ class ParseToolCallsTests(unittest.TestCase):
         )
 
 
+class ShellGuardTests(unittest.TestCase):
+    """护栏：shell 类命令引号不配对时丢弃，避免把坏命令发给 bash。"""
+
+    def test_unbalanced_double_quote_dropped(self):
+        # 模型/解析把命令尾部闭引号弄丢："git commit -m "msg"
+        # 引号数为奇数 → 丢弃（否则 bash 报 unexpected EOF）。
+        text = (
+            'TOOL_CALL: {"name": "exec_command", "arguments": '
+            '{"cmd": "git commit -m "msg"}}'
+        )
+        self.assertEqual(parse_tool_calls(text), [])
+
+    def test_balanced_double_quotes_kept(self):
+        text = (
+            'TOOL_CALL: {"name": "exec_command", "arguments": '
+            '{"cmd": "git commit -m "msg here" && git push"}}'
+        )
+        calls = parse_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["name"], "exec_command")
+
+    def test_single_quoted_command_kept(self):
+        # prompt 建议命令内部用单引号：这是首选形态，不应被护栏误伤。
+        text = (
+            'TOOL_CALL: {"name": "exec_command", "arguments": '
+            "{\"cmd\": \"git commit -m 'msg here'\"}}"
+        )
+        calls = parse_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["arguments"]["cmd"], "git commit -m 'msg here'")
+
+    def test_non_shell_tool_not_guarded(self):
+        # 非 shell 工具的字符串参数即使引号不配对也不受影响（不被护栏丢弃）。
+        text = 'TOOL_CALL: {"name": "write_note", "arguments": {"text": "a \\" b"}}'
+        calls = parse_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["arguments"]["text"], 'a " b')
+
+
 class ToToolCallModelsTests(unittest.TestCase):
     def test_arguments_serialized_as_json_string(self):
         calls = [{"name": "f", "arguments": {"a": 1}}]

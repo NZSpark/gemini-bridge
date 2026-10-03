@@ -86,6 +86,8 @@ def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
         "TOOL_CALL: {\"name\": \"工具名\", \"arguments\": {参数对象}}",
         "arguments 必须是合法 JSON：字符串里的双引号必须转义成 \\\"（反斜杠+引号），"
         "不能直接写裸的双引号；",
+        "如果参数是 shell 命令，命令内部请**改用单引号**（如 git commit -m 'msg'），"
+        "避免命令里的双引号与 JSON 边界引号冲突；",
         "一行一个调用；一次可输出多行以并行调用多个工具；TOOL_CALL 行之外不要输出多余解释。",
         "如果不需要调用任何工具，请直接给出最终回答，不要输出 TOOL_CALL 行。",
     ]
@@ -104,6 +106,8 @@ def format_tool_call_emphasis() -> str:
         "TOOL_CALL: {\"name\": \"工具名\", \"arguments\": {参数对象}}",
         "arguments 必须是合法 JSON：字符串里的双引号必须转义成 \\\"（反斜杠+引号），"
         "不能直接写裸的双引号；否则网页端会把内容当代码渲染、导致参数被截断。",
+        "如果参数是 shell 命令，命令内部请**改用单引号**（如 git commit -m 'msg'），"
+        "避免命令里的双引号与 JSON 边界引号冲突。",
         "工具名必须逐字使用 [工具调用说明] 中列出的名字，不要自造 bash / shell 之类的通用名。",
         "禁止输出 <｜DSML｜ ...>、<invoke>/<parameter>、<tool_calls> 等 XML/DSL 标记——它们不会被执行。",
     ])
@@ -273,17 +277,25 @@ def _strip_redundant_value_quotes(raw: str) -> str:
 def _repair_json_quotes(raw: str) -> Optional[Any]:
     """尽力修复模型输出的非法 JSON。
 
-    两类常见损伤：
+    三类常见损伤：
       1. 字符串值里未转义的裸引号：
          {"cmd": "git commit -m "Update logic" && git push"}
       2. 值边界多余引号（模型给值又包了一层）：
          {"cmd": ""git status && git log""}
          表现为参数值从第一个引号处被截断、或整体解析失败。
+      3. 值内含嵌套的 shell 双引号，且末尾闭引号看似"丢失"：
+         {"cmd": "git commit -m "msg"}
+         逐字符启发式会把它当"字符串结束"而截断值、丢掉尾引号。
 
-    处理顺序：先折叠边界冗余引号，再用转义状态机修内层裸引号。
-    只在首次 json.loads 失败后调用，避免影响合法输入。
+    处理顺序：先折叠边界冗余引号，再用「结构定位 + 内层全转义」重写，
+    最后回退到旧的逐字符状态机。只在首次 json.loads 失败后调用。
     """
     raw = _strip_redundant_value_quotes(raw)
+
+    # 说明：曾尝试用"结构定位"重写值内嵌套引号，但 JSON 值内嵌 shell 双引号
+    # 本质有歧义（无法区分"值的边界引号"与"正文引号"），实验版本会产出"合法
+    # 但错误"的截断命令。改为在 prompt 层要求命令内部用单引号从源头消除歧义，
+    # 解析层只保留确定性修复 + 下方护栏。
     out = []
     in_string = False
     escaped = False
@@ -329,6 +341,25 @@ def _repair_json_quotes(raw: str) -> Optional[Any]:
         return json.loads(repaired)
     except Exception:
         return None
+
+
+def _shell_quotes_balanced(cmd: str) -> bool:
+    """粗判 shell 命令里的双引号是否成对（忽略 \\" 转义引号）。
+
+    解析出的命令若引号不配对，几乎必然是 JSON 修复阶段把值截断/丢尾引号，
+    直接发给 shell 只会得到 `unexpected EOF`。宁可在桥接层拦下，让模型重出。
+    """
+    count = 0
+    i = 0
+    n = len(cmd)
+    while i < n:
+        if cmd[i] == "\\":
+            i += 2
+            continue
+        if cmd[i] == '"':
+            count += 1
+        i += 1
+    return count % 2 == 0
 
 
 def _iter_balanced_objects(text: str):
@@ -482,7 +513,27 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
     if valid_names:
         calls = [c for c in calls if c.get("name") in valid_names]
 
+    # 护栏：shell 类命令若双引号不配对，几乎必然是解析阶段把值截断/丢尾引号。
+    # 这类命令发给 shell 只会得到 `unexpected EOF`，宁可在桥接层丢弃，
+    # 让模型下一轮重新输出完整命令。
+    calls = [c for c in calls if _call_args_sane(c)]
+
     return calls
+
+
+def _call_args_sane(call: Dict[str, Any]) -> bool:
+    """对 shell 类调用做最低限度健全性检查（当前：命令引号配对）。"""
+    name = (call.get("name") or "").lower()
+    if not any(k in name for k in _SHELL_NAME_KEYWORDS):
+        return True
+    args = call.get("arguments")
+    if not isinstance(args, dict):
+        return True
+    for key in ("command", "cmd", "script"):
+        value = args.get(key)
+        if isinstance(value, str) and not _shell_quotes_balanced(value):
+            return False
+    return True
 
 
 def to_tool_call_models(calls: List[Dict[str, Any]]) -> List[ToolCall]:
