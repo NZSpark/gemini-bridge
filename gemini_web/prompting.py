@@ -168,7 +168,9 @@ def build_prompt(
 
     prompt = "\n\n".join(part for part in parts if part).strip()
 
-    if use_tools:
+    # 去重：入站 system 消息可能已带 [工具调用说明]（harness 会内联一份），
+    # 再追加一遍会造成同一 prompt 出现两份说明、互相干扰。
+    if use_tools and "[工具调用说明]" not in prompt:
         prompt = (prompt + "\n\n" + format_tools_instruction(tools)).strip()
 
     return prompt

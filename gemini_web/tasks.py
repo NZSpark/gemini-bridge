@@ -65,11 +65,23 @@ resume 时就会看到“目标 = 另一个项目的 cwd”这种串台错觉。
     return fallback[: max(1, config.TASK_GOAL_MAX_CHARS)]
 
 
-# Agent 自动注入的环境/元信息包装：整条消息只由这些标签构成时，不算“任务目标”
+# Agent 自动注入的环境/元信息包装：整条消息只由这些标签构成时，不算“任务目标”。
+# 除 environment_context 外，Codex 还会注入 skills_instructions、permissions
+# instructions、collaboration_mode 等——它们都不是用户的真实意图，必须一并排除，
+# 否则会被当正文写进快照 recent，轮转播种时把 prompt 灌成一大段系统提示。
 _ENV_WRAPPER_RE = re.compile(
-    r"^\s*<(environment_context|user_instructions|system_instructions|env)\b",
+    r"^\s*<(environment_context|user_instructions|system_instructions|env"
+    r"|skills_instructions|permissions[_ ]instructions|collaboration_mode)\b",
     re.IGNORECASE,
 )
+
+
+def _wrap_recent_item(text: str) -> str:
+    """把单条 recent 文本裁到 TASK_RECENT_ITEM_MAX_CHARS，避免超长系统块占满预算。"""
+    limit = max(1, config.TASK_RECENT_ITEM_MAX_CHARS)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "…（已截断）"
 
 
 def _is_environment_wrapper(text: str) -> bool:
@@ -104,7 +116,7 @@ def _recent_texts(messages: List[ChatMessage]) -> List[Dict[str, str]]:
     for message in picked:
         text = _content_to_text(message.content).strip()
         if text and not _is_environment_wrapper(text) and not _is_meta_prompt(text):
-            out.append({"role": message.role, "text": text})
+            out.append({"role": message.role, "text": _wrap_recent_item(text)})
     return out
 
 

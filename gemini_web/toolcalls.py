@@ -70,16 +70,16 @@ def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
         if params:
             lines.append(f"  参数(JSON Schema): {json.dumps(params, ensure_ascii=False)}")
 
-    # 注入格式刻意使用行首纯文本标记 ``TOOL_CALL:``，而不是 markdown 代码围栏。
-    # 历史教训：模型会把 ```tool_call``` 当成 XML/HTML 标签，脑补出闭合的 ``>``，
-    # 输出成 ``tool_call">``；这个畸形串一旦进入会话历史就会被反复模仿、越滚越脏。
-    # 行首标记没有尖括号、没有反引号，模型无从“闭合”，从源头杜绝该污染。
+    # 与 format_tool_call_emphasis 保持一致：统一使用 markdown 围栏 ```tool_call。
+    # 两处格式必须一致，否则同一 prompt 里出现互斥指令，模型会退回原生 DSML 标记。
     lines += [
         "",
-        "需要调用工具时，在单独一行以 TOOL_CALL: 开头，紧跟一个 JSON 对象（arguments 必须是合法 JSON）：",
-        'TOOL_CALL: {"name": "工具名", "arguments": {参数对象}}',
-        "一次可输出多个 TOOL_CALL 行以并行调用多个工具；这些行之外不要输出多余解释。",
-        "如果不需要调用任何工具，请直接给出最终回答，不要输出 TOOL_CALL 行。",
+        "需要调用工具时，只输出一个或多个如下格式的代码块（arguments 必须是合法 JSON）：",
+        "```tool_call",
+        '{"name": "工具名", "arguments": {参数对象}}',
+        "```",
+        "一次可输出多个代码块以并行调用多个工具；代码块之外不要输出多余解释。",
+        "如果不需要调用任何工具，请直接给出最终回答，不要输出 tool_call 代码块。",
     ]
     return "\n".join(lines)
 

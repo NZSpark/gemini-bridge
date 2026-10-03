@@ -95,6 +95,8 @@ STABLE_POLLS = env_int("STABLE_POLLS", 2)
 # 次保守的兜底：仅凭“长度不再增长”收尾时要多等几轮，
 # 避免生成中途的长停顿（如长思考）被误判成结束
 LEN_STABLE_POLLS = env_int("LEN_STABLE_POLLS", 4)
+# 连续多少次轮询既无正文也无「生成中」信号即判定页面卡死，提前失败（不再干等到总超时）
+STALL_POLLS = env_int("STALL_POLLS", 20)
 
 
 # ==================== 重试 ====================
@@ -183,6 +185,9 @@ TASK_NAMESPACE = env_str("TASK_NAMESPACE", "") or (
 TASK_GOAL_MAX_CHARS = env_int("TASK_GOAL_MAX_CHARS", 2000)
 # 快照里滚动保留的最近消息条数（用于“最近进展”）。
 TASK_KEEP_MESSAGES = env_int("TASK_KEEP_MESSAGES", 8)
+# 任务快照里单条 recent 文本的最大字符数；防止 harness 注入的超长系统块
+# （skills / permissions / collaboration_mode 等）撑爆快照，轮转播种时把 prompt 灌满。
+TASK_RECENT_ITEM_MAX_CHARS = env_int("TASK_RECENT_ITEM_MAX_CHARS", 500)
 
 
 # ==================== DOM 选择器 ====================
