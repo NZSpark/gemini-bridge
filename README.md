@@ -8,7 +8,7 @@
 
 - **OpenAI 兼容端点**：`/v1/models`、`/v1/chat/completions`、`/v1/responses`。
 - **流式与非流式**：SSE 逐块输出，首块带 `role`，末块带 `finish_reason`，`data: [DONE]` 收尾。
-- **模拟 function calling**：把 OpenAI `tools` 注入提示词，解析模型输出的调用块为 `tool_calls`；解析失败按普通文本返回。
+- **模拟 function calling**：把 OpenAI `tools` 注入提示词，解析模型输出的 `TOOL_CALL: {...}` 为 `tool_calls`；支持单引号 shell 命令引导与控制字符 / 双引号容错修复；解析失败按普通文本返回。
 - **会话分桶**：按 `X-Gemini-Session` → `user` → User-Agent 分优先级隔离会话，LRU 回收，可选同桶排队锁。
 - **不丢任务**：会话轮转时按任务快照 + 历史播种，任务目标不被字符预算截断。
 - **登录态持久化**：浏览器 profile 落在 `user_data/`，登录一次即可复用。
@@ -151,12 +151,27 @@ codex --profile gemini
 | `SESSION_SCOPING` | `true` | 是否启用分桶 |
 | `SESSION_SCOPING_BY_UA` | `true` | 无键时按 UA 分桶 |
 | `MAX_SESSION_BUCKETS` | `8` | 会话桶上限（LRU） |
+| `MAX_SESSION_STATE_CACHE` | `64` | 内存会话状态缓存上限（LRU 逐出，0 不限） |
 | `BUCKET_IDLE_TTL_S` | `900` | 空闲回收 |
 | `PARALLEL_BUCKETS` | `false` | 各桶并行页面 |
 | `BUCKET_LOCK_TIMEOUT_S` | `0` | 同桶排队超时，>0 超时返回 503 `upstream_busy` |
 | `SEED_MAX_CHARS` | `12000` | 轮转播种字符预算 |
 | `SESSION_MAX_TURNS` | `60` | 轮数到顶阈值（0 禁用） |
 | `SESSION_MAX_TOKENS` | `60000` | 估算 token 到顶阈值（0 禁用） |
+
+> 上表列出的是 `config.py` 的**内置默认值**。实际运行时以 `.env` 为准（真实环境变量优先）；
+> 例如仓库自带 `.env` 覆盖为 `STABLE_POLLS=5`、`MAX_SESSION_BUCKETS=3`。
+> 想从零起步可直接复制 `.env.example`。
+
+**代码落盘 / 调试端点**
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `SAVE_FILES` | `false` | 是否把回复代码块落盘（请求字段仅在显式传入时覆盖） |
+| `OUTPUT_MAX_FILES` | `0` | `output/` 保留文件数上限（0 不限） |
+| `OUTPUT_MAX_AGE_DAYS` | `0` | `output/` 最长保留天数（0 不限） |
+| `RESET_TOKEN` | 空 | 设置后 `/session/reset` 需带 `X-Reset-Token` 头 |
+| `CHAT_KEEPALIVE_S` | `10.0` | chat 流式 keep-alive 间隔（0 关闭） |
 
 **Responses API**
 
@@ -224,6 +239,7 @@ user_data/                浏览器 profile 与状态（gitignore）
 
 - 默认仅监听 `127.0.0.1`，不要暴露到公网。
 - `.env`、`user_data/`（含登录 cookie）、`output/` 均不提交。
+- `user_data/` **不要备份 / 同步**（iCloud、Dropbox 等会带走登录态）；DEBUG 日志不含消息正文。
 
 ## 状态
 

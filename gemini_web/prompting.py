@@ -53,21 +53,24 @@ def _delta_piece(streamed: str, current: str) -> tuple[Optional[str], str]:
     """计算 ``current`` 相对「已经发给客户端的内容」真正新增的部分。
 
     网页版在生成中可能重排 / 替换回复节点，导致 ``current`` 不再以之前的内容为前缀。
-    此时不能用简单的 ``startswith`` 判定（会静默丢字），也不应从头发一遍
-    （会重复）。这里退回「公共前缀之后的部分」。
+    此时有两种做法：
 
-    :return: (需要补发的内容, 客户端补发后实际拥有的内容)；无新增时第一项为 None。
+    * 退回「公共前缀之后的部分」追加——但这会让客户端把**改写后的旧内容**
+      拼在旧内容后面，得到重复 / 错乱的文本（旧尾巴不会撤回）；
+    * **停止发送增量**（返回 ``(None, streamed)``）——保留已发内容不动，
+      等本轮结束由调用方一次性给全量文本，客户端最终拿到的是完整且不重复的回复。
+
+    这里选后者：宁可少发几次增量，也不要让客户端拼出错乱文本。真正的
+    前缀扩展（最常见情形）仍然逐块下发。
+
+    :return: (需要补发的内容, 客户端补发后实际拥有的内容)；无新增 / 已停发时为 None。
     """
     if current == streamed:
         return None, streamed
     if current.startswith(streamed):
         return current[len(streamed):], current
-    limit = min(len(streamed), len(current))
-    index = 0
-    while index < limit and streamed[index] == current[index]:
-        index += 1
-    piece = current[index:] or None
-    return piece, streamed[:index] + (piece or "")
+    # 非前缀：节点被整体替换 / 重排。停发增量，保留已发内容，交由收尾补全。
+    return None, streamed
 
 
 # 播种时的默认字符预算（server 会传入 config.SEED_MAX_CHARS 覆盖）

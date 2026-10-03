@@ -65,13 +65,17 @@ class DeltaPieceTests(unittest.TestCase):
     def test_prefix_extension(self):
         self.assertEqual(srv._delta_piece("abc", "abcdef"), ("def", "abcdef"))
 
-    def test_rewrite_does_not_resend_from_scratch(self):
-        piece, _ = srv._delta_piece("abc", "abd")
-        self.assertEqual(piece, "d")
+    def test_rewrite_stops_streaming_instead_of_appending(self):
+        # 节点被整体替换：不再追加，避免客户端拼出重复 / 错乱文本；
+        # 已发内容保持不动，收尾时由调用方补发全量。
+        piece, streamed = srv._delta_piece("abc", "abd")
+        self.assertIsNone(piece)
+        self.assertEqual(streamed, "abc")
 
-    def test_rewrite_with_no_common_prefix_sends_all(self):
-        piece, _ = srv._delta_piece("abc", "xyz")
-        self.assertEqual(piece, "xyz")
+    def test_rewrite_with_no_common_prefix_stops(self):
+        piece, streamed = srv._delta_piece("abc", "xyz")
+        self.assertIsNone(piece)
+        self.assertEqual(streamed, "abc")
 
 
 class BalancedObjectTests(unittest.TestCase):

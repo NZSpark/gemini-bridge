@@ -300,6 +300,41 @@ class ShellGuardTests(unittest.TestCase):
         self.assertEqual(calls[0]["arguments"]["text"], 'a " b')
 
 
+class ToolCallLineContractTests(unittest.TestCase):
+    """首选形态 TOOL_CALL: 的“一行一调用”契约与重复消费回归（update_codex §2.3）。"""
+
+    def test_multi_line_multi_calls(self):
+        text = (
+            'TOOL_CALL: {"name": "exec_command", "arguments": {"cmd": "ls"}}\n'
+            'TOOL_CALL: {"name": "exec_command", "arguments": {"cmd": "pwd"}}\n'
+        )
+        calls = parse_tool_calls(text)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            [c["arguments"]["cmd"] for c in calls], ["ls", "pwd"]
+        )
+
+    def test_two_objects_same_line_second_dropped(self):
+        text = (
+            'TOOL_CALL: {"name": "exec_command", "arguments": {"cmd": "ls"}} '
+            '{"name": "exec_command", "arguments": {"cmd": "pwd"}}\n'
+        )
+        calls = parse_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["arguments"]["cmd"], "ls")
+
+    def test_marker_without_object_does_not_duplicate_next(self):
+        # 第一个标记后没跟对象，只有解释文字；第二个标记才有对象。
+        # 修复前：第一个标记会消费第二个标记的对象，导致同一调用出现两次。
+        text = (
+            "TOOL_CALL: 我改主意了，先说明一下\n"
+            'TOOL_CALL: {"name": "exec_command", "arguments": {"cmd": "ls"}}\n'
+        )
+        calls = parse_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["arguments"]["cmd"], "ls")
+
+
 class ToToolCallModelsTests(unittest.TestCase):
     def test_arguments_serialized_as_json_string(self):
         calls = [{"name": "f", "arguments": {"a": 1}}]

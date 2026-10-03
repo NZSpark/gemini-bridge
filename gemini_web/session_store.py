@@ -55,7 +55,26 @@ class SessionStoreMixin:
         if state is None:
             state = SessionState.from_payload(self._load_session_state(bucket))
             self._sessions[bucket] = state
+            self._evict_session_cache()
         return state
+
+    def _evict_session_cache(self) -> None:
+        """内存会话缓存超限时按最久未用逐出（状态已落盘，安全）。
+
+        默认桶永不逐出；正在持有锁 / 活跃的桶也不逐出，避免打断进行中的请求。
+        """
+        limit = config.MAX_SESSION_STATE_CACHE
+        if limit <= 0 or len(self._sessions) <= limit:
+            return
+        candidates = [
+            bucket for bucket in self._sessions
+            if bucket != DEFAULT_SESSION_KEY and not self._bucket_busy(bucket)
+        ]
+        # 用页面最近使用时间作为 LRU 依据；没有页面记录的排在最前（最旧）。
+        candidates.sort(key=lambda b: self._page_last_used.get(b, 0.0))
+        for bucket in candidates[: max(0, len(self._sessions) - limit)]:
+            self._sessions.pop(bucket, None)
+            self._last_prompts.pop(bucket, None)
 
     def _page_for(self, key: Optional[str] = None):
         """取出某个会话桶的页面；默认桶就是 ``self.page``。"""

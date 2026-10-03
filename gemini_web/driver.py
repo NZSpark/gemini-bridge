@@ -18,7 +18,12 @@
 import asyncio
 from typing import Any, Dict, List, Optional
 
-from playwright.async_api import async_playwright
+# 惰性 import Playwright：把 `from playwright.async_api import async_playwright`
+# 放到 `init()` 内部。driver 被 `gemini_web/__init__.py` 顶层导入，若这里顶层
+# import Playwright，则任何 `import gemini_web`（哪怕只想读 config / 跑纯逻辑
+# 测试）都会因缺 Playwright 直接 ImportError。放进 init() 后，只有真正要启动
+# 浏览器时才需要该依赖，纯逻辑模块可在未装 Playwright 的环境下正常使用。
+async_playwright = None
 
 from . import completion, config, errors, page_pool, prompting, session_store  # noqa: F401
 from .chat_io import ChatIOMixin
@@ -70,6 +75,17 @@ class GeminiWebDriver(PagePoolMixin, SessionStoreMixin, CompletionMixin, ChatIOM
 
     async def init(self):
         """初始化浏览器实例"""
+        global async_playwright
+        if async_playwright is None:
+            try:
+                from playwright.async_api import async_playwright as _async_playwright
+            except ImportError as exc:  # noqa: BLE001
+                raise RuntimeError(
+                    "缺少 Playwright 依赖，无法启动浏览器。请先安装：\n"
+                    "  pip install -r requirements.txt\n"
+                    "  playwright install chromium"
+                ) from exc
+            async_playwright = _async_playwright
         self.playwright = await async_playwright().start()
         try:
             self.context = await self.playwright.chromium.launch_persistent_context(

@@ -46,7 +46,8 @@ class RequestTests(unittest.TestCase):
         req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}])
         self.assertEqual(req.model, "gemini-chat")
         self.assertFalse(req.stream)
-        self.assertTrue(req.save_files)
+        # None = 客户端未指定，实际是否落盘由 config.SAVE_FILES 决定
+        self.assertIsNone(req.save_files)
         self.assertIsNone(req.output_dir)
 
     def test_unknown_fields_never_rejected(self):

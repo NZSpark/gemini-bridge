@@ -55,7 +55,9 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
     stop: Optional[Any] = None
     # ---- 本地扩展字段（Pi 不会传，保持默认即可）----
-    save_files: Optional[bool] = True
+    # None 表示「未显式指定」，落盘与否交给 config.SAVE_FILES 决定（默认 false）；
+    # 只有客户端显式传 true/false 时才覆盖。避免默认产生落盘副作用。
+    save_files: Optional[bool] = None
     output_dir: Optional[str] = None  # None -> 使用 .env 的 OUTPUT_DIR
 
 

@@ -47,7 +47,7 @@ class ResponsesRequest(BaseModel):
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     # 本地扩展（Codex 不传，保持与 chat 一致的默认）
-    save_files: Optional[bool] = True
+    save_files: Optional[bool] = None
     output_dir: Optional[str] = None
 
 
@@ -419,23 +419,40 @@ async def stream_responses(
 
     task = asyncio.create_task(runner())
 
-    # 文本消息的结构（先声明 output_item / content_part）
-    yield evt("response.output_item.added", {
-        "output_index": 0,
-        "item": {
-            "type": "message",
-            "id": msg_id,
-            "status": "in_progress",
-            "role": "assistant",
-            "content": [],
-        },
-    })
-    yield evt("response.content_part.added", {
-        "item_id": msg_id,
-        "output_index": 0,
-        "content_index": 0,
-        "part": {"type": "output_text", "text": "", "annotations": []},
-    })
+    # 文本形态的 output_item / content_part **延迟到确定本轮不是 tool_calls 之后再发**。
+    # 早先无条件先发 message item 会让工具分支也占用 output_index 0，
+    # 与 function_call 的 index 撞车（Codex 按 index 关联 item）。
+    message_item_opened = False
+
+    def open_message_item():
+        """发 message item 的 added + content_part.added（幂等，只发一次）。"""
+        nonlocal message_item_opened
+        if message_item_opened:
+            return []
+        message_item_opened = True
+        return [
+            evt("response.output_item.added", {
+                "output_index": 0,
+                "item": {
+                    "type": "message",
+                    "id": msg_id,
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": [],
+                },
+            }),
+            evt("response.content_part.added", {
+                "item_id": msg_id,
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": "", "annotations": []},
+            }),
+        ]
+
+    # 非工具模式：文本一定会走 message，先开 item，客户端才能流式收到 delta。
+    if not wants_tools:
+        for line in open_message_item():
+            yield line
 
     streamed = ""
     result = None
@@ -451,6 +468,10 @@ async def stream_responses(
             continue
         if kind == "delta":
             streamed += payload
+            if not message_item_opened:
+                # 工具模式 + RESPONSES_TOOL_BUFFER=false：实时吐字时先补发 message item
+                for line in open_message_item():
+                    yield line
             yield evt("response.output_text.delta", {
                 "item_id": msg_id,
                 "output_index": 0,
@@ -474,42 +495,52 @@ async def stream_responses(
         return
 
     if tool_calls:
-        # 工具调用：跳过文本事件，改发 function_call 事件
+        # 工具调用：不发 message item（此前未开），每个 call 一个独立 output_index。
+        # item id / call_id 全程复用同一对，added / delta / done / final_output 一致。
+        final_output: List[Dict[str, Any]] = []
         for index, call in enumerate(tool_calls):
             call_id = f"call_{uuid.uuid4().hex[:16]}"
+            item_id = f"fc_{uuid.uuid4().hex[:12]}"
+            args_str = json.dumps(call["arguments"], ensure_ascii=False)
             yield evt("response.output_item.added", {
                 "output_index": index,
                 "item": {
                     "type": "function_call",
-                    "id": f"fc_{uuid.uuid4().hex[:12]}",
+                    "id": item_id,
                     "call_id": call_id,
                     "name": call["name"],
                     "arguments": "",
                     "status": "in_progress",
                 },
             })
-            args_str = json.dumps(call["arguments"], ensure_ascii=False)
             yield evt("response.function_call_arguments.delta", {
-                "item_id": call_id,
+                "item_id": item_id,
                 "output_index": index,
                 "delta": args_str,
             })
             yield evt("response.function_call_arguments.done", {
-                "item_id": call_id,
+                "item_id": item_id,
                 "output_index": index,
                 "arguments": args_str,
             })
-        final_output: List[Dict[str, Any]] = [
-            {
+            final_item = {
                 "type": "function_call",
-                "call_id": f"call_{uuid.uuid4().hex[:16]}",
-                "name": c["name"],
-                "arguments": json.dumps(c["arguments"], ensure_ascii=False),
+                "id": item_id,
+                "call_id": call_id,
+                "name": call["name"],
+                "arguments": args_str,
                 "status": "completed",
             }
-            for c in tool_calls
-        ]
+            final_output.append(final_item)
+            # 每个 function_call item 都单独发 done，index 与 added 对齐
+            yield evt("response.output_item.done", {
+                "output_index": index,
+                "item": final_item,
+            })
     else:
+        # 文本形态：确保 message item 已开（工具模式缓冲后此处才补开）
+        for line in open_message_item():
+            yield line
         full = reply if reply is not None else streamed
         if not streamed and full:
             # 工具模式缓冲后未流式吐字，这里补发
@@ -539,11 +570,10 @@ async def stream_responses(
             "role": "assistant",
             "content": [{"type": "output_text", "text": full, "annotations": []}],
         }]
-
-    yield evt("response.output_item.done", {
-        "output_index": 0,
-        "item": final_output[0],
-    })
+        yield evt("response.output_item.done", {
+            "output_index": 0,
+            "item": final_output[0],
+        })
 
     completed = {
         **base_response,

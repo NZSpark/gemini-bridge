@@ -150,11 +150,17 @@ async def healthz():
 
 
 @app.post("/session/reset", include_in_schema=False)
-async def reset_session(session: Optional[str] = None):
+async def reset_session(
+    session: Optional[str] = None,
+    x_reset_token: Optional[str] = Header(None, alias="X-Reset-Token"),
+):
     """手动逃生口：让指定会话桶的下一轮开新会话（历史会用“播种”重放，不丢上下文）。
 
     ``session`` 省略时重置默认桶；也可用 ``GEMINI_NEW_SESSION=true`` 在启动时重置。
+    设置了 ``RESET_TOKEN`` 时必须带 ``X-Reset-Token`` 头，否则 403。
     """
+    if config.RESET_TOKEN and x_reset_token != config.RESET_TOKEN:
+        raise HTTPException(status_code=403, detail="RESET_TOKEN 校验失败")
     key = (session or "").strip() or None
     driver.reset_session(key)
     bucket = key or DEFAULT_SESSION_KEY
@@ -370,7 +376,9 @@ async def chat_completions(
         )
 
     saved_files = []
-    if request.save_files:
+    # None = 客户端未指定，回落到 config.SAVE_FILES（默认 false）；显式传入才覆盖
+    save_files = config.SAVE_FILES if request.save_files is None else request.save_files
+    if save_files:
         saved_files = driver.save_extracted_files(
             reply_content, code_blocks, request.output_dir or config.OUTPUT_DIR
         )

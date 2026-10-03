@@ -93,9 +93,12 @@ async def _stream_chat_completion(
     error_type = "server_error"
     keepalives = 0
 
+    keepalive_s = config.CHAT_KEEPALIVE_S
     while True:
         try:
-            kind, payload = await asyncio.wait_for(queue.get(), timeout=10.0)
+            kind, payload = await asyncio.wait_for(
+                queue.get(), timeout=keepalive_s if keepalive_s and keepalive_s > 0 else None
+            )
         except asyncio.TimeoutError:
             # 网页版生成较慢，发送 SSE 注释保活，避免 Pi 侧超时断连。
             # 带 tools 时回复必须先完整缓冲才能判断是不是 tool_calls，

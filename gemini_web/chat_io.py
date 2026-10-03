@@ -20,6 +20,38 @@ from .errors import (
 from .prompting import _delta_piece, estimate_tokens
 
 
+def _prune_output_dir(output_dir: str) -> None:
+    """按 config 的保留策略清理落盘目录（0 = 不限，出错静默忽略）。"""
+    max_files = config.OUTPUT_MAX_FILES
+    max_age_days = config.OUTPUT_MAX_AGE_DAYS
+    if not max_files and not max_age_days:
+        return
+    try:
+        entries = [p for p in Path(output_dir).iterdir() if p.is_file()]
+    except Exception:
+        return
+    now = time.time()
+    for path in entries:
+        try:
+            if max_age_days and now - path.stat().st_mtime > max_age_days * 86400:
+                path.unlink()
+        except Exception:
+            continue
+    if max_files:
+        try:
+            remaining = sorted(
+                (p for p in Path(output_dir).iterdir() if p.is_file()),
+                key=lambda p: p.stat().st_mtime,
+            )
+            for path in remaining[: max(0, len(remaining) - max_files)]:
+                try:
+                    path.unlink()
+                except Exception:
+                    continue
+        except Exception:
+            return
+
+
 class ChatIOMixin:
     async def send_chat(
         self,
@@ -412,6 +444,7 @@ class ChatIOMixin:
     def save_extracted_files(raw_text: str, code_blocks: List[dict], output_dir: str) -> List[str]:
         """将提取的代码落地为对应格式的文件"""
         Path(output_dir).mkdir(parents=True, exist_ok=True)
+        _prune_output_dir(output_dir)
         saved = []
 
         ext_map = {

@@ -77,11 +77,31 @@ USER_DATA_DIR = env_str("USER_DATA_DIR", "./user_data")
 OUTPUT_DIR = env_str("OUTPUT_DIR", "./output")
 
 
+# ==================== 代码落盘 ====================
+# 是否把回复里的代码块落盘到 OUTPUT_DIR。默认关闭：保存文件是本地扩展字段，
+# 标准 OpenAI 客户端并不知情，默认开启会让每次请求都产生意外副作用。
+# 请求体里的 save_files 仅在显式传入时覆盖（见 models.ChatCompletionRequest）。
+SAVE_FILES = env_bool("SAVE_FILES")
+# 落盘目录的保留策略（0 = 不限制）：超出后在启动时清理最旧的文件。
+OUTPUT_MAX_FILES = env_int("OUTPUT_MAX_FILES", 0)
+OUTPUT_MAX_AGE_DAYS = env_float("OUTPUT_MAX_AGE_DAYS", 0)
+
+
 # ==================== 运行模式 / 调试 ====================
 # 无显示环境（CI / 服务器）可用 HEADLESS=1 启动；首次登录仍需有头模式
 HEADLESS = env_bool("HEADLESS")
 # 打开后每轮轮询都打印一行状态，便于定位「为什么一直判不到结束」（GEMINI_DEBUG=1）
 DEBUG = env_bool("GEMINI_DEBUG")
+
+# /session/reset 的可选访问令牌：留空则维持原行为（不校验）。
+# 该端点会让指定会话桶的下一轮重开对话，属于有副作用的本地操作，
+# 同机多用户环境下建议设置 RESET_TOKEN，调用时带 X-Reset-Token 头。
+RESET_TOKEN = env_str("RESET_TOKEN", "")
+
+# /v1/chat/completions 流式生成期间的 keep-alive 注释间隔（秒）；0 = 关闭。
+# 工具模式需要先缓冲整段回复才能判断 tool_calls，这期间客户端看不到内容，
+# 用注释保活避免客户端超时断连（此前硬编码 10s）。
+CHAT_KEEPALIVE_S = env_float("CHAT_KEEPALIVE_S", 10.0)
 
 
 # ==================== 回复结束检测 / 超时 ====================
@@ -135,6 +155,10 @@ SESSION_KEY_MAX_LEN = env_int("SESSION_KEY_MAX_LEN", 64)
 # 同时在用的会话桶数量上限。超出时**回收最久未用**的页面（状态保留，下次按 URL 恢复）。
 # 0 表示不允许额外会话桶（所有请求都走默认桶）；想彻底关闭分桶用 SESSION_SCOPING=false。
 MAX_SESSION_BUCKETS = env_int("MAX_SESSION_BUCKETS", 8)
+# 内存里缓存的会话状态上限（超出按最久未用逐出）。
+# 状态本就落盘（session_store._state 未命中会从磁盘恢复），逐出内存副本是安全的，
+# 避免长跑时 _sessions / _last_prompts / _locks 三个 dict 无界增长。0 = 不限制。
+MAX_SESSION_STATE_CACHE = env_int("MAX_SESSION_STATE_CACHE", 64)
 # 空闲页面的回收间隔（秒）：超过这个时间没被用过的桶页面会被关闭（0 = 不按空闲回收）。
 # 页面关掉不等于丢上下文：状态里的 url / turns 仍在，下次会重新打开并决定是否播种。
 BUCKET_IDLE_TTL_S = env_float("BUCKET_IDLE_TTL_S", 900)

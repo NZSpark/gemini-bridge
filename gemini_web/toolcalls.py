@@ -499,9 +499,18 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
                 calls.append(normalized)
 
     # 0. 首选形态：行首 TOOL_CALL: 后跟一个平衡 JSON 对象。
-    #    用 _iter_balanced_objects 逐对象解析，一行一个，天然支持多调用。
-    for match in _TOOL_CALL_LINE_RE.finditer(text):
-        segment = text[match.end():]
+    #
+    #    契约：**每个 TOOL_CALL: 标记只取其后第一个平衡 JSON 对象；一行一调用；
+    #    多个调用必须写成多行**。同行第二个对象会被丢弃（这是有意为之——
+    #    避免把标记之后的无关 {..} 当成调用吞进来）。
+    #
+    #    segment 必须截到**下一个 TOOL_CALL 标记之前**：否则某个标记后面若没跟
+    #    对象（模型写了标记又改主意），它会把下一个标记的对象当成自己的消费掉，
+    #    轮到下一个标记时又消费同一个对象 → 同一次调用重复出现两次。
+    matches = list(_TOOL_CALL_LINE_RE.finditer(text))
+    for index, match in enumerate(matches):
+        next_start = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        segment = text[match.end():next_start]
         objs = list(_iter_balanced_objects(segment))
         if not objs:
             # 平衡扫描失败：多半是值边界多/少了一个引号，导致字符串状态错乱、
