@@ -274,10 +274,55 @@ def _strip_redundant_value_quotes(raw: str) -> str:
     return "".join(out)
 
 
+def _escape_control_chars_in_strings(raw: str) -> str:
+    """把 JSON 字符串**内部**的裸控制字符转义（`\\n`/`\\r`/`\\t` 等）。
+
+    JSON 规范禁止字符串字面量里出现未转义的控制字符。模型写多行 shell
+    命令（如 heredoc）时，常把真实换行直接写进值里，导致：
+        json.loads: Invalid control character at ...
+    这类损伤**没有歧义**——字符串内的裸控制字符一律转义即可，是安全修复。
+
+    逐字符扫描，用 `in_string`/`escaped` 跟踪状态，只在字符串内部替换。
+    """
+    out = []
+    in_string = False
+    escaped = False
+    for ch in raw:
+        if not in_string:
+            out.append(ch)
+            if ch == '"':
+                in_string = True
+            continue
+        if escaped:
+            out.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            out.append(ch)
+            escaped = True
+            continue
+        if ch == '"':
+            out.append(ch)
+            in_string = False
+            continue
+        # 字符串内部：裸控制字符转义
+        if ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ord(ch) < 0x20:
+            out.append("\\u%04x" % ord(ch))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def _repair_json_quotes(raw: str) -> Optional[Any]:
     """尽力修复模型输出的非法 JSON。
 
-    三类常见损伤：
+    常见损伤：
       1. 字符串值里未转义的裸引号：
          {"cmd": "git commit -m "Update logic" && git push"}
       2. 值边界多余引号（模型给值又包了一层）：
@@ -286,11 +331,23 @@ def _repair_json_quotes(raw: str) -> Optional[Any]:
       3. 值内含嵌套的 shell 双引号，且末尾闭引号看似"丢失"：
          {"cmd": "git commit -m "msg"}
          逐字符启发式会把它当"字符串结束"而截断值、丢掉尾引号。
+      4. 值内有裸控制字符（多行命令/heredoc 的真实换行）：
+         json.loads: Invalid control character at ...
+         这类无歧义，优先修复。
 
-    处理顺序：先折叠边界冗余引号，再用「结构定位 + 内层全转义」重写，
-    最后回退到旧的逐字符状态机。只在首次 json.loads 失败后调用。
+    处理顺序：先折叠边界冗余引号、转义字符串内控制字符，再用逐字符
+    状态机修内层裸引号。只在首次 json.loads 失败后调用。
     """
     raw = _strip_redundant_value_quotes(raw)
+
+    # 无歧义修复优先：字符串内裸控制字符（多行命令的真实换行等）。
+    # 很多长指令只因这一项就无法解析，单独先试一次。
+    ctrl_fixed = _escape_control_chars_in_strings(raw)
+    if ctrl_fixed != raw:
+        try:
+            return json.loads(ctrl_fixed)
+        except Exception:
+            raw = ctrl_fixed  # 控制字符已修，继续尝试引号修复
 
     # 说明：曾尝试用"结构定位"重写值内嵌套引号，但 JSON 值内嵌 shell 双引号
     # 本质有歧义（无法区分"值的边界引号"与"正文引号"），实验版本会产出"合法

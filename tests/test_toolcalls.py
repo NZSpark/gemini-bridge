@@ -234,6 +234,33 @@ class ParseToolCallsTests(unittest.TestCase):
         )
 
 
+class ControlCharRepairTests(unittest.TestCase):
+    """多行命令（heredoc）里的真实换行：JSON 字符串内裸控制字符需转义。"""
+
+    def test_heredoc_newlines_repaired(self):
+        # 模型把多行命令的真实换行直接写进 JSON 字符串值。
+        # 手工拼一个"含裸换行"的 JSON（不走 json.dumps，否则会转义掉换行）。
+        cmd = "cat << 'EOF' > x.py\nprint('hi')\nEOF\n"
+        raw = '{"name": "exec_command", "arguments": {"cmd": "' + cmd + '"}}'
+        calls = parse_tool_calls("TOOL_CALL: " + raw, {"exec_command"})
+        self.assertEqual(len(calls), 1)
+        got = calls[0]["arguments"]["cmd"]
+        self.assertIn("cat << 'EOF' > x.py\n", got)
+        self.assertIn("print('hi')\n", got)
+
+    def test_tab_control_char_repaired(self):
+        text = 'TOOL_CALL: {"name": "exec_command", "arguments": {"cmd": "echo\thi"}}'
+        calls = parse_tool_calls(text, {"exec_command"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["arguments"]["cmd"], "echo\thi")
+
+    def test_wellformed_multiline_still_parses(self):
+        # 已正确转义 \n 的合法输入不受影响。
+        text = 'TOOL_CALL: {"name": "exec_command", "arguments": {"cmd": "a\\nb"}}'
+        calls = parse_tool_calls(text, {"exec_command"})
+        self.assertEqual(calls[0]["arguments"]["cmd"], "a\nb")
+
+
 class ShellGuardTests(unittest.TestCase):
     """护栏：shell 类命令引号不配对时丢弃，避免把坏命令发给 bash。"""
 
