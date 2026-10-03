@@ -97,7 +97,16 @@ class MetaPromptDetectionTests(unittest.TestCase):
 
         self.assertTrue(tasks._is_meta_prompt("只回复两个字：你好"))
         self.assertTrue(tasks._is_meta_prompt("只回复四个字：联网测试通过"))
-        self.assertTrue(tasks._is_meta_prompt("仅输出 OK"))
+        self.assertTrue(tasks._is_meta_prompt("只输出三个字"))
+
+    def test_normal_request_with_output_verb_is_not_meta(self):
+        # “请只输出下面这一行……”是正常用户请求，不能被误判成元提示而整条丢弃。
+        from gemini_web import tasks
+
+        self.assertFalse(
+            tasks._is_meta_prompt("请只输出下面这一行，不要任何解释、不要加代码围栏")
+        )
+        self.assertFalse(tasks._is_meta_prompt("更新README.md文件"))
 
 
 class ResumeBlockSanitizesPollutedGoalTests(unittest.TestCase):

@@ -70,16 +70,18 @@ def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
         if params:
             lines.append(f"  参数(JSON Schema): {json.dumps(params, ensure_ascii=False)}")
 
-    # 与 format_tool_call_emphasis 保持一致：统一使用 markdown 围栏 ```tool_call。
-    # 两处格式必须一致，否则同一 prompt 里出现互斥指令，模型会退回原生 DSML 标记。
+    # 统一使用 `TOOL_CALL: {json}` 纯文本行，**不要**用 ```tool_call 代码围栏。
+    # 原因：Gemini 网页版会把 markdown 代码围栏渲染成 Code snippet 组件，
+    # 取回 DOM 文本时围栏/换行被破坏，tool_call 解析失败；而普通文本行不会被
+    # 渲染成代码块，能原样取回。解析侧 _TOOL_CALL_LINE_RE 已把该形态列为首选。
     lines += [
         "",
-        "需要调用工具时，只输出一个或多个如下格式的代码块（arguments 必须是合法 JSON）：",
-        "```tool_call",
-        '{"name": "工具名", "arguments": {参数对象}}',
-        "```",
-        "一次可输出多个代码块以并行调用多个工具；代码块之外不要输出多余解释。",
-        "如果不需要调用任何工具，请直接给出最终回答，不要输出 tool_call 代码块。",
+        "需要调用工具时，只输出一个或多个如下格式的**纯文本行**（不要用代码围栏、"
+        "不要加 ```）：",
+        "TOOL_CALL: {\"name\": \"工具名\", \"arguments\": {参数对象}}",
+        "一行一个调用，arguments 必须是合法 JSON；",
+        "一次可输出多行以并行调用多个工具；TOOL_CALL 行之外不要输出多余解释。",
+        "如果不需要调用任何工具，请直接给出最终回答，不要输出 TOOL_CALL 行。",
     ]
     return "\n".join(lines)
 
@@ -92,10 +94,8 @@ def format_tool_call_emphasis() -> str:
     """
     return "\n".join([
         "[输出格式强调] 这是一个新会话（或刚被重置），以下规则本会话持续有效：",
-        "需要调用工具时，只输出一个或多个如下格式的代码块（arguments 必须是合法 JSON）：",
-        "```tool_call",
-        '{"name": "工具名", "arguments": {参数对象}}',
-        "```",
+        "需要调用工具时，只输出如下格式的**纯文本行**（不要用代码围栏、不要加 ```）：",
+        "TOOL_CALL: {\"name\": \"工具名\", \"arguments\": {参数对象}}",
         "工具名必须逐字使用 [工具调用说明] 中列出的名字，不要自造 bash / shell 之类的通用名。",
         "禁止输出 <｜DSML｜ ...>、<invoke>/<parameter>、<tool_calls> 等 XML/DSL 标记——它们不会被执行。",
     ])
@@ -211,6 +211,66 @@ def _tool_names(tools: Optional[List[Dict[str, Any]]]) -> set:
     return names
 
 
+def _repair_json_quotes(raw: str) -> Optional[Any]:
+    """尽力修复模型输出的非法 JSON（最常见：字符串值里未转义的裸引号）。
+
+    背景：要求模型输出 ``TOOL_CALL: {...}`` 时，它常把 shell 命令里的引号
+    原样写进 JSON 字符串，例如：
+        {"cmd": "git commit -m "Update logic" && git push"}
+    这里的内层 " 没有转义，标准 json.loads 直接失败。
+
+    做法：逐字符状态机，在**字符串内部**遇到引号时判断它是“真结束符”还是
+    “正文引号”。判定依据是它后面的第一个非空白字符——若为 JSON 结构符
+    （``:``/``,``/``}``/``]``）或已到结尾，则视为结束；否则视为正文引号并转义。
+    只在首次 json.loads 失败后调用，避免影响合法输入。
+    """
+    out = []
+    in_string = False
+    escaped = False
+    i = 0
+    n = len(raw)
+    while i < n:
+        ch = raw[i]
+        if not in_string:
+            out.append(ch)
+            if ch == '"':
+                in_string = True
+                escaped = False
+            i += 1
+            continue
+        # 处于字符串内部
+        if escaped:
+            out.append(ch)
+            escaped = False
+            i += 1
+            continue
+        if ch == "\\":
+            out.append(ch)
+            escaped = True
+            i += 1
+            continue
+        if ch == '"':
+            # 向后看第一个非空白字符，判断是否为字符串真结束
+            j = i + 1
+            while j < n and raw[j] in " \t\r\n":
+                j += 1
+            if j >= n or raw[j] in ":,}]":
+                out.append(ch)
+                in_string = False
+            else:
+                # 正文引号：转义后保留
+                out.append('\\"')
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    repaired = "".join(out)
+    try:
+        return json.loads(repaired)
+    except Exception:
+        return None
+
+
 def _iter_balanced_objects(text: str):
     """扫描文本，产出顶层、括号平衡的 JSON 对象字面量（能正确处理字符串与转义）。"""
     in_string = False
@@ -263,7 +323,11 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
         try:
             data = json.loads(raw)
         except Exception:
-            return
+            # 模型常把 shell 命令里的引号原样写进 JSON 字符串（未转义），
+            # 标准解析失败；退回尽力修复（见 _repair_json_quotes）。
+            data = _repair_json_quotes(raw)
+            if data is None:
+                return
         if isinstance(data, dict) and isinstance(data.get("tool_calls"), list):
             entries = data["tool_calls"]
         elif isinstance(data, dict) and isinstance(data.get("tool_uses"), list):
