@@ -67,7 +67,7 @@ def env_bool(key: str, default: bool = False) -> bool:
 
 # ==================== 服务监听 ====================
 HOST = env_str("HOST", "127.0.0.1")
-PORT = env_int("PORT", 8000)
+PORT = env_int("PORT", 8001)
 
 
 # ==================== 路径 ====================
@@ -187,7 +187,7 @@ TASK_KEEP_MESSAGES = env_int("TASK_KEEP_MESSAGES", 8)
 
 # ==================== DOM 选择器 ====================
 # 统一集中在这里，网页版改版时只需改这一处（也可用 .env 覆盖而无需改代码）。
-# 回复节点的候选选择器
+# 回复节点的候选选择器（逗号分隔的 CSS 列表，直接交给 query_selector_all）
 RESPONSE_SELECTORS = env_str(
     "RESPONSE_SELECTORS",
     'message-content, .model-response-text, .markdown, div[class*="response"]',
