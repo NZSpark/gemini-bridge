@@ -82,6 +82,23 @@ class NormalizeEntryTests(unittest.TestCase):
         out = _normalize_tool_entry({"name": "f", "arguments": '{"a": 1}'})
         self.assertEqual(out["arguments"], {"a": 1})
 
+    def test_multiline_command_with_inner_quotes(self):
+        # Real newlines plus unescaped inner quotes inside a JSON string value.
+        raw_command = "\n".join([
+            "python3 -c '",
+            "import os, glob",
+            'files = [y for x in os.walk(".") for y in glob.glob(os.path.join(x[0], "*"))]',
+            "print('done')",
+            "'",
+        ])
+        text = 'TOOL_CALL: {"name": "bash", "arguments": {"command": "' + raw_command + '"}}'
+        calls = parse_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["name"], "bash")
+        cmd = calls[0]["arguments"]["command"]
+        self.assertIn('os.walk(".")', cmd)
+        self.assertIn("glob.glob", cmd)
+
 
 class ParseToolCallsTests(unittest.TestCase):
     def test_fenced_call(self):

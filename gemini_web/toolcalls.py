@@ -100,15 +100,15 @@ def builtin_tool_names() -> set:
 
 
 def edit_markdown_spec() -> str:
-    """注入提示词的 edit_markdown 使用说明（附锚点/围栏注意事项）。"""
+    """Usage notes for edit_markdown injected into the prompt (anchors / fences caveats)."""
     return "\n".join([
-        "[edit_markdown 说明]",
-        "编辑 Markdown 文件时优先用 edit_markdown，不要整段重写后再做纯文本匹配：",
+        "[edit_markdown notes]",
+        "When editing a Markdown file, prefer edit_markdown over rewriting the whole file and doing plain-text matching:",
         'TOOL_CALL: {"name": "edit_markdown", "arguments": {"path": "README.md", '
-        '"start": <int>, "end": <int>, "new_text": "<替换内容>"}}',
-        "start/end 为 1-based 闭区间行号；区间外的内容（含空行、缩进、行尾空白）原样保留。",
-        "不要改到 ``` 围栏行；围栏内部内容不参与结构定位。",
-        "默认只返回 diff；确认无误后再用 write=true 落盘。",
+        '"start": <int>, "end": <int>, "new_text": "<replacement text>"}}',
+        "start/end are 1-based inclusive line numbers; content outside the range (including blank lines, indentation, trailing whitespace) is preserved verbatim.",
+        "Do not touch ``` fence lines; content inside a fence does not participate in structural positioning.",
+        "By default only a diff is returned; once confirmed, pass write=true to persist to disk.",
     ])
 
 
@@ -181,8 +181,8 @@ def execute_edit_markdown(args: Dict[str, Any], *, backup_dir: str = "output/bac
 def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
     """把 OpenAI tools 描述转换成注入网页版的自然语言指令。"""
     lines = [
-        "[工具调用说明]",
-        "你可以调用下列工具来完成任务（本轮对话中有效）：",
+        "[Tool Calling Instructions]",
+        "You can call the following tools to complete the task (valid for this turn):",
     ]
     for tool in tools:
         fn = tool.get("function", tool) if isinstance(tool, dict) else {}
@@ -191,43 +191,45 @@ def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
         params = fn.get("parameters", {})
         lines.append(f"- {name}: {desc}")
         if params:
-            lines.append(f"  参数(JSON Schema): {json.dumps(params, ensure_ascii=False)}")
+            lines.append(f"  parameters (JSON Schema): {json.dumps(params, ensure_ascii=False)}")
 
-    # 统一使用 `TOOL_CALL: {json}` 纯文本行，**不要**用 ```tool_call 代码围栏。
-    # 原因：Gemini 网页版会把 markdown 代码围栏渲染成 Code snippet 组件，
-    # 取回 DOM 文本时围栏/换行被破坏，tool_call 解析失败；而普通文本行不会被
-    # 渲染成代码块，能原样取回。解析侧 _TOOL_CALL_LINE_RE 已把该形态列为首选。
+    # Always use a plain-text `TOOL_CALL: {json}` line, **never** a ```tool_call code fence.
+    # Reason: the Gemini web UI renders markdown code fences as a Code snippet component,
+    # corrupting the fence/newlines when the DOM text is retrieved and breaking tool_call
+    # parsing; plain text lines are not rendered as code blocks and come back verbatim.
+    # The parser (_TOOL_CALL_LINE_RE) already treats that form as the preferred one.
     lines += [
         "",
-        "需要调用工具时，只输出一个或多个如下格式的**纯文本行**（不要用代码围栏、"
-        "不要加 ```）：",
-        "TOOL_CALL: {\"name\": \"工具名\", \"arguments\": {参数对象}}",
-        "arguments 必须是合法 JSON：字符串里的双引号必须转义成 \\\"（反斜杠+引号），"
-        "不能直接写裸的双引号；",
-        "如果参数是 shell 命令，命令内部请**改用单引号**（如 git commit -m 'msg'），"
-        "避免命令里的双引号与 JSON 边界引号冲突；",
-        "一行一个调用；一次可输出多行以并行调用多个工具；TOOL_CALL 行之外不要输出多余解释。",
-        "如果不需要调用任何工具，请直接给出最终回答，不要输出 TOOL_CALL 行。",
+        "When you need to call a tool, output only one or more of the following format as **plain text lines** (no code fences, "
+        "do not add ```):",
+        "TOOL_CALL: {\"name\": \"tool name\", \"arguments\": {arguments object}}",
+        "arguments must be valid JSON: double quotes inside strings must be escaped as \\\" (backslash+quote), "
+        "never write a bare double quote;",
+        "if an argument is a shell command, **switch to single quotes** inside the command (e.g. git commit -m 'msg'), "
+        "to avoid a clash between double quotes in the command and the JSON boundary quotes;",
+        "one call per line; you may output multiple lines to call multiple tools in parallel; do not output extra explanation outside the TOOL_CALL lines.",
+        "If you do not need to call any tool, just give the final answer directly; do not output a TOOL_CALL line.",
     ]
     return "\n".join(lines)
 
 
 def format_tool_call_emphasis() -> str:
-    """新会话 / 重置会话时，放在播种 prompt **开头**的格式强调块。
+    """Format-emphasis block placed at the start of the seed prompt for a new / reset session.
 
-    新 bucket 没有“示范过正确格式”的历史轮次，模型最容易在这时候
-    退回原生 DSML 标记；把带围栏示例的完整格式再点一遍，双保险。
+    A new bucket has no history turns that demonstrate the correct format, so the model is
+    most likely to fall back to native DSML markers at that point; repeating the full format
+    is a second safeguard.
     """
     return "\n".join([
-        "[输出格式强调] 这是一个新会话（或刚被重置），以下规则本会话持续有效：",
-        "需要调用工具时，只输出如下格式的**纯文本行**（不要用代码围栏、不要加 ```）：",
-        "TOOL_CALL: {\"name\": \"工具名\", \"arguments\": {参数对象}}",
-        "arguments 必须是合法 JSON：字符串里的双引号必须转义成 \\\"（反斜杠+引号），"
-        "不能直接写裸的双引号；否则网页端会把内容当代码渲染、导致参数被截断。",
-        "如果参数是 shell 命令，命令内部请**改用单引号**（如 git commit -m 'msg'），"
-        "避免命令里的双引号与 JSON 边界引号冲突。",
-        "工具名必须逐字使用 [工具调用说明] 中列出的名字，不要自造 bash / shell 之类的通用名。",
-        "禁止输出 <｜DSML｜ ...>、<invoke>/<parameter>、<tool_calls> 等 XML/DSL 标记——它们不会被执行。",
+        "[Output Format Emphasis] This is a new session (or one that was just reset); the following rules stay in effect for this whole session:",
+        "When you need to call a tool, output only the following format as **plain text lines** (no code fences, do not add ```):",
+        "TOOL_CALL: {\"name\": \"tool name\", \"arguments\": {arguments object}}",
+        "arguments must be valid JSON: double quotes inside strings must be escaped as \\\" (backslash+quote), "
+        "never write a bare double quote; otherwise the web UI renders the content as code and the arguments get truncated.",
+        "if an argument is a shell command, **switch to single quotes** inside the command (e.g. git commit -m 'msg'), "
+        "to avoid a clash between double quotes in the command and the JSON boundary quotes.",
+        "Use the tool names exactly as listed in [Tool Calling Instructions]; do not invent generic names like bash / shell.",
+        "Do not output XML/DSL markers such as <｜DSML｜ ...>, <invoke>/<parameter>, <tool_calls> - they will not be executed.",
     ])
 
 
@@ -437,6 +439,47 @@ def _escape_control_chars_in_strings(raw: str) -> str:
     return "".join(out)
 
 
+_NAME_ARG_COMMAND_RE = re.compile(
+    r'^\s*{\s*"name"\s*:\s*"(?P<name>[^"\\]+)"\s*,\s*"arguments"\s*:\s*{\s*"(?P<argkey>[A-Za-z_][A-Za-z0-9_]*)"\s*:\s*"',
+    re.DOTALL,
+)
+
+
+def _salvage_single_string_arg(raw: str):
+    """Salvage objects shaped like {"name": X, "arguments": {"<key>": "<body>"}}.
+
+    When the value string contains raw newlines or unescaped inner quotes that
+    defeat JSON repair, locate structurally: anchor name and the single argument
+    key with a regex, take everything from that key's opening quote up to the
+    object-closing quote before }}, and re-serialize. Only single-string-arg
+    objects are accepted, to avoid misreading multi-arg or nested shapes.
+    """
+    m = _NAME_ARG_COMMAND_RE.match(raw)
+    if not m:
+        return None
+    name = m.group("name")
+    argkey = m.group("argkey")
+    body_start = m.end()
+    stripped = raw.rstrip()
+    if not stripped.endswith("}}"):
+        return None
+    close = stripped.rindex('"')
+    if close < body_start:
+        return None
+    value = raw[body_start:close]
+    try:
+        value = json.loads('"' + value + '"')
+    except Exception:
+        escaped = value.replace("\\", "\\\\")
+        escaped = escaped.replace('"', '\\"')
+        escaped = escaped.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+        try:
+            value = json.loads('"' + escaped + '"')
+        except Exception:
+            return None
+    return {"name": name, "arguments": {argkey: value}}
+
+
 def _repair_json_quotes(raw: str) -> Optional[Any]:
     """尽力修复模型输出的非法 JSON。
 
@@ -526,6 +569,10 @@ def _repair_json_quotes(raw: str) -> Optional[Any]:
         out.append(ch)
         i += 1
     repaired = "".join(out)
+    # 引号修复后字符串体内可能仍留着裸控制字符（多行命令的真实换行）：
+    # 逐字符修复阶段不会转义它们，这里补一次，否则最终 json.loads 仍会报
+    # "Invalid control character" 而返回 None、整条调用被丢弃。
+    repaired = _escape_control_chars_in_strings(repaired)
     try:
         return json.loads(repaired)
     except Exception:
@@ -611,6 +658,9 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
             # 标准解析失败；退回尽力修复（见 _repair_json_quotes）。
             data = _repair_json_quotes(raw)
             if data is None:
+                salvaged = _salvage_single_string_arg(raw)
+                if salvaged is not None:
+                    calls.append(salvaged)
                 return
         if isinstance(data, dict) and isinstance(data.get("tool_calls"), list):
             entries = data["tool_calls"]
