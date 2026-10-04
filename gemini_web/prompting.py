@@ -78,13 +78,20 @@ DEFAULT_SEED_MAX_CHARS = 12000
 
 
 def _render_message(message: ChatMessage) -> str:
-    """把单条消息渲染成喂给网页版的一段文本。"""
-    content = _content_to_text(message.content).strip()
-    if message.role == "system":
-        return f"[系统指令]\n{content}"
+    """把单条消息渲染成喂给网页版的一段文本。
+
+    ``role == "tool"`` 的正文必须逐字节保留：Pi/Codex 的 read 结果会原样
+    作为 edit 工具的 oldText，任何 .strip() 抹掉的首尾空行/换行都会导致
+    "Could not find the exact text ... including all whitespace and newlines"。
+    其它角色仍是历史对话文本，去掉首尾空白无副作用。
+    """
+    raw = _content_to_text(message.content)
     if message.role == "tool":
         tag = f" {message.tool_call_id}" if message.tool_call_id else ""
-        return f"[工具执行结果{tag}]\n{content}"
+        return f"[工具执行结果{tag}]\n{raw}"
+    content = raw.strip()
+    if message.role == "system":
+        return f"[系统指令]\n{content}"
     if message.role == "assistant":
         return f"[你之前的回复]\n{content}"
     return content

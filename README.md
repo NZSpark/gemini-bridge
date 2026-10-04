@@ -215,6 +215,7 @@ gemini_web/
   models.py               OpenAI 兼容 Pydantic 模型
   prompting.py            messages -> 输入框文本、token 估算
   toolcalls.py            工具注入与解析
+  markdown_io.py          Markdown 提取与工具调用解析器
   driver.py               Playwright 浏览器驱动、会话生命周期
   chat_io.py              DOM 交互、输入框等待、页面内事件提交与代码块提取
   session_store.py        会话状态落盘与持久化管理
