@@ -123,6 +123,51 @@ class ChatIOMixin:
             raise last_error
         raise RuntimeError("上游请求未能发送")
 
+    @staticmethod
+    def _strip_code_noise(code_content: str, lang: str) -> str:
+        """剥离 Gemini 代码块界面噪声，但保留首尾空白。
+
+        旧实现直接 .strip()，会无条件抹掉开头/结尾的空白与空行。
+        对 README.md 这类要按原文匹配再改的文件是致命的：
+        首行空行、末尾换行被删后，edit 工具逐字节匹配就会失败。
+
+        这里只去掉头部的语言标签行与 Copy/Download 行，
+        正文的空白、空行、首尾换行全部原样保留。
+        """
+        text = code_content.replace("\r\n", "\n").replace("\r", "\n")
+        lines = text.split("\n")
+        lang_alt = re.escape(lang) if lang else r"[A-Za-z0-9_+#.-]*"
+        lang_line_re = re.compile(
+            r"^\s*(?:" + lang_alt + r"|bash|shell|sh|python|py|json|html|javascript|js|"
+            r"typescript|ts|css|sql|go|rust|java|cpp|c|markdown|md|txt)\s*$",
+            re.IGNORECASE,
+        )
+        copy_line_re = re.compile(
+            r"^\s*(?:" + lang_alt + r"|bash|shell|sh|python|py|json|html|javascript|js)?"
+            r"\s*(?:Copy|Download)\s*$",
+            re.IGNORECASE,
+        )
+        # 头部：允许先跳过空行，再剥语言标签 / Copy 行；
+        # 一旦遇到第一行正文就停，避免误删正文里同名的行。
+        start = 0
+        while start < len(lines):
+            line = lines[start]
+            if not line.strip():
+                start += 1
+                continue
+            if lang_line_re.match(line) or copy_line_re.match(line):
+                start += 1
+                continue
+            break
+        end = len(lines)
+        while end > start:
+            last = lines[end - 1]
+            if last.strip() and copy_line_re.match(last):
+                end -= 1
+                continue
+            break
+        return "\n".join(lines[start:end])
+
     async def _extract_code_blocks(self, element) -> List[dict]:
         """从某条回复的 DOM 节点中提取代码块（语言 + 纯代码文本）。"""
         extracted: List[dict] = []
@@ -139,10 +184,7 @@ class ChatIOMixin:
                     lang = lang_match.group(1)
 
             code_content = await self._complete_text(code_tag or code_el)
-            clean_code = re.sub(
-                r'^(?:' + lang + r'|bash|python|json|html|javascript)?\s*(?:Copy|Download)\s*\n',
-                '', code_content, flags=re.IGNORECASE
-            ).strip()
+            clean_code = self._strip_code_noise(code_content, lang)
 
             extracted.append({"lang": lang, "code": clean_code})
         return extracted
