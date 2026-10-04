@@ -206,6 +206,7 @@ gemini_web/
   prompting.py            messages -> 输入框文本、token 估算
   toolcalls.py            工具注入与解析
   driver.py               Playwright 浏览器驱动、会话生命周期
+  chat_io.py              DOM 交互、输入框等待与代码块提取
   streaming.py            SSE 流式编码
   responses.py            Responses API 映射
   tasks.py                会话桶任务快照
