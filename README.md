@@ -65,16 +65,26 @@ Pi 通过 `~/.pi/agent/models.json` 做模型发现，走 OpenAI **Chat Completi
 
 ```json
 {
-  "models": [
-    {
-      "id": "gemini-chat",
-      "name": "Gemini (本地桥接)",
-      "provider": "openai",
+  "providers": {
+    "gemini-web": {
       "baseUrl": "http://127.0.0.1:8001/v1",
-      "apiKey": "unused",
-      "model": "gemini-chat"
+      "api": "openai-completions",
+      "apiKey": "none",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false
+      },
+      "models": [
+        {
+          "id": "gemini-chat",
+          "name": "Gemini Pro (Web)",
+          "input": ["text"],
+          "contextWindow": 1000000,
+          "maxTokens": 65535
+        }
+      ]
     }
-  ]
+  }
 }
 ```
 
