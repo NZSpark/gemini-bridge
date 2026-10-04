@@ -708,7 +708,8 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
             if not parsed:
                 pos = match.end()
 
-    if valid_names:
+    # 护栏：若传入了 valid_names，则过滤掉不在其中的幻觉工具名；否则保留全部解析出的工具调用。
+    if valid_names is not None:
         calls = [c for c in calls if c.get("name") in valid_names]
 
     # 护栏：shell 类命令若双引号不配对，几乎必然是解析阶段把值截断/丢尾引号。
