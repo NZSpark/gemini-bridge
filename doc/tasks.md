@@ -46,13 +46,13 @@
 
 [x] T4.2 Tool Call 结尾语法强校验：收尾阶段校验 JSON 完整性，修正截断或回退普通文本。
 
-[ ] T4.3 会话缓存有界 LRU 逐出：SessionStore 的 _sessions 与 _locks 引入上限逐出机制，防止内存增长。
+[x] T4.3 会话缓存有界 LRU 逐出：SessionStore 的 _sessions 与 _locks 引入上限逐出机制，防止内存增长。
 
-[ ] T4.4 output/ 自动清理：服务启动及后台周期任务中，执行 OUTPUT_MAX_FILES 与 OUTPUT_MAX_AGE_DAYS 清理。
+[x] T4.4 output/ 自动清理：服务启动及后台周期任务中，执行 OUTPUT_MAX_FILES 与 OUTPUT_MAX_AGE_DAYS 清理。
 
-[ ] T4.5 任务快照 Agent 元素过滤：tasks.py 提取快照时过滤 Pi 重复的 System/Skill 模板，确保用户真实 goal 处于截断保护首位。
+[x] T4.5 任务快照 Agent 元素过滤：tasks.py 提取快照时过滤 Pi 重复的 System/Skill 模板，确保用户真实 goal 处于截断保护首位。
 
-[ ] T4.6 会话上限自动无缝轮转：达到 SESSION_MAX_TURNS 或 SESSION_MAX_TOKENS 时自动初始化新会话并播种任务快照。
+[x] T4.6 会话上限自动无缝轮转：达到 SESSION_MAX_TURNS 或 SESSION_MAX_TOKENS 时自动初始化新会话并播种任务快照。
 
 阶段 5：文档与规范
 
