@@ -207,6 +207,8 @@ def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
         "never write a bare double quote;",
         "if an argument is a shell command, **switch to single quotes** inside the command (e.g. git commit -m 'msg'), "
         "to avoid a clash between double quotes in the command and the JSON boundary quotes;",
+        "if an argument contains multi-line content or markdown code fences, escape every newline as \\n and every "
+        "double quote as \\\" inside the string; never emit a raw newline or a bare double quote inside a JSON string;",
         "one call per line; you may output multiple lines to call multiple tools in parallel; do not output extra explanation outside the TOOL_CALL lines.",
         "If you do not need to call any tool, just give the final answer directly; do not output a TOOL_CALL line.",
     ]
@@ -444,28 +446,79 @@ _NAME_ARG_COMMAND_RE = re.compile(
     re.DOTALL,
 )
 
+# 前面已完整闭合的字符串参数对，形如 `"path": "README.md",`。
+_STRING_ARG_PAIR_RE = re.compile(r'"(?P<key>[A-Za-z_][A-Za-z0-9_]*)"\s*:\s*"(?P<val>(?:[^"\\]|\\.)*)"\s*,')
 
-def _salvage_single_string_arg(raw: str):
-    """Salvage objects shaped like {"name": X, "arguments": {"<key>": "<body>"}}.
 
-    When the value string contains raw newlines or unescaped inner quotes that
-    defeat JSON repair, locate structurally: anchor name and the single argument
-    key with a regex, take everything from that key's opening quote up to the
-    object-closing quote before }}, and re-serialize. Only single-string-arg
-    objects are accepted, to avoid misreading multi-arg or nested shapes.
+def _parse_complete_string_args(raw: str):
+    """Parse leading ``"key": "value",`` pairs; return None if anything is off.
+
+    Used by :func:`_salvage_string_args` to recover the well-formed arguments
+    that precede an object's broken final string value.
+    """
+    text = raw.strip()
+    if text.endswith(","):
+        text = text[:-1].rstrip()
+    if not text:
+        return {}
+    out = {}
+    pos = 0
+    while pos < len(text):
+        m = _STRING_ARG_PAIR_RE.match(text, pos)
+        if not m:
+            return None
+        try:
+            out[m.group("key")] = json.loads('"' + m.group("val") + '"')
+        except Exception:
+            return None
+        pos = m.end()
+    return out
+
+
+def _salvage_string_args(raw: str):
+    """Salvage objects shaped like {"name": X, "arguments": {"<key>": "<body>"[, ...]}}.
+
+    When a value string contains raw newlines or unescaped inner quotes (the
+    common case for markdown / shell content) that defeat JSON repair, locate
+    structurally: anchor ``name`` and the leading string-valued argument key(s)
+    with a regex, take everything from that key's opening quote up to the
+    object-closing quote before ``}}``, and re-serialize. Only objects whose
+    preceding arguments are all well-formed quoted strings are accepted, which
+    keeps multi-key shapes like the ``write`` tool (path + content) working
+    while refusing to guess at nested/array values.
     """
     m = _NAME_ARG_COMMAND_RE.match(raw)
     if not m:
         return None
     name = m.group("name")
     argkey = m.group("argkey")
-    body_start = m.end()
+    body_start = m.end()  # first char of the anchored key's value
+    # Prefix covers any fully-quoted args before the anchored key; it starts
+    # right after the `{` that opens the arguments object (the one immediately
+    # preceding the anchored key), so the slice holds `"path": "...",` pairs.
+    brace = raw.rfind("{", 0, body_start)
+    if brace < 0:
+        return None
+    head = brace + 1
     stripped = raw.rstrip()
     if not stripped.endswith("}}"):
         return None
     close = stripped.rindex('"')
     if close < body_start:
         return None
+
+    # The prefix ends with the anchored key's own `"<argkey>": "` fragment
+    # (the regex consumed up to its opening quote). Drop that trailing fragment
+    # so only complete preceding `"key": "value",` pairs remain.
+    prefix = raw[head:body_start]
+    anchor_frag = '"' + argkey + '"'
+    anchor_pos = prefix.rfind(anchor_frag)
+    if anchor_pos >= 0:
+        prefix = prefix[:anchor_pos]
+    prefix_args = _parse_complete_string_args(prefix)
+    if prefix_args is None:
+        return None
+
     value = raw[body_start:close]
     try:
         value = json.loads('"' + value + '"')
@@ -477,7 +530,8 @@ def _salvage_single_string_arg(raw: str):
             value = json.loads('"' + escaped + '"')
         except Exception:
             return None
-    return {"name": name, "arguments": {argkey: value}}
+    prefix_args[argkey] = value
+    return {"name": name, "arguments": prefix_args}
 
 
 def _repair_json_quotes(raw: str) -> Optional[Any]:
@@ -658,7 +712,7 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
             # 标准解析失败；退回尽力修复（见 _repair_json_quotes）。
             data = _repair_json_quotes(raw)
             if data is None:
-                salvaged = _salvage_single_string_arg(raw)
+                salvaged = _salvage_string_args(raw)
                 if salvaged is not None:
                     calls.append(salvaged)
                 return
@@ -698,6 +752,14 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
             # 平衡扫描失败：多半是值边界多/少了一个引号，导致字符串状态错乱、
             # depth 回不到 0。先用边界引号归一化再扫一遍。
             objs = list(_iter_balanced_objects(_strip_redundant_value_quotes(segment)))
+        if not objs:
+            # 值内出现裸 `{`（如 markdown 里的 {"a":1}）会让字符串状态提前错乱，
+            # 平衡扫描切不出完整对象。改用锚点式 salvage：按 name/arguments/首个
+            # 键定位，一直取到对象收尾，绕开括号配对。
+            salvaged = _salvage_string_args(segment)
+            if salvaged is not None:
+                calls.append(salvaged)
+                continue
         for obj in objs:
             _consume(obj, allow_bare_object=True)
             break

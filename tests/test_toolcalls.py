@@ -193,6 +193,35 @@ class ParseToolCallsTests(unittest.TestCase):
         calls = parse_tool_calls(text)
         self.assertEqual(calls[0]["arguments"]["cmd"], 'echo "hi"')
 
+    def test_fenced_content_with_inner_object_recovered(self):
+        # 值内既有 markdown 围栏又有裸 `{...}` 时，平衡扫描会错位；
+        # 锚点式 salvage 应按 name/arguments 取到对象收尾，保留完整内容。
+        text = (
+            'TOOL_CALL: {"name": "write", "arguments": {"content": '
+            '"see ```json\n{\\"a\\":1}\n``` end"}}'
+        )
+        calls = parse_tool_calls(text, valid_names={"write"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["name"], "write")
+        self.assertEqual(
+            calls[0]["arguments"]["content"],
+            'see ```json\n{"a":1}\n``` end',
+        )
+
+    def test_multi_arg_fenced_content_with_raw_newline_recovered(self):
+        # write 工具常见形态：path + content，content 是多行围栏且值内带双引号。
+        text = (
+            'TOOL_CALL: {"name": "write", "arguments": {"path": "README.md", '
+            '"content": "```python\nclient = OpenAI(base_url=\\"http://x\\")\n```"}}'
+        )
+        calls = parse_tool_calls(text, valid_names={"write"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["arguments"]["path"], "README.md")
+        self.assertEqual(
+            calls[0]["arguments"]["content"],
+            '```python\nclient = OpenAI(base_url="http://x")\n```',
+        )
+
     def test_markdown_escaped_marker_recovered(self):
         # Gemini 网页版 markdown 渲染会插入反斜杠：TOOL\_CALL / exec\_command
         text = 'TOOL\\_CALL: {"name": "exec\\_command", "arguments": {"cmd": "mkdir -p doc"}}'
