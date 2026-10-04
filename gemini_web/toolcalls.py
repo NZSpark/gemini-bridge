@@ -60,6 +60,124 @@ _DSML_GENERIC_NAMES = {
 _SHELL_NAME_KEYWORDS = ("shell", "exec", "bash", "command", "term")
 
 
+# ==================== 内置工具：edit_markdown ====================
+# 桥接层内置的 Markdown 锚点编辑工具。模型只需给出行号区间与新文本，
+# 桥接层用 markdown_io 做围栏安全的定位/校验/保真写回，避免整段文本匹配。
+EDIT_MARKDOWN_TOOL_NAME = "edit_markdown"
+
+EDIT_MARKDOWN_TOOL: Dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": EDIT_MARKDOWN_TOOL_NAME,
+        "description": (
+            "按行号区间编辑本地 Markdown 文件：保留围栏代码块结构，"
+            "只替换 [start, end] 行，区间外字节级保真。默认只返回 diff（dry-run），"
+            "传 write=true 才落盘，落盘前自动备份。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "目标 Markdown 文件路径"},
+                "start": {"type": "integer", "description": "起始行号（1-based，闭区间）"},
+                "end": {"type": "integer", "description": "结束行号（1-based，闭区间）"},
+                "new_text": {"type": "string", "description": "替换 [start, end] 的新文本"},
+                "write": {
+                    "type": "boolean",
+                    "description": "true 才落盘；默认 false 仅返回 diff",
+                },
+            },
+            "required": ["path", "start", "end", "new_text"],
+        },
+    },
+}
+
+# 所有可由桥接层本地执行的内置工具。供响应层按需注入/执行。
+BUILTIN_TOOLS: List[Dict[str, Any]] = [EDIT_MARKDOWN_TOOL]
+
+
+def builtin_tool_names() -> set:
+    return {t["function"]["name"] for t in BUILTIN_TOOLS}
+
+
+def edit_markdown_spec() -> str:
+    """注入提示词的 edit_markdown 使用说明（附锚点/围栏注意事项）。"""
+    return "\n".join([
+        "[edit_markdown 说明]",
+        "编辑 Markdown 文件时优先用 edit_markdown，不要整段重写后再做纯文本匹配：",
+        'TOOL_CALL: {"name": "edit_markdown", "arguments": {"path": "README.md", '
+        '"start": <int>, "end": <int>, "new_text": "<替换内容>"}}',
+        "start/end 为 1-based 闭区间行号；区间外的内容（含空行、缩进、行尾空白）原样保留。",
+        "不要改到 ``` 围栏行；围栏内部内容不参与结构定位。",
+        "默认只返回 diff；确认无误后再用 write=true 落盘。",
+    ])
+
+
+def execute_edit_markdown(args: Dict[str, Any], *, backup_dir: str = "output/backups") -> Dict[str, Any]:
+    """桥接层本地执行 edit_markdown。返回可直接回传的结构化结果。
+
+    - 默认 dry-run：只返回统一 diff，不落盘。
+    - write=true 时先备份原文件，再原子写回。
+    - 任何结构性错误（围栏不配对、行号越界）都作为 error 返回，不抛给上层。
+    """
+    from . import markdown_io
+
+    path = args.get("path")
+    if not isinstance(path, str) or not path:
+        return {"ok": False, "error": "edit_markdown 需要 path"}
+    try:
+        start = int(args["start"])
+        end = int(args["end"])
+    except (KeyError, TypeError, ValueError):
+        return {"ok": False, "error": "edit_markdown 需要合法的 start/end"}
+    new_text = args.get("new_text", "")
+    if not isinstance(new_text, str):
+        return {"ok": False, "error": "edit_markdown 的 new_text 必须是字符串"}
+    do_write = bool(args.get("write", False))
+
+    try:
+        doc = markdown_io.read_md(path)
+    except FileNotFoundError:
+        return {"ok": False, "error": f"文件不存在：{path}"}
+    except markdown_io.MarkdownError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    total = len(doc.lines)
+    if start < 1 or end > total or start > end:
+        return {"ok": False, "error": f"行号越界：{start}-{end}（共 {total} 行）"}
+
+    try:
+        edited = markdown_io.apply_edit(doc, start, end, new_text)
+    except markdown_io.MarkdownError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    issues = markdown_io.verify(edited)
+    if issues:
+        return {
+            "ok": False,
+            "error": "编辑后结构校验未通过",
+            "issues": [{"code": i.code, "message": i.message, "line": i.line} for i in issues],
+        }
+
+    backup_path = None
+    if do_write:
+        try:
+            backup = markdown_io.backup_md(path, backup_dir=backup_dir)
+            backup_path = str(backup.backup_path)
+        except OSError as exc:
+            return {"ok": False, "error": f"备份失败：{exc}"}
+
+    diff = markdown_io.write_md(edited, path=path, dry_run=not do_write)
+    return {
+        "ok": True,
+        "path": path,
+        "start": start,
+        "end": end,
+        "written": do_write,
+        "backup": backup_path,
+        "diff": diff,
+    }
+
+
 def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
     """把 OpenAI tools 描述转换成注入网页版的自然语言指令。"""
     lines = [

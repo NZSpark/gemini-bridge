@@ -189,6 +189,14 @@ ENABLE_RESPONSES_API = env_bool("ENABLE_RESPONSES_API", True)
 # 流式生成期间发送 keep-alive 注释的间隔（秒）；0 = 关闭。
 # 网页版生成慢，Codex 侧 stream_idle_timeout_ms 较大时用它保活连接。
 RESPONSES_KEEPALIVE_S = env_float("RESPONSES_KEEPALIVE_S", 10.0)
+# ==================== 内置工具：edit_markdown ====================
+# 是否允许桥接层在本地执行模型发出的 edit_markdown（Markdown 锚点编辑）。
+# 关闭时 edit_markdown 仍可作为普通工具名被解析，由客户端自行执行。
+EDIT_MARKDOWN_LOCAL = env_bool("EDIT_MARKDOWN_LOCAL", False)
+# edit_markdown 落盘前的备份目录。
+EDIT_MARKDOWN_BACKUP_DIR = env_str("EDIT_MARKDOWN_BACKUP_DIR", "output/backups")
+
+
 # 工具模式下：是否先缓冲整段回复再判断 tool_calls（true = 需要缓冲，
 # 因为要等完整文本才能解析出 function_call；false = 直接透传文本增量）。
 RESPONSES_TOOL_BUFFER = env_bool("RESPONSES_TOOL_BUFFER", True)

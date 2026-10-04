@@ -100,6 +100,8 @@ generate_edit(doc, instruction, llm) -> (start, end, new_text)
 
 - `gemini_web/chat_io.py`：`_strip_code_noise()` 已修掉项目侧空白改写；本能力进一步避免“整段重写再匹配”。
 - 新增 `gemini_web/markdown_io.py`（纯逻辑，无浏览器依赖），新增 `tests/test_markdown_io.py`。
+- **已接入**：`gemini_web/toolcalls.py` 提供 `EDIT_MARKDOWN_TOOL` / `BUILTIN_TOOLS` / `edit_markdown_spec()` / `execute_edit_markdown()`；`prompting.build_prompt` 在工具列表含 `edit_markdown` 时追加使用说明；`server.py`（chat）与 `responses.py`（Responses）在 `EDIT_MARKDOWN_LOCAL=1` 时自动注册并本地执行，结果挂回对应 tool_call（含 diff / written / backup / error）。
+- 配置：`config.EDIT_MARKDOWN_LOCAL`（默认 false，仅注册 schema，不本地执行）、`config.EDIT_MARKDOWN_BACKUP_DIR`（默认 `output/backups`）。
 - README「故障排查」中“有头模式失焦”一条已过时（仍在讲 `bring_to_front()` / `focus()`），应改为“DOM 事件派发、不依赖焦点”，并补 `SEND_BUTTON_SELECTORS`。
 
 ## 8. 风险与取舍
@@ -121,7 +123,7 @@ generate_edit(doc, instruction, llm) -> (start, end, new_text)
 
 ## 10. 建议落地顺序
 
-1. `read_md` / 围栏扫描 / `locate` / `apply_edit` / `write_md` + 单元测试（无模型依赖）。
-2. `verify`（围栏配对/长度安全）+ 备份 + dry-run。
-3. `generate_edit` 接入现有 chat 通道，端到端联调。
+1. ✅ `read_md` / 围栏扫描 / `locate` / `apply_edit` / `write_md` + 单元测试（无模型依赖）。
+2. ✅ `verify`（围栏配对/长度安全）+ 备份 + dry-run。
+3. ✅ `generate_edit` + `edit_markdown` 接入 chat / Responses 通道（`EDIT_MARKDOWN_LOCAL=1` 时本地执行，默认 dry-run）。
 4. 补 README 与 `doc/tasks.md` 条目。

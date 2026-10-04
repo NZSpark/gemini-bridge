@@ -31,7 +31,14 @@ from .prompting import build_prompt, estimate_tokens
 from .responses import ResponsesRequest, handle_responses
 from . import tasks
 from .streaming import _stream_chat_completion
-from .toolcalls import _tool_names, parse_tool_calls, to_tool_call_models
+from .toolcalls import (
+    _tool_names,
+    EDIT_MARKDOWN_TOOL,
+    EDIT_MARKDOWN_TOOL_NAME,
+    execute_edit_markdown,
+    parse_tool_calls,
+    to_tool_call_models,
+)
 
 driver = GeminiWebDriver()
 
@@ -268,6 +275,23 @@ async def debug_dom():
     }
 
 
+def _run_local_edit_markdown(tool_calls):
+    """本地执行 edit_markdown，把结构化结果挂回对应调用。未开启时原样返回。"""
+    if not config.EDIT_MARKDOWN_LOCAL or not tool_calls:
+        return tool_calls
+    out = []
+    for call in tool_calls:
+        if call.get("name") == EDIT_MARKDOWN_TOOL_NAME:
+            result = execute_edit_markdown(
+                call.get("arguments") or {},
+                backup_dir=config.EDIT_MARKDOWN_BACKUP_DIR,
+            )
+            out.append({**call, "result": result})
+        else:
+            out.append(call)
+    return out
+
+
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def chat_completions(
     request: ChatCompletionRequest,
@@ -294,6 +318,9 @@ async def chat_completions(
     bucket = session_key or DEFAULT_SESSION_KEY
     tasks.record(bucket, request.messages)
     task_block = tasks.resume_block(bucket)
+
+    if config.EDIT_MARKDOWN_LOCAL and EDIT_MARKDOWN_TOOL_NAME not in _tool_names(request.tools):
+        request.tools = list(request.tools or []) + [EDIT_MARKDOWN_TOOL]
 
     # 两份文本：增量版（现有会话已有上下文）与播种版（新会话 / 轮转后需要重放历史）。
     # 到底用哪份由 driver 决定（只有它知道当前网页会话是否还有历史）。
@@ -359,6 +386,7 @@ async def chat_completions(
     sent_prompt = driver.sent_prompt(session_key) or prompt
     wants_tools = bool(request.tools) and request.tool_choice != "none"
     tool_calls = parse_tool_calls(reply_content, _tool_names(request.tools)) if wants_tools else []
+    tool_calls = _run_local_edit_markdown(tool_calls)
 
     if tool_calls:
         return ChatCompletionResponse(

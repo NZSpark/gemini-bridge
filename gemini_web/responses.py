@@ -26,7 +26,13 @@ from .driver import DEFAULT_SESSION_KEY
 from .models import ChatCompletionRequest, ChatMessage, ToolCall
 from .prompting import build_prompt, estimate_tokens
 from . import tasks
-from .toolcalls import _tool_names, parse_tool_calls
+from .toolcalls import (
+    _tool_names,
+    EDIT_MARKDOWN_TOOL,
+    EDIT_MARKDOWN_TOOL_NAME,
+    execute_edit_markdown,
+    parse_tool_calls,
+)
 
 
 # ==================== 请求模型（宽松接收）====================
@@ -234,6 +240,40 @@ def _map_exception(exc: Exception) -> Tuple[int, str]:
     return 500, "server_error"
 
 
+def _maybe_register_edit_markdown(request: ChatCompletionRequest) -> None:
+    """本地执行开启时，把 edit_markdown 注册进本轮工具列表（客户端未提供时）。"""
+    if not config.EDIT_MARKDOWN_LOCAL:
+        return
+    names = _tool_names(request.tools)
+    if EDIT_MARKDOWN_TOOL_NAME in names:
+        return
+    tools = list(request.tools or [])
+    tools.append(EDIT_MARKDOWN_TOOL)
+    request.tools = tools
+
+
+def _maybe_run_edit_markdown(tool_calls):
+    """本地执行 edit_markdown：把结果就地替换为结构化 tool 结果。
+
+    每个调用会变成 {"name": ..., "arguments": {...}, "result": {...}}，
+    其中 result 是 execute_edit_markdown 的返回值（含 diff / written / error）。
+    未开启本地执行或无可执行调用时原样返回。
+    """
+    if not config.EDIT_MARKDOWN_LOCAL or not tool_calls:
+        return tool_calls
+    out = []
+    for call in tool_calls:
+        if call.get("name") == EDIT_MARKDOWN_TOOL_NAME:
+            args = call.get("arguments") or {}
+            result = execute_edit_markdown(
+                args, backup_dir=config.EDIT_MARKDOWN_BACKUP_DIR
+            )
+            out.append({**call, "result": result})
+        else:
+            out.append(call)
+    return out
+
+
 # ==================== 共享执行（流式/非流式都走这里）====================
 
 
@@ -309,6 +349,7 @@ async def handle_responses(
         )
 
     chat_req = to_chat_request(req)
+    _maybe_register_edit_markdown(chat_req)
     if not chat_req.messages:
         return JSONResponse(
             status_code=400,
@@ -346,6 +387,7 @@ async def handle_responses(
         traceback.print_exc()
         return JSONResponse(status_code=500, content=_error_payload(str(exc), "server_error"))
 
+    tool_calls = _maybe_run_edit_markdown(tool_calls)
     return from_chat_response(
         reply, req.model, estimate_tokens(sent_prompt), tool_calls or None
     )

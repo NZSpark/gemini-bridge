@@ -226,4 +226,12 @@ def build_prompt(
     if use_tools and "[工具调用说明]" not in prompt:
         prompt = (prompt + "\n\n" + format_tools_instruction(tools)).strip()
 
+    if use_tools and any(
+        (t.get("function", t) or {}).get("name") == "edit_markdown" for t in tools
+    ):
+        from .toolcalls import edit_markdown_spec
+
+        if "[edit_markdown 说明]" not in prompt:
+            prompt = (prompt + "\n\n" + edit_markdown_spec()).strip()
+
     return prompt
