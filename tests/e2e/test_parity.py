@@ -58,7 +58,9 @@ def _copy_profile() -> None:
         shutil.rmtree(PROFILE_E2E, ignore_errors=True)
     if PROFILE_E2E.exists():
         raise unittest.SkipTest(f"无法刷新 profile 副本 {PROFILE_E2E}（是否被占用？）")
-    shutil.copytree(PROFILE, PROFILE_E2E)
+    shutil.copytree(
+        PROFILE, PROFILE_E2E, ignore=shutil.ignore_patterns('Singleton*', 'RunningChromeVersion')
+    )
     # 清掉从原目录带过来的 Chromium 单实例锁，否则副本起不来
     for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
         path = PROFILE_E2E / name

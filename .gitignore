@@ -16,6 +16,7 @@ env/
 
 # Playwright / Chromium persistent profile (contains login cookies)
 user_data/
+user_data_e2e/
 
 # Generated output
 output/

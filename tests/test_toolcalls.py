@@ -233,6 +233,35 @@ class ParseToolCallsTests(unittest.TestCase):
             'git status && git log -n 5 --oneline',
         )
 
+    def test_body_quote_before_bracket_kept(self):
+        # Gemini 网页渲染会把 \" 消耗掉，DOM 取回后值里是裸引号：
+        # [contenteditable="true"]。true 后面的引号紧跟 ]，再下一个是正文字符，
+        # 不能被当成字符串结束，否则字符串提前闭合、整条调用被丢弃。
+        text = (
+            'TOOL_CALL: {"name": "edit", "arguments": {"edits": [{"oldText": '
+            '"- `READY_SELECTOR`：`textarea, [contenteditable="true"]`，判定可输入。"}], '
+            '"path": "doc/design.md"}}'
+        )
+        calls = parse_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0]["arguments"]["edits"][0]["oldText"],
+            '- `READY_SELECTOR`：`textarea, [contenteditable="true"]`，判定可输入。',
+        )
+        self.assertEqual(calls[0]["arguments"]["path"], "doc/design.md")
+
+    def test_body_quote_with_raw_newlines_repaired(self):
+        # 裸引号 + 真实换行（多行 Markdown 未转义）叠加：仍应完整还原。
+        old = '- `A`：x\n- `READY_SELECTOR`：`textarea, [contenteditable="true"]`，判定。\n- `B`：y'
+        text = (
+            'TOOL_CALL: {"name": "edit", "arguments": {"edits": [{"oldText": "'
+            + old +
+            '"}]}}'
+        )
+        calls = parse_tool_calls(text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["arguments"]["edits"][0]["oldText"], old)
+
 
 class ControlCharRepairTests(unittest.TestCase):
     """多行命令（heredoc）里的真实换行：JSON 字符串内裸控制字符需转义。"""

@@ -383,9 +383,23 @@ def _repair_json_quotes(raw: str) -> Optional[Any]:
             j = i + 1
             while j < n and raw[j] in " \t\r\n":
                 j += 1
-            if j >= n or raw[j] in ":,}]":
+            if j >= n or raw[j] in ":,":
                 out.append(ch)
                 in_string = False
+            elif raw[j] in "}]":
+                # 引号后是 } / ] 时再看一层：值真结束时，} / ] 之后必然是
+                # 结构符（, } ]）或输入结束；若是正文引号（如
+                # `[contenteditable="true"]` 中 true 后面那个 `"`），紧跟的
+                # 是正文字符，不能当作字符串结束——否则字符串被提前闭合、
+                # 后续修复失败，整条工具调用被丢弃。
+                k = j + 1
+                while k < n and raw[k] in " \t\r\n":
+                    k += 1
+                if k >= n or raw[k] in ",}]":
+                    out.append(ch)
+                    in_string = False
+                else:
+                    out.append('\\"')
             else:
                 # 正文引号：转义后保留
                 out.append('\\"')

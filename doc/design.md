@@ -92,7 +92,8 @@ GeminiBridge/
 ├── cmdlog.md
 └── doc/
     ├── design.md             # 本文件
-    └── update.md             # 进度规划
+    ├── tasks.md              # 任务分解与状态跟踪
+    └── update.md             # 代码现状与重构分析
 ```
 
 ---
