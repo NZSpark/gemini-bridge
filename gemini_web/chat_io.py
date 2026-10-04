@@ -216,6 +216,44 @@ class ChatIOMixin:
         except Exception:
             return False
 
+    async def _bring_page_to_front(self, page) -> None:
+        """把页面带到前台并尝试激活窗口（无头模式无副作用）。
+
+        有头 Chromium 是真实窗口，失焦时会被系统降级为后台标签，
+        requestAnimationFrame 被节流，Gemini 懒渲染会卸载/延迟挂载输入框；
+        同时不在前台时 keyboard 事件可能落到别的窗口。带内重试前也调用它。
+        """
+        if page is None:
+            return
+        try:
+            await page.bring_to_front()
+        except Exception:
+            pass
+
+    async def _focus_input(self, page, chat_input) -> bool:
+        """聚焦输入框并确认焦点真的在它上面。
+
+        返回是否确认聚焦成功。失败时仍返回 False 而不抛错：
+        调用方应把它当作“可能发不出去”的降级信号，而不是致命错误。
+        """
+        if page is None or chat_input is None:
+            return False
+        try:
+            await chat_input.scroll_into_view_if_needed()
+        except Exception:
+            pass
+        try:
+            await chat_input.focus()
+        except Exception:
+            return False
+        try:
+            focused = await chat_input.evaluate(
+                "(n) => n === document.activeElement"
+            )
+        except Exception:
+            return False
+        return bool(focused)
+
     async def _send_chat_locked(self, prompt: str, on_delta=None,
                                 key: Optional[str] = None) -> tuple[str, List[dict]]:
         """发送单条消息并获取响应及提取的代码块。
@@ -231,18 +269,34 @@ class ChatIOMixin:
             if page is None:
                 raise RuntimeError("浏览器尚未初始化：找不到可用于发送的会话页面。")
             self._touch_page(bucket)  # 正在用的页面不会被空闲回收 / LRU 淘汰
-            # 1. 定位并填入输入框
+
+            # 0. 把页面带到前台。有头模式下窗口失焦会被系统降级为后台标签，
+            #    Gemini 的懒渲染会把输入框卸载或延迟挂载，wait_for_selector 全超时；
+            #    即使找到节点，不在前台时 fill()/press("Enter") 的按键也会落到别的窗口。
+            #    无头模式没有窗口焦点竞争，bring_to_front 无害。
+            await self._bring_page_to_front(page)
+
+            # 1. 定位输入框：单次 3s 命中不了就重试（每轮重试前重新激活页面）。
             chat_input = None
-            for selector in config.INPUT_SELECTORS:
-                try:
-                    chat_input = await page.wait_for_selector(selector, timeout=3000)
-                    if chat_input:
-                        break
-                except Exception:
-                    continue
+            for attempt in range(3):
+                for selector in config.INPUT_SELECTORS:
+                    try:
+                        chat_input = await page.wait_for_selector(selector, timeout=2000)
+                        if chat_input:
+                            break
+                    except Exception:
+                        continue
+                if chat_input:
+                    break
+                await self._bring_page_to_front(page)
 
             if not chat_input:
                 raise RuntimeError("无法找到对话输入框，请检查 Gemini 网页是否打开或处于登录状态。")
+
+            # 1.1 聚焦输入框，确认焦点真的落在它上面，再继续输入。
+            #     bring_to_front 后仍可能被其它窗口抢焦点，focus() 失败会让
+            #     keyboard.press("Enter") 打到别处，表现为「发了但没反应」。
+            await self._focus_input(page, chat_input)
 
             # 记录发送前最后一条回复的文本，用来判断“新回复是否已经出现”。
             # 注意：绝不能用“回复节点数量变多”来判断。

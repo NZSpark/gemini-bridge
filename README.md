@@ -13,6 +13,7 @@
 - **不丢任务**：会话轮转时按任务快照 + 历史播种，任务目标不被字符预算截断。
 - **登录态持久化**：浏览器 profile 落在 `user_data/`，登录一次即可复用。
 - **纯本地**：默认只监听 `127.0.0.1`。
+- **无头防失焦**：有头模式下窗口失焦会被系统降级为后台标签，Gemini 懒渲染卸载输入框导致发送失败；推荐 `HEADLESS=1`。
 
 ## 环境要求
 
@@ -129,7 +130,7 @@ codex --profile gemini
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `HOST` / `PORT` | `127.0.0.1` / `8001` | 监听地址 |
-| `HEADLESS` | `false` | 无头模式；首次登录需 `false` |
+| `HEADLESS` | `false` | 无头模式，推荐正式运行时设为 `1`；首次登录需 `false` |
 | `GEMINI_DEBUG` | `false` | 打印轮询状态、开放 `/debug/dom` |
 
 **结束判定与超时**
@@ -230,10 +231,11 @@ user_data/                浏览器 profile 与状态（gitignore）
 | --- | --- |
 | 一直判不到结束 | 设 `GEMINI_DEBUG=1` 看轮询日志；确认 `RESPONSE_SELECTORS` 命中 |
 | 工具调用参数被截断（如 JSON 只剩半截） | Gemini 逐 token 显现动画会让 `inner_text()` 取不到未显现的 token；代码已改为 `_complete_text`（去动画类后取全文）并在 `.pending` 清空前不收尾。若仍出现，检查页面是否新增了别的动画类名 |
-| 登录态失效 | `HEADLESS=0` 手动重登，profile 存在 `user_data/` |
+| 登录态失效 | `HEADLESS=0` 手动重登，profile 存在 `user_data/`；登录完成后设 `HEADLESS=1` 长跑 |
 | profile 被占用 | 同一时间只允许一个实例，先 `pkill` 旧进程 |
 | Codex 连接断开 | 调大客户端 `stream_idle_timeout_ms`，或调小 `RESPONSES_KEEPALIVE_S` |
 | 抓不到回复节点 | `/debug/dom` 定位，改 `.env` 里的选择器 |
+| 有头模式下报「无法找到对话输入框」/ 输入焦点丢失 | 有头 Chromium 是真实窗口，切到其它 App 会失焦，甚至被系统挂起或降级为后台标签。后台标签的 `requestAnimationFrame` 被节流，Gemini 懒渲染会卸载或延迟挂载输入框，`chat_io.py` 的 `wait_for_selector(INPUT_SELECTORS, timeout=3000)` 三个候选全部超时，于是抛「无法找到对话输入框」；窗口不在前台时 `fill()` + `press("Enter")` 的按键也会落到别的窗口。对策：在 `.env` 设 `HEADLESS=1`（解析器认 `1`/`true`/`yes`/`on`），无头不参与窗口焦点竞争，首次登录仍用有头，之后切无头；仍用有头时，发送前先 `page.bring_to_front()` 并 `focus()` 输入框，给定位加整体重试（如 3 次 × 2s，期间 `bring_to_front()`），并可加 `--disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows` 缓解后台节流 |
 
 ## 安全
 
