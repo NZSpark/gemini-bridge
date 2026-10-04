@@ -235,6 +235,18 @@ INPUT_SELECTORS = [
     ).split("||")
     if s.strip()
 ]
+# 发送按钮候选选择器（.env 中用 "||" 分隔多个候选）。
+# 优先用 DOM 事件发送（见 chat_io._submit_prompt），只有派发事件无效时才点它。
+SEND_BUTTON_SELECTORS = [
+    s.strip()
+    for s in env_str(
+        "SEND_BUTTON_SELECTORS",
+        'button[aria-label*="Send"]||button[aria-label*="send"]||'
+        'button[aria-label*="发送"]||button[data-test-id*="send"]||'
+        'button[type="submit"]',
+    ).split("||")
+    if s.strip()
+]
 # 页面就绪（输入框出现）用的选择器
 READY_SELECTOR = env_str(
     "READY_SELECTOR", 'rich-textarea, [contenteditable="true"], textarea'

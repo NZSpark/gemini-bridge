@@ -27,6 +27,10 @@ class FakeInput:
     async def fill(self, text):
         return None
 
+    async def evaluate(self, script):
+        # _dispatch_enter 的脚本会派发 Enter 键事件；假节点只回报“已派发”。
+        return True
+
 
 class FakeKeyboard:
     async def press(self, key):
