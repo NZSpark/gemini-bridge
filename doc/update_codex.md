@@ -198,4 +198,26 @@
 - §4 低优先级质量项（统一 logging、`ModelCard.context_window` 透出等）。
 
 **注意**：系统 `python` 未装 Playwright，跑测试请用 `.venv/bin/python`（本轮已通过惰性 import
-让纯逻辑模块不再依赖该库，但 `unittest discover` 仍会加载 driver 相关测试）。
+让纯逻辑模块不再依赖该库，但测试收集仍会加载 driver 相关模块）。
+
+### 8.1 后续进展（2026-10-06 复审轮，T10.3 复核）
+
+§8 的「未做」清单已逐项落地，状态以 `doc/update.md` / `doc/tasks.md`（v5）为准：
+
+| §8「未做」项 | 现状 |
+| --- | --- |
+| §3.5 路由级测试（`test_routes_*.py`） | ✅ 已补：`tests/test_routes_chat.py`、`tests/test_routes_responses.py`（T9.3）、`tests/test_auth.py`（T9.5） |
+| §4 统一 logging | ✅ 已实现：新增 `gemini_web/logging_setup.py`，全仓 `print` → `logging`，`GEMINI_DEBUG` 控级别（T8.1） |
+| §4 `ModelCard.context_window` 透出 | ✅ 已实现：`/v1/models` 返回 `context_window`（= `SESSION_MAX_TOKENS`），旧的 65536 / README 示例 1000000 三方矛盾已消除（T8.7） |
+| §2.6 端点加固 | ✅ 已加强：除 `RESET_TOKEN` 外新增可选 `BRIDGE_TOKEN`（Bearer）保护两个生成端点（T8.10） |
+| §3.6 `client_test.py` / `INSTALL.md` / `cmdlog.md` | 仍未做：需真实登录环境；对等测试改由 `tests/e2e/`（`GEMINI_E2E=1`）承担 |
+| §3.3 抽 `ReplyWatcher` | 仍未做：重构面大，建议在更多路由级测试就位后再动 |
+
+另两点与本文／§8 描述不同，以现状为准：
+
+1. 测试入口统一为 `.venv/bin/python -m pytest -q`（§8 里的 `unittest discover` 与
+   `153 用例` 是当时快照；现阶段为 **279 passed, 19 skipped**，unittest / pytest 混跑但由 pytest 统一收集）。
+2. `_prune_output_dir` 已公开为 `prune_output_dir` 并接入服务启动 / 后台周期任务（T7.2）。
+
+依赖与 CI 也已补上：`pyproject.toml`（`requires-python >=3.10` + 版本区间，`openai` 移入 dev extras）
+与 `.github/workflows/ci.yml`（T8.4 / T8.5）。

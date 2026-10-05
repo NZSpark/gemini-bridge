@@ -4,9 +4,12 @@
 
 状态标记：`[ ]` 未开始、`[~]` 进行中、`[x]` 完成（实现 + 验收测试齐备）。
 
-核对时间：2026-10-06（实施轮）；基线：`.venv/bin/python -m pytest -q` → **238 passed, 19 skipped**（本轮新增 20 个用例，全部不联网）。
+核对时间：2026-10-06（实施轮 + 随行轮，阶段 6–10 已全部落地）；基线：`.venv/bin/python -m pytest -q` → **279 passed, 19 skipped, 31 subtests passed**（随行轮新增 41 个不联网用例，238 → 279）。
 
-**联网实测状态（见 `doc/update.md` 第 10 节，真实 Gemini 登录）**：chat（流式/非流式）、tools（流式/非流式）、Responses（流式/非流式）、长文本结束判定、多轮增量、session 分桶**均已实测通过**；P0-1 / P0-2 因缺少触发条件（节点整体替换 / 两桶并发落盘）**未复现，仍待修**——“未复现”不等于“已排除”。
+**联网实测状态（见 `doc/update.md` 第 10 节，真实 Gemini 登录）**：chat（流式/非流式）、tools（流式/非流式）、Responses（流式/非流式）、长文本结束判定、多轮增量、session 分桶**均已实测通过**。两点关于 P0 的结论要分开看：
+
+- **P0-1（流式丢尾）**：代码层确认存在（节点整体替换时停发增量，而收尾只在「从未发过增量」时补全）；真实流量下未复现（缺触发条件），已按代码层修复并补回归用例（T6.1 / T9.1）。**“未复现”不等于“已排除”**——修复是为了从机制上消除它。
+- **P0-2（状态落盘）**：「跨桶读-改-写竞态」**已被实测证伪**（`_save_session_state` 无 `await`，单事件循环下不可打断；8 桶 × 30 轮强制交错零丢失）；真正的问题是 `write_text` 非原子，已改为临时文件 + `os.replace`（T6.2）。
 
 > 说明：update.md 指出「真正的代码缺陷只有两处（P0）」，因此 T6.x 为最高优先级；T7.x 为一致性修复（低成本、高确定性）；T8.x 为工程化；T9.x 为测试补全；T10.x 为文档同步。
 > 每个任务都给出**对应条目**与**验收标准**，验收未达成不得标记 `[x]`。
@@ -66,16 +69,23 @@
 
 ## 阶段 8：工程质量与可维护性（P2）
 
-- [ ] **T8.1 结构化日志**（P2-1）：以 `logging` 替换全仓 `print`，`GEMINI_DEBUG` 控制级别，提供统一观测面。
+- [x] **T8.1 结构化日志**（P2-1）—— **已实施**：新增 `gemini_web/logging_setup.py`（包级 handler、幂等、`propagate=False`），41 处 `print` 全部改为 `logging`（含 `traceback.print_exc()` → `exc_info=True`），级别由 `GEMINI_DEBUG` 决定（true → DEBUG，否则 INFO）。
+  - 验收：`tests/test_logging.py`（级别映射 / 幂等 / 输出格式 / **全包无裸 `print` 的结构性守护**）。
 - [x] **T8.2 异常可观测**（P2-2）—— **已实施**：`session_store` / `tasks` / `chat_io.prune_output_dir` 的关键副作用失败改为 `logging.warning`（不再 `except: pass`）。
 - [x] **T8.3 清理死代码**（P2-3）—— **已实施**：删除 `responses.py` 无调用的 `_resolve_session()`（`markdown_io.generate_edit` 属预留，保留）。
-- [ ] **T8.4 依赖固定**（P2-4）：新增 `pyproject.toml`（`requires-python >=3.10` + 版本区间）并锁定关键依赖；`openai` 移入 dev extras。
-- [ ] **T8.5 最小 CI**（P2-5）：新增 CI 流水线（安装依赖 + `pytest -q`，`GEMINI_E2E` 未设置时 E2E 保持 skip）。
-- [ ] **T8.6 测试框架统一**（P2-6）：统一到 pytest，或在文档中明确 unittest / pytest 并存（同步修正 `design.md` §7）。
-- [ ] **T8.7 `context_window` 一致化**（P2-7）：`models.SUPPORTED_MODELS`(65536)、`README.md:82`(1000000)、`/v1/models` 未透出三者对齐；要么透出并统一数值，要么删除以免误导。
-- [ ] **T8.8 `estimate_tokens` 注释**（P2-8）：在 `prompting.py` 注明这是「量级估算」，非精确值。
-- [ ] **T8.9 `edit_markdown` 路径约束**（P2-9）：限制写入到工作区根（拒绝 `..` / 仅允许相对路径），并在 README 安全节说明（`.env` 当前 `EDIT_MARKDOWN_LOCAL=true`）。
-- [ ] **T8.10 可选 `BRIDGE_TOKEN`**（P2-10）：为 `/v1/chat/completions` / `/v1/responses` 提供默认关闭的 Bearer 鉴权开关，保持向后兼容。
+- [x] **T8.4 依赖固定**（P2-4）—— **已实施**：新增 `pyproject.toml`（`requires-python >=3.10`，运行时依赖全部带区间）+ dev extras（`pytest` / `httpx2` / `openai`）；`requirements.txt` 同步为带区间的运行时列表。
+  - 验收：`tests/test_config_drift.py` 新增依赖防漂移（requirements ↔ pyproject 同名同集、关键依赖必须有版本约束、`openai` 只能在 dev）。
+- [x] **T8.5 最小 CI**（P2-5）—— **已实施**：`.github/workflows/ci.yml`（push/PR，Python 3.10 + 3.13 矩阵，装依赖后 `python -m pytest -q`）。
+  - 不装浏览器、不设 `GEMINI_E2E`，因此 E2E 全部 skip：CI 只跑不联网套件（全部用假 page / driver / TestClient）。
+- [x] **T8.6 测试框架统一**（P2-6）—— **已实施（走“明确并存”路线）**：标准入口统一为 `.venv/bin/python -m pytest -q`（`pyproject.toml` 设 `testpaths = ["tests"]`），`design.md` §7 写明 unittest / pytest 并存与为何不再把 `unittest discover` 当标准入口（收集不到 pytest 风格文件的 parametrize 用例）。
+- [x] **T8.7 `context_window` 一致化**（P2-7）—— **已实施（走“透出 + 统一数值”路线）**：`SUPPORTED_MODELS` 删掉硬编码的 `65536`，`ModelCard.context_window` 由 `/v1/models` 按 `SESSION_MAX_TOKENS`（会话轮转预算）填充；README 的 Pi 示例注明该值应以端点返回为准。
+  - 验收：`tests/test_routes_chat.py` 断言端点透出且随 `SESSION_MAX_TOKENS` 变化；`tests/test_models.py` 反向断言模型表里不再有硬编码值。
+- [x] **T8.8 `estimate_tokens` 注释**（P2-8）—— **已实施**：docstring 明确「量级估算 / order-of-magnitude，不是精确值」，并列出它同时充当计价单位的三个地方（`usage` / `SESSION_MAX_TOKENS` 轮转预算 / `/v1/models` 的 `context_window`），要求三处同源。
+- [x] **T8.9 `edit_markdown` 路径约束**（P2-9）—— **已实施**：新增 `config.EDIT_MARKDOWN_ROOT`（默认项目根，留空回落）与 `toolcalls._resolve_edit_path()`；路径先 `resolve()` 再校验必须落在根内，`../` 逃逸、根外绝对路径、软链接跳出一律拒绝（读写 / 备份 / 落盘用同一份解析结果）。
+  - 附带修复：目标是目录或权限不足时返回结构化 `读取失败：...`，不再把 `IsADirectoryError` 抛给上层。
+  - 验收：`tests/test_toolcalls.py::EditMarkdownPathGuardTests`（6 例：根内允许、`..` 与根外绝对路径拒绝、`write=true` 同关卡、根内写入真落盘 + 备份、目录目标不抛错）；README 安全节已说明。
+- [x] **T8.10 可选 `BRIDGE_TOKEN`**（P2-10）—— **已实施**：`config.BRIDGE_TOKEN`（默认空 = 不校验）+ FastAPI 依赖 `_require_bridge_token`，用 `dependencies=[Depends(...)]` 只挂在两个生成端点上；`/healthz`、`/v1/models` 保持开放。
+  - 验收：`tests/test_auth.py::BridgeTokenTests`（默认关闭可直接访问、缺头 / 错 token 401、正确 token 200、探活与模型发现不被挡）。
 
 ---
 
@@ -83,9 +93,10 @@
 
 - [x] **T9.1 流式节点替换回归**（对应 T6.1）—— 已实施：chat 4 例 + Responses 4 例。
 - [x] **T9.2 多桶并发落盘**（对应 T6.2）—— 已实施：8 桶 × 20 轮，每桶 `turns` 完整。
-- [ ] **T9.3 新增 `tests/test_routes_responses.py`**（对应 update.md §6）：覆盖 `/v1/responses` 路由级——`ENABLE_RESPONSES_API=false` 返回 404、非法 / 空 `input`、非流式结构。
-- [ ] **T9.4 `tasks.py` 表驱动单测**（对应 update.md §6）：`_is_environment_wrapper` / `_is_meta_prompt` 的多分支（各类 harness 注入块）。
-- [ ] **T9.5 鉴权分支测试**（对应 update.md §6）：`RESET_TOKEN` 设置后 `/session/reset` 缺失/错误头返回 403；`/debug/dom` 在 `GEMINI_DEBUG=false` 时 404。
+- [x] **T9.3 新增 `tests/test_routes_responses.py`**（对应 update.md §6）—— **已实施**（7 例）：`ENABLE_RESPONSES_API=false` → 404、空 `input` → 400（不是 500）、`input` 数组形态、浏览器未就绪 → 503、非流式结构（`object` / `status` / `output[].content[].text` / `usage`）、流式命名事件序列。
+- [x] **T9.4 `tasks.py` 表驱动单测**（对应 update.md §6）—— **已实施**：新增 `tests/test_tasks.py`（表驱动 12 + 11 例，覆盖 `environment_context` / `skills_instructions` / `permissions instructions` / `collaboration_mode` / `env` 等注入块与标题生成 / 交接 JSON / 字数约束类元提示），并覆盖 `_goal_from_messages` 选取与快照往返（goal 只写一次、跨命名空间隔离、recent 截断、开关关闭不落盘）。
+  - 有意锁定的边界：「标签 + 同行正文」（如 `<environment_context>请修复…`）**不**视为包装块，避免整条真实请求被丢掉。
+- [x] **T9.5 鉴权分支测试**（对应 update.md §6）—— **已实施**：新增 `tests/test_auth.py`（10 例）——`RESET_TOKEN` 缺失 / 错误头 403、正确头 200 且真的作用到指定桶、未设置时不校验；`/debug/dom` 在 `GEMINI_DEBUG=false` 时 404、调试开启但浏览器未就绪时 503；`BRIDGE_TOKEN` 的两个端点 401/200 分支（T8.10）。
 - [x] **T9.6 `_prune_output_dir` 保留策略单测**（对应 T7.2）—— 已实施：`tests/test_output_prune.py`（保留策略 / 启动清理 / 周期开关 / 缺失目录不致命）。
 - [x] **T9.7 E2E 脚手架定向回归测试**（本轮新增，对应 update.md 第 11 节）
   - 交付：`tests/test_e2e_harness.py`（9 用例，不联网、不起浏览器），守护 `_resolve_port`（拒绝 `0`/越界/非数字/非整数浮点/bool）、`BridgeServer.ensure_started`（端口非法快速失败、`503+init_error` 快速失败并清理、外部服务复用不重复拉起）、`DirectGeminiClient.start`（必须导航到 Gemini 入口、落点非 Gemini 或就绪失败时必须关闭浏览器）。
@@ -98,7 +109,7 @@
 
 - [x] **T10.1 `design.md` 同步**：§3 文件清单、§4 默认值/配置优先级、§7 测试框架说明 —— 已实施。
 - [x] **T10.2 `README.md` 同步**：配置表补全 + `SEND_BUTTON_SELECTORS` + `GEMINI_RETRIES` 措辞 —— 已实施。
-- [ ] **T10.3 复核历史分析文档状态**：`doc/update_codex.md` §8、`doc/update_pi.md` 的「已完成」条目与实现一致（并入 T7.5）。
+- [x] **T10.3 复核历史分析文档状态** —— **已实施**：在 `doc/update_codex.md`（新增 §8.1）与 `doc/update_pi.md`（新增 §4）追加「后续进展」对照表，逐条给出「已完成 / 仍未做」及对应任务卡；纠正两处过期快照（测试入口与用例数、`_prune_output_dir` 只在落盘时触发）。历史结论保留原文，不改写历史。
 - [x] **T10.4 Markdown 编辑设计稿归档**：原 `doc/update.md` 的设计稿已迁移至 `doc/markdown_io_design.md`，并修正 `gemini_web/markdown_io.py` 与 `doc/e2e_test_design.md` 的引用。
 
 ---
@@ -111,9 +122,12 @@
 | Phase 2 | T6.2 | ✅ 已完成（原“竞态”判断已实测证伪，改为修非原子写盘） |
 | Phase 3 | T7.1 / T7.2 / T7.6 | ✅ 已完成；T7.6 实测每请求省 877 tokens |
 | Phase 4 | T7.3 / T7.4 / T7.5 | ✅ 已完成（防漂移改为 config ↔ .env.example 双向校验） |
-| Phase 5 | T8.1 / T8.4 / T8.5 / T8.6 / T8.7 / T8.8 | ⏳ 待做（日志改造 / 依赖固定 / CI / 框架统一 / context_window / 注释） |
-| Phase 6 | T8.9 / T8.10 | ⏳ 待做（安全加固：edit_markdown 路径约束、可选 BRIDGE_TOKEN） |
-| 随行 | T9.3 / T9.4 / T9.5 / T10.3 | ⏳ 待做（responses 路由级测试 / tasks 表驱动单测 / 鉴权分支测试 / 历史文档复核） |
+| Phase 5 | T8.1 / T8.4 / T8.5 / T8.6 / T8.7 / T8.8 | ✅ 已完成（日志改造 / 依赖固定 / CI / 框架统一 / context_window / 注释） |
+| Phase 6 | T8.9 / T8.10 | ✅ 已完成（安全加固：edit_markdown 路径约束、可选 BRIDGE_TOKEN） |
+| 随行 | T9.3 / T9.4 / T9.5 / T10.3 | ✅ 已完成（responses 路由级测试 / tasks 表驱动单测 / 鉴权分支测试 / 历史文档复核） |
+
+> 阶段 6–10 至此全部完成。后续若要继续推进，建议方向见 `doc/update.md` 的“仍未做”与 §8.1 / §4
+> 对照表中明确标注的「仍未做」两项（`ReplyWatcher` 重构、真实环境专属交付物）。
 
 ---
 

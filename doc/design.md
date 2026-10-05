@@ -80,6 +80,7 @@ GeminiBridge/
 │   ├── chat_io.py            # 发送 / 轮询 / 提取 / 落盘清理（ChatIOMixin）
 │   ├── streaming.py          # chat completions 的 SSE 编码
 │   ├── responses.py          # Responses API 兼容层（命名 SSE 事件）
+│   ├── logging_setup.py      # 统一日志配置（GEMINI_DEBUG 控级别，见 §9）
 │   └── server.py             # FastAPI app、路由、会话桶、健康检查
 ├── tests/                    # unittest + pytest 混合，全部用假 page / driver
 │   ├── test_config.py        test_config_drift.py   test_doc_sync.py
@@ -87,9 +88,12 @@ GeminiBridge/
 │   ├── test_parsing.py       test_seed_prompt.py    test_markdown_io.py
 │   ├── test_end_detection.py test_sessions.py       test_responses.py
 │   ├── test_streaming.py     test_routes_chat.py    test_output_prune.py
-│   ├── test_e2e_harness.py   # E2E 脚手架的定向回归（不联网）
+│   ├── test_routes_responses.py  test_auth.py       test_tasks.py
+│   ├── test_logging.py       test_e2e_harness.py    # 不联网
 │   └── e2e/                  # 真实联网对等测试（GEMINI_E2E=1 才跑）
-├── requirements.txt
+├── pyproject.toml            # 依赖声明（运行时 + dev extras）与 pytest 配置
+├── .github/workflows/ci.yml  # CI：安装依赖 + 跑不联网套件
+├── requirements.txt          # 运行时依赖（与 pyproject 同名同区间，防漂移守护）
 ├── .env                      # 已存在，实际生效配置（gitignore）
 ├── .env.example              # 全量配置模板（防漂移测试双向守护）
 ├── .gitignore
@@ -137,7 +141,9 @@ GeminiBridge/
 
 ### 运行模式 / 调试
 - `HEADLESS`：无头模式，首次登录需 `false`，默认 `false`。
-- `GEMINI_DEBUG`：开启后每轮轮询打印状态，并启用 `/debug/dom`（不回显正文），默认 `false`。
+- `GEMINI_DEBUG`：开启后日志级别降为 `DEBUG`（逐轮轮询状态、keep-alive、会话键），并启用 `/debug/dom`（不回显正文），默认 `false`。
+- `RESET_TOKEN`：设置后 `/session/reset` 需带 `X-Reset-Token` 头，否则 403，默认空（不校验）。
+- `BRIDGE_TOKEN`（T8.10）：设置后 `/v1/chat/completions` 与 `/v1/responses` 需带 `Authorization: Bearer <同值>`，否则 401，默认空（关闭，向后兼容）；`/healthz` 与 `/v1/models` 不受影响。
 
 ### 路径
 - `USER_DATA_DIR`：Chromium 持久化用户目录，默认 `./user_data`，勿提交。
@@ -169,6 +175,18 @@ GeminiBridge/
 - `RESPONSES_KEEPALIVE_S`：流式 keep-alive 注释间隔（秒），默认 `10.0`，`0` = 关闭。
 - `RESPONSES_TOOL_BUFFER`：工具模式是否先缓冲整段回复再解析 `tool_calls`，默认 `true`。
 
+### 内置工具：edit_markdown
+- `EDIT_MARKDOWN_LOCAL`：允许桥接层本地执行，默认 `false`（仅解析，由客户端执行）。
+- `EDIT_MARKDOWN_ALWAYS_REGISTER`：客户端未声明任何工具时是否仍注入，默认 `false`（自动注入约多付 970 tokens）。
+- `EDIT_MARKDOWN_BACKUP_DIR`：落盘前备份目录，默认 `output/backups`。
+- `EDIT_MARKDOWN_ROOT`（T8.9）：允许读写的工作区根，默认项目根目录（留空即回落）。
+  路径先 `resolve()` 再校验必须落在根内：`../` 逃逸、根外绝对路径、经软链接跳出都会被拒绝。
+
+### 代码落盘 / 保留策略
+- `SAVE_FILES`：是否落盘回复代码块，默认 `false`；请求字段 `save_files` 仅在显式传入时覆盖。
+- `OUTPUT_MAX_FILES` / `OUTPUT_MAX_AGE_DAYS`：保留策略，默认 `0`（不限）。
+- `OUTPUT_PRUNE_INTERVAL_S`：后台周期清理间隔（秒），默认 `3600`；启动时必定清一次，`0` = 只保留启动清理。
+
 ---
 
 ## 5. 模块设计
@@ -181,6 +199,9 @@ GeminiBridge/
 ### 5.2 `models.py`
 - `ChatCompletionRequest`：`model`、`messages`、`tools`、`stream`、`user` 等；`extra="allow"` 宽松校验，未知字段（`temperature`、`reasoning_effort`、内容分片数组等）一律接受，绝不返回 422。
 - 响应模型：`ChatCompletion`、`ChatCompletionChunk`、`ToolCall`、`Usage`。
+- `ModelCard.context_window`：由 `/v1/models` 透出，值取 `SESSION_MAX_TOKENS`（会话轮转预算），
+  作为客户端裁剪上下文的唯一权威数值（旧版把 `65536` 硬编码在 `SUPPORTED_MODELS`，与 README
+  的 `1000000` 互相矛盾，见 T8.7）。
 - `ResponsesRequest` / `ResponsesResponse`：Responses API 结构。
 - `ErrorResponse`：OpenAI 兼容 `error` 对象。
 
@@ -216,7 +237,8 @@ GeminiBridge/
 - 错误映射为 Responses 兼容错误结构。
 
 ### 5.8 `server.py`
-- 路由：`GET /v1/models`、`POST /v1/chat/completions`、`POST /v1/responses`（受 `ENABLE_RESPONSES_API` 控制）、`GET /healthz`、`GET /debug/dom`（受 `GEMINI_DEBUG` 控制，不回显正文）。
+- 路由：`GET /v1/models`（透出 `context_window`）、`POST /v1/chat/completions`、`POST /v1/responses`（受 `ENABLE_RESPONSES_API` 控制）、`GET /healthz`、`POST /session/reset`（受 `RESET_TOKEN` 控制）、`GET /debug/dom`（受 `GEMINI_DEBUG` 控制，不回显正文）。
+- 鉴权（T8.10）：两个生成端点可选用 Bearer 门控（`BRIDGE_TOKEN`，默认关闭）；设置后用 FastAPI 依赖在进入处理函数前返回 401，`/healthz`、`/v1/models` 保持开放。
 - 会话桶：键优先 `X-Gemini-Session`，其次 `user`，最后（`SESSION_SCOPING_BY_UA=true` 时）User-Agent。
 - `PARALLEL_BUCKETS=true` 时各桶独立页面并行；`MAX_SESSION_BUCKETS` 限制总数。
 - `BUCKET_LOCK_TIMEOUT_S>0` 时同桶排队超时返回 503 `upstream_busy`。
@@ -246,7 +268,8 @@ GeminiBridge/
 - 以标准库 `unittest` 为主，部分文件（如 `test_config_drift.py`、`test_output_prune.py`）为 pytest 风格；两者都由 `pytest -q` 统一收集。
 - 用假 page / 假 driver 驱动，不启动浏览器、不需额外依赖；`tests/e2e/` 是真实联网对等测试，`GEMINI_E2E=1` 才运行，否则全部 skip。
 - 覆盖：配置解析与默认值、prompting 拼接、toolcalls 注入与解析、结束判定、会话生命周期（播种 / 到顶 / 轮转 / 重试 / 分桶 / 回收 / 锁）、chat 路由、Responses 路由。
-- 运行：`.venv/bin/python -m unittest discover -s tests -t . -v`。
+- 运行（**统一入口**）：`.venv/bin/python -m pytest -q`；`unittest discover` 仍可单独跑某个文件，但不再作为标准入口（`tests/test_config_drift.py` 等为 pytest 风格，discover 收集不到 parametrize 用例）。
+- 依赖：运行时用 `pip install -r requirements.txt`，跑测试用 `pip install -e ".[dev]"`（含 pytest / httpx2 / openai，见 `pyproject.toml`）；CI 见 `.github/workflows/ci.yml`（不设 `GEMINI_E2E`，E2E 保持 skip）。
 
 ---
 
@@ -257,4 +280,17 @@ GeminiBridge/
 - **profile 被占用**：同一时间只允许一个实例，重复启动给出提示并建议 `pkill`。
 - **结束判定误判**：双阈值（`STABLE_POLLS` / `LEN_STABLE_POLLS`），偏保守。
 - **Codex 连接断开**：`RESPONSES_KEEPALIVE_S` 保活，客户端侧调大 `stream_idle_timeout_ms`。
-- **安全**：只监听 `127.0.0.1`，不提交 `user_data/`。
+- **安全**：只监听 `127.0.0.1`，不提交 `user_data/`；`RESET_TOKEN` / `BRIDGE_TOKEN` 可给有副作用的端点加门槛；
+  本地 `edit_markdown` 只能改 `EDIT_MARKDOWN_ROOT` 内的文件（默认项目根），`../` 与根外绝对路径均被拒绝。
+
+---
+
+## 9. 可观测性（T8.1）
+
+- 全仓统一用 `logging`，不再有裸 `print`；由 `tests/test_logging.py` 对包源码做结构性守护。
+- `logging_setup.setup_logging()` 在 `server.py` 导入时安装**包级** handler（幂等，`propagate=False`），
+  格式为 `时间 级别 模块名: 消息`，输出到 stdout（与 uvicorn 日志一致地可被重定向收集）。
+- 级别只由 `GEMINI_DEBUG` 决定：`true` → `DEBUG`，否则 `INFO`；pytest 下不自动接管，保持测试输出干净。
+- 级别约定：客户端可区分的上游状况（到顶、繁忙）用 `WARNING`；超时 / 浏览器不可用 / 未知异常用
+  `ERROR` + `exc_info=True`（保留栈，替代原先的 `traceback.print_exc()`）；状态变更（轮转、恢复、清理、
+  保存文件）用 `INFO`；逐轮轮询 / keep-alive / 会话键用 `DEBUG`。

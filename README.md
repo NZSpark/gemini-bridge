@@ -21,8 +21,12 @@
 - Playwright + Chromium
 
 ```bash
+# 运行时依赖
 pip install -r requirements.txt
 playwright install chromium
+
+# 若要跑测试 / 用 openai SDK 联调（dev extras 含 pytest / httpx2 / openai）
+pip install -e ".[dev]"
 ```
 
 ## 快速开始
@@ -88,8 +92,15 @@ Pi 通过 `~/.pi/agent/models.json` 做模型发现，走 OpenAI **Chat Completi
 }
 ```
 
+启动 Pi 并指定模型：
+```bash
+pi --provider gemini-web --model gemini-chat
+```
+
 - 模型名用 `/v1/models` 返回的 `gemini-chat` 或 `gemini-reasoner`。
-- Pi 会自动请求 `GET /v1/models` 做模型发现，无需手填上下文长度。
+- Pi 会自动请求 `GET /v1/models` 做模型发现；该端点现在会返回 `context_window`
+  （= `SESSION_MAX_TOKENS`，会话轮转预算），上面示例里的 `1000000` 就是它的值。
+  改了 `SESSION_MAX_TOKENS` 请以端点返回为准，不要手写另一个数（旧版本这里曾与代码里的 `65536` 互相矛盾）。
 - 想固定会话桶可加请求头 `X-Gemini-Session: <name>`（见「配置」的 `SESSION_KEY_HEADER`）。
 
 ### Codex CLI 接入
@@ -196,6 +207,7 @@ codex --profile gemini
 | `OUTPUT_MAX_AGE_DAYS` | `0` | `output/` 最长保留天数（0 不限） |
 | `OUTPUT_PRUNE_INTERVAL_S` | `3600` | 后台周期清理间隔（秒）；启动时一定清一次，0 = 只保留启动清理 |
 | `RESET_TOKEN` | 空 | 设置后 `/session/reset` 需带 `X-Reset-Token` 头 |
+| `BRIDGE_TOKEN` | 空 | 设置后 `/v1/chat/completions` 与 `/v1/responses` 需带 `Authorization: Bearer <同值>`，否则 401（`/healthz`、`/v1/models` 不受影响） |
 | `CHAT_KEEPALIVE_S` | `10.0` | chat 流式 keep-alive 间隔（0 关闭） |
 
 **内置工具：edit_markdown**
@@ -205,6 +217,7 @@ codex --profile gemini
 | `EDIT_MARKDOWN_LOCAL` | `false` | 允许桥接层本地执行 `edit_markdown`（默认只注册 schema，由客户端执行） |
 | `EDIT_MARKDOWN_ALWAYS_REGISTER` | `false` | 客户端未声明任何工具时是否仍注入 `edit_markdown`。开启会给每个请求多付约 970 tokens 脚手架 |
 | `EDIT_MARKDOWN_BACKUP_DIR` | `output/backups` | 落盘前的备份目录 |
+| `EDIT_MARKDOWN_ROOT` | 项目根目录 | 允许读写的工作区根；`../` 逃逸、指向根外的绝对路径、软链接跳出都会被拒绝 |
 
 **Responses API**
 
@@ -247,7 +260,10 @@ gemini_web/
   streaming.py            SSE 流式编码
   responses.py            Responses API 映射
   tasks.py                会话桶任务快照
+  logging_setup.py        统一日志配置（GEMINI_DEBUG 控制级别）
   server.py               FastAPI 应用与路由
+pyproject.toml            依赖声明（运行时 + dev extras）与 pytest 配置
+.github/workflows/ci.yml  CI：安装依赖 + 跑不联网的回归套件
 doc/design.md             设计文档
 doc/tasks.md              任务分解与验收标准
 output/                   回复与代码块落盘（gitignore）
@@ -280,7 +296,14 @@ user_data/                浏览器 profile 与状态（gitignore）
 - 默认仅监听 `127.0.0.1`，不要暴露到公网。
 - `.env`、`user_data/`（含登录 cookie）、`output/` 均不提交。
 - `user_data/` **不要备份 / 同步**（iCloud、Dropbox 等会带走登录态）；DEBUG 日志不含消息正文。
+- `edit_markdown` 本地执行时只能改工作区根（`EDIT_MARKDOWN_ROOT`，默认项目根）内的文件：
+  `../` 逃逸、根外绝对路径、经软链接跳出的路径一律拒绝；真正的落盘还要显式 `write=true`，
+  并先备份到 `EDIT_MARKDOWN_BACKUP_DIR`。
+- 需要给生成端点加一层本地门槛时设 `BRIDGE_TOKEN`（默认关闭，向后兼容）；
+  它只保护 `/v1/chat/completions` 与 `/v1/responses`，探活与模型发现保持开放。
 
 ## 状态
 
-配置、模型、prompting、toolcalls、driver、streaming、responses、server 均已实现；测试套件与文档仍在补全（见 `doc/tasks.md`）。
+配置、模型、prompting、toolcalls、driver、streaming、responses、server 均已实现；
+`doc/tasks.md` 的阶段 6–10 已全部落地（含日志改造、依赖固定、CI、鉴权开关与测试补全），
+真实联网对等测试见 `doc/e2e_test_design.md`（`GEMINI_E2E=1` 才跑）。

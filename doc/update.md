@@ -313,3 +313,35 @@ T9.4 `tasks.py` 表驱动单测、T9.5 鉴权分支测试、T10.x 剩余文档�
 > 另注：上述改动均在**新代码**上验证；当时运行的存量服务（PID 33060）仍跑着旧代码，
 > 未重启以避免抢占 `user_data` profile。T7.6 的收益是用本地复算量化验证的，
 > 下次重启服务后可用线上 `usage.prompt_tokens` 复核（预期无工具请求从 ~970 降到 ~93）。
+
+---
+
+## 13. 随行轮：P2 与测试缺口收尾（已实施并验证）
+
+接上一节，把 §4（P2）与 §6（测试缺口）的剩余项全部落地。每一项都附了守护测试，验收标准见 `doc/tasks.md`。
+
+| 任务 | 改动 | 验证 |
+| --- | --- | --- |
+| T8.1 | 新增 `logging_setup.py`；41 处 `print` → `logging`（含 `traceback.print_exc()` → `exc_info=True`）；级别由 `GEMINI_DEBUG` 决定；`server.py` 导入时安装包级 handler（幂等、`propagate=False`） | `tests/test_logging.py`（级别 / 幂等 / 格式 / **全包无裸 `print`**） |
+| T8.4 | 新增 `pyproject.toml`（`requires-python >=3.10`、运行时依赖带区间、dev extras = pytest/httpx2/openai）；`requirements.txt` 同步带区间、`openai` 移出运行时 | `test_config_drift.py` 依赖防漂移（名字集合一致、必须有版本约束、`openai` 仅 dev） |
+| T8.5 | 新增 `.github/workflows/ci.yml`（push/PR，3.10 + 3.13，装依赖后 `pytest -q`） | 不设 `GEMINI_E2E` → E2E 保持 skip |
+| T8.6 | 标准入口统一为 `python -m pytest -q`（`pyproject` 设 `testpaths`）；`design.md` §7 写明混合框架与为何弃用 `unittest discover` 作入口 | 人工核对 + 全量回归 |
+| T8.7 | `ModelCard.context_window` 透出（= `SESSION_MAX_TOKENS`）；`SUPPORTED_MODELS` 删掉硬编码 `65536`；README 示例注明以端点为准 | `test_routes_chat.py`（透出 + 随配置变化）、`test_models.py`（不再硬编码） |
+| T8.8 | `estimate_tokens` docstring 明确「量级估算」并列出三处同源用途（`usage` / 轮转预算 / `context_window`） | 人工核对 |
+| T8.9 | 新增 `EDIT_MARKDOWN_ROOT` + `_resolve_edit_path()`：`resolve()` 后校验根内归属；附带修掉目录目标抛 `IsADirectoryError` 的问题 | `test_toolcalls.py::EditMarkdownPathGuardTests`（6 例） |
+| T8.10 | 新增可选 `BRIDGE_TOKEN`（Bearer），用 FastAPI 依赖只挂两个生成端点；`/healthz`、`/v1/models` 保持开放 | `test_auth.py::BridgeTokenTests`（4 例） |
+| T9.3 | 新增 `tests/test_routes_responses.py`（7 例）：开关 404、空 input 400、数组 input、未就绪 503、非流式结构、流式事件序列 | 新增文件全绿 |
+| T9.4 | 新增 `tests/test_tasks.py`（表驱动 23 例 + 快照往返）：环境包装块 / 元提示矩阵、goal 选取、跨命名空间隔离、recent 截断 | 新增文件全绿 |
+| T9.5 | 新增 `tests/test_auth.py`（10 例）：`RESET_TOKEN` 403/200、`/debug/dom` 404/503、`BRIDGE_TOKEN` 401/200 | 新增文件全绿 |
+| T10.3 | `update_codex.md` 新增 §8.1、`update_pi.md` 新增 §4「后续进展」对照表；纠正过期快照（测试入口 / 用例数、`_prune_output_dir` 只在落盘触发） | 人工核对 |
+
+**测试基线**：`pytest -q` → **279 passed, 19 skipped, 31 subtests passed**（随行轮 238 → 279，新增用例全部不联网）。
+
+**仍未做**（已知且有意保留，均已写明原因）：
+
+- `ReplyWatcher` 重构（update_codex.md §3.3）：重构面大，建议在更多路由级测试就位后再动。
+- 真实环境专属交付物（`client_test.py` / `INSTALL.md` / `cmdlog.md`，update_codex.md §3.6）。
+- 线上复核 T7.6 的真实 token 收益：需重启服务并用线上 `usage.prompt_tokens` 观察（预期无工具请求 ~970 → ~93）。
+
+> 本轮为纯本地改动 + 不联网测试，未触碰浏览器 profile；`.env` 只插入了两个新键
+> （`BRIDGE_TOKEN=`、`EDIT_MARKDOWN_ROOT=`，均为空 = 保持现有行为），键数 61 = 61。
