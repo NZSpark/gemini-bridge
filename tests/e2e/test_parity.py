@@ -3,9 +3,30 @@
 判定矩阵（doc/e2e_test_design.md §1.2）：直连是"上游能力基线"——
 直连达标而 bridge 不达标 = 代码缺陷（FAIL）；双侧都不达标 = 环境问题（SKIP）。
 
-运行（真实访问 Gemini，串行，约 15~25 分钟）：
+用例清单（优化后 10 例 + 1 例可选；每个用例都有一项**其他用例不覆盖**的断言，
+理由与覆盖矩阵见 doc/e2e_test_design.md §3）：
 
+    A1 内容对等 + 响应 schema + 注入块泄漏 + **token 预算回归**（P1-5）
+    A4 长文尾部哨兵（结束判定过早截断 / 重复）
+    B1 GET /healthz      B2 GET /v1/models（含 context_window 契约）
+    B4 流式 SSE 序列      B6 Responses 命名事件
+    C1 工具调用非流式解析  C2 工具调用流式分片
+    D1 同桶多轮（增量 prompt）  D2 分桶隔离  D3 重置后播种
+    B8（可选，E2E_FULL=1）openai SDK 冒烟：唯一覆盖「第三方 SDK 严格解析」的用例
+
+已删除 **A2**（"法国首都"）：与 A1 同型（单轮问答的内容对等），无独立信息量——
+“模型知不知道这个事实”属于上游能力，不是 bridge 行为。
+
+运行（真实访问 Gemini，串行）：
+
+    # 全量（约 15~20 分钟）
     GEMINI_E2E=1 .venv/bin/python -m unittest tests.e2e.test_parity -v
+
+    # 只跑本次改动过的用例（推荐：几分钟，见 doc/e2e_test_design.md §4.1）
+    GEMINI_E2E=1 .venv/bin/python -m unittest \
+        tests.e2e.test_parity.TestAContentParity.test_a1_sentinel_parity \
+        tests.e2e.test_parity.TestBProtocol.test_b2_models \
+        tests.e2e.test_parity.TestCToolParity -v
 
 开关：E2E_HEADED=1 直连浏览器可见；E2E_PORT 改 bridge 端口；E2E_FULL=1 启用 B8。
 未设置 GEMINI_E2E 时全部 skip，常规测试套件不受影响、不发起网络请求。
@@ -152,11 +173,21 @@ def tearDownModule() -> None:
             print(f"  {case_id:<8} {line}{ratio}")
 
 
+def _tool_predicate(text: str) -> bool:
+    """C 组判定：回复里出现 TOOL_CALL 标记且点名了 get_weather（两侧共用）。"""
+    upper = (text or "").upper()
+    return "TOOL_CALL" in upper and "GET_WEATHER" in upper
+
+
 def _cjk_ratio(text: str) -> float:
     if not text:
         return 0.0
     cjk = sum(1 for ch in text if "一" <= ch <= "鿿" or "　" <= ch <= "ヿ")
     return cjk / len(text)
+
+
+# C 组共享的直连基线缓存（见 E2ECase.tool_call_baseline）
+_TOOL_BASELINE: Dict[str, str] = {}
 
 
 # 统一工具定义（C 组用）
@@ -302,22 +333,69 @@ class E2ECase(unittest.TestCase):
         for token in ("[上下文重建]", "[工具调用说明]", "[任务状态]", "TOOL_CALL"):
             self.assertNotIn(token, text, f"回复中泄漏了注入块 {token!r}")
 
+    def assert_prompt_budget(self, raw: Any) -> None:
+        """P1-5 回归护栏：**未声明 tools** 的请求不得携带内置工具脚手架（约 970 tokens）。
+
+        阈值 500 对 A1 这种十几~几十 token 的真实占用有 10 倍余量，又足以抓住
+        「edit_markdown 脚手架被重新无条件注入」这类回归（实测：注入后约 970）。
+        若真需要旧行为（`.env` 设 `EDIT_MARKDOWN_ALWAYS_REGISTER=true`），断言让步并打印说明。
+        """
+        if config.EDIT_MARKDOWN_ALWAYS_REGISTER:
+            print("\n[a1 观测] EDIT_MARKDOWN_ALWAYS_REGISTER=true，跳过 token 预算断言")
+            return
+        usage = (raw or {}).get("usage") or {}
+        prompt_tokens = usage.get("prompt_tokens")
+        self.assertIsInstance(prompt_tokens, int, f"usage.prompt_tokens 缺失/非整数：{usage!r}")
+        self.assertGreater(prompt_tokens, 0, f"usage.prompt_tokens 非正数：{usage!r}")
+        self.assertLess(
+            prompt_tokens, 500,
+            "无工具请求的 prompt 明显过大（疑似内置工具脚手架被无条件注入，P1-5 回归）："
+            f"prompt_tokens={prompt_tokens}",
+        )
+
+    def tool_call_baseline(self, case_id: str, prompt_text: str) -> str:
+        """C 组共享的直连基线：同源工具指令下，上游必须能输出 `TOOL_CALL` 标记。
+
+        结果在进程内缓存（C1 / C2 共用）：两个用例一起跑时只付一次直连调用（~20s）；
+        单跑任一用例也都有基线，不会把「上游不配合」误报成 bridge 缺陷。
+        """
+        if _TOOL_BASELINE.get("text"):
+            return _TOOL_BASELINE["text"]
+        d_text = ""
+        for attempt in range(2):
+            t0 = time.monotonic()
+            try:
+                d_text = self.direct.ask(prompt_text)
+            except Exception as exc:  # noqa: BLE001
+                raise unittest.SkipTest(f"{case_id}: 直连失败（环境问题）：{exc}") from exc
+            _record(case_id, "direct", time.monotonic() - t0)
+            if _tool_predicate(d_text):
+                break
+        if not _tool_predicate(d_text):
+            raise unittest.SkipTest(
+                f"{case_id}: 直连侧模型未输出工具调用标记（上游不配合，非 bridge 缺陷）。"
+                f"原文开头：{d_text[:200]!r}"
+            )
+        _TOOL_BASELINE["text"] = d_text
+        return d_text
+
 
 class TestAContentParity(E2ECase):
-    """组 A：内容对等（双侧同断言，期望答案为独立 ground truth）。"""
+    """组 A：内容对等（双侧同断言，期望答案为独立 ground truth）。
+
+    A2（法国首都）已在设计优化中删除：与 A1 同型、无独立信息量，
+    详见 doc/e2e_test_design.md §3.0。
+    """
 
     def test_a1_sentinel_parity(self):
         prompt = "请只回复这四个字符：K7Q9，不要输出任何其他内容。"
         d_text, b_text, raw = self.run_parity(
             "a1", prompt, lambda t: "K7Q9" in t
         )
-        self.assert_chat_schema(raw)              # B3（复用同一次请求）
-        self.assert_no_injection_leak(b_text)     # A6
+        self.assert_chat_schema(raw)              # B3（已并入本用例）
+        self.assert_no_injection_leak(b_text)     # A6（已并入本用例）
         # 语言一致性不断言在此：哨兵回复本身是 ASCII；中文占比断言见 A4 长文
-
-    def test_a2_fact_parity(self):
-        prompt = "法国的首都会是哪座城市？只回答城市名。"
-        self.run_parity("a2", prompt, lambda t: "巴黎" in t or "paris" in t.lower())
+        self.assert_prompt_budget(raw)            # P1-5 回归护栏
 
     def test_a4_longform_tail_sentinel(self):
         prompt = "请写一篇约600字的中文短文，主题是「一座桥」。要求：最后一行单独输出 END7。"
@@ -353,8 +431,16 @@ class TestBProtocol(E2ECase):
         status, body = self.bridge.models()
         self.assertEqual(status, 200, body)
         self.assertEqual(body.get("object"), "list")
-        ids = [m.get("id") for m in body.get("data") or []]
+        data = body.get("data") or []
+        ids = [m.get("id") for m in data]
         self.assertIn(MODEL_ID, ids)
+        # T8.7 对外契约：context_window 必须透出，且与 SESSION_MAX_TOKENS 同源
+        # （同一个 .env / 环境变量，两个进程读到的应是同一个值）。
+        for card in data:
+            self.assertEqual(
+                card.get("context_window"), config.SESSION_MAX_TOKENS,
+                f"context_window 与 SESSION_MAX_TOKENS 不一致：{card!r}",
+            )
 
     def test_b4_stream_sequence(self):
         prompt = "请只回复这四个字符：S7R9，不要输出任何其他内容。"
@@ -439,35 +525,24 @@ class TestBProtocol(E2ECase):
 
 
 class TestCToolParity(E2ECase):
-    """组 C：工具调用对等（直连=同源指令的上游能力基线）。"""
+    """组 C：工具调用对等（直连=同源指令的上游能力基线）。
+
+    C1 与 C2 共用同一份直连基线（`E2ECase.tool_call_baseline`，进程内缓存）：
+    两个用例一起跑只付一次直连调用；单跑 C2 也先取基线，避免把「上游不配合」
+    误报成 bridge 缺陷。两者不可互相替代：C1 断言非流式解析结果，
+    C2 断言流式 `delta.tool_calls` 分片拼起来可解析（两条编码路径不同）。
+    """
 
     USER_PROMPT = "请先调用 get_weather 工具查询北京的天气，然后再根据结果作答。"
 
-    @staticmethod
-    def _tool_predicate(text: str) -> bool:
-        upper = text.upper()
-        return "TOOL_CALL" in upper and "GET_WEATHER" in upper
-
-    def test_c1_tool_call_parity(self):
-        # 直连：与 bridge 同源的工具指令（build_prompt 是共享的注入逻辑）
-        prompt_text = build_prompt(
+    def _tool_prompt(self) -> str:
+        """与 bridge 同源的工具指令（build_prompt 是两侧共享的注入逻辑，C 组必须同源）。"""
+        return build_prompt(
             [ChatMessage(role="user", content=self.USER_PROMPT)], tools=TOOLS
         )
-        d_text = ""
-        for attempt in range(2):
-            t0 = time.monotonic()
-            try:
-                d_text = self.direct.ask(prompt_text)
-            except Exception as exc:  # noqa: BLE001
-                raise unittest.SkipTest(f"c1: 直连失败（环境问题）：{exc}") from exc
-            _record("c1", "direct", time.monotonic() - t0)
-            if self._tool_predicate(d_text):
-                break
-        if not self._tool_predicate(d_text):
-            raise unittest.SkipTest(
-                "c1: 直连侧模型未输出工具调用标记（上游不配合，非 bridge 缺陷）。"
-                f"原文开头：{d_text[:200]!r}"
-            )
+
+    def test_c1_tool_call_parity(self):
+        self.tool_call_baseline("c1", self._tool_prompt())
 
         # bridge：解析出的 tool_calls 必须与基线一致
         t0 = time.monotonic()
@@ -487,6 +562,7 @@ class TestCToolParity(E2ECase):
         self.assertIsInstance(args, dict)
 
     def test_c2_tool_call_stream(self):
+        self.tool_call_baseline("c2", self._tool_prompt())
         res = self.bridge.chat_stream(
             [self._user(self.USER_PROMPT)], tools=TOOLS, session="e2e-c2"
         )
