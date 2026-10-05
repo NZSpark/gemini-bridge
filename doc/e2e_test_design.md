@@ -70,22 +70,42 @@ Gemini 是非确定性生成模型：同一 prompt 两次直连的回复也不�
 
 ## 3. 测试用例清单
 
+### 3.0 本次设计修订（优化轮）
+
+| 变更 | 内容 | 理由 |
+| --- | --- | --- |
+| **删除** | A2「法国首都？只回答城市名」 | 与 A1 同型（单轮问答的内容对等）：同样的“直连达标 → bridge 达标”判定、同样的节点抓取风险。它额外验证的“事实正确性”是上游模型的常识，不是 bridge 行为；删除后省下一次直连 + 一次桥调用（约 40s） |
+| **合并** | A5（语言一致性）→ A1/A4；B3（schema）、B5（落盘）、A6（注入块泄漏）→ A1 同一次请求 | 这些断言本来就“同一次请求顺带就能查”，单列只会多付一次上游调用 |
+| **新增** | A1：**token 预算护栏**（`usage.prompt_tokens < 500`；`EDIT_MARKDOWN_ALWAYS_REGISTER=true` 时让步） | P1-5 的收益（无工具请求 970 → 93 tokens）此前只有本地复算，没有任何回归护栏；脚手架一旦被重新无条件注入 → FAIL |
+| **新增** | B2：`context_window == SESSION_MAX_TOKENS` | T8.7 的对外契约：Pi 等客户端据此裁剪上下文，端点与配置必须同源 |
+| **加固** | C1/C2 共用直连基线（`E2ECase.tool_call_baseline`，进程内缓存） | 单跑 C2 也有基线（不再把“上游不配合”误报为 bridge 缺陷）；一起跑不重复付直连调用 |
+
+保留用例的“不可删理由”（逐条对应「独有覆盖」）：
+
+- **A1**：唯一同时覆盖「简单请求的内容对等 + 响应 schema + 注入块泄漏 + token 预算」的用例，是整条链路的冒烟；
+- **A4**：唯一针对“长文 + 尾部标记”的用例——结束判定过早收尾会砍掉尾巴，A1 的短回复抓不到；
+- **B1 / B2**：纯协议、不调用模型（秒级完成），分别覆盖探活字段与模型发现契约；
+- **B4 / B6**：chat SSE 与 Responses 命名事件是两套独立的编码实现，互不覆盖；
+- **C1 / C2**：非流式解析 vs 流式分片拼接是两条编码路径；
+- **D1 / D2 / D3**：增量 prompt 链路 / 分桶隔离 / 重置后播种（对应 `build_prompt`、桶路由、`build_prompt(seed=True)` + 任务快照三条不同代码路径）；
+- **B8**（可选，`E2E_FULL=1`）：唯一用**第三方 SDK 严格解析**响应的用例（`assert_chat_schema` 只看原始 JSON，抓不到 SDK 侧的校验失败），默认关闭。
+
+> 每条用例都有一项**其他用例不覆盖**的断言（即“不可删的理由”）。
+> 修订历史与已删除用例见 §3.0；同类断言已合并到主用例，不再单列 ID。
+
 ### 组 A：内容对等（直连 vs Bridge，双侧同断言）
 
 | ID | Prompt（要点） | 断言 | 覆盖的 bridge 风险 |
 | --- | --- | --- | --- |
-| A1 | `只回复 K7Q9` | 双侧含 `K7Q9`；bridge 回复无注入块泄漏（`[上下文重建]`/`[工具调用说明]`/`[任务状态]`/`TOOL_CALL`）；CJK 占比 ≥0.2；**同一次请求附带 B3 schema、B5 落盘断言** | prompt 拼装污染、回复节点抓取错误、注入块泄漏进回复 |
-| A2 | `法国首都？只回答城市名` | 双侧含 `巴黎`/`Paris` | 抓到用户回显/错误节点、历史播种串台 |
-| A4 | `写约 600 字短文，最后一行单独输出 END7` | 双侧 ≥300 字且 **`END7` 位于末尾 100 字内**；长度比 ∈ [0.4, 2.5] | **结束判定过早收尾 → 截断**（update.md 双阈值/`_complete_text` 风险） |
-
-> A5（语言一致性）并入 A1；A3（算术 391）与 A2 等价，列入可选扩展。
+| A1 | `只回复 K7Q9` | 双侧含 `K7Q9`；bridge 回复无注入块泄漏（`[上下文重建]`/`[工具调用说明]`/`[任务状态]`/`TOOL_CALL`）；**同一次请求附带 B3 schema、B5 落盘断言、P1-5 token 预算护栏** | prompt 拼装污染、回复节点抓取错误、注入块泄漏进回复、**内置工具脚手架被无条件注入（~970 tokens 回归）** |
+| A4 | `写约 600 字短文，最后一行单独输出 END7` | 双侧 ≥300 字且 **`END7` 位于末尾 100 字内**；长度比 ∈ [0.4, 2.5]；双侧 CJK 占比 ≥0.3 | **结束判定过早收尾 → 截断**（update.md 双阈值/`_complete_text` 风险），以及重复/串台 |
 
 ### 组 B：协议正确性（仅 Bridge，静态规范）
 
 | ID | 用例 | 断言 | 覆盖风险 |
 | --- | --- | --- | --- |
-| B1 | `GET /healthz` | 200、`status=ok`、含 `cluster`/`session_keys`/`init_error` 字段 | 探活、可观测性 |
-| B2 | `GET /v1/models` | `object=list`、含 `gemini-chat` | 模型发现（Pi） |
+| B1 | `GET /healthz` | 200、`status=ok`、含 `cluster`/`session_keys`/`init_error` 字段 | 探活、可观测性（`setUpModule` 的 200 探活只做门禁，不查字段） |
+| B2 | `GET /v1/models` | `object=list`、含 `gemini-chat`、**每张卡的 `context_window` == `SESSION_MAX_TOKENS`** | 模型发现（Pi）+ T8.7 对外契约（客户端据此裁剪上下文） |
 | B3 | （并入 A1 的非流式请求） | `id` 以 `chatcmpl-` 开头、`object=chat.completion`、`choices[0].message.role=assistant`、`finish_reason` 合法、`usage` 存在、`model` 回显、`saved_files` 为 list（非空时文件确实存在于磁盘） | 响应结构、落盘副作用一致性 |
 | B4 | 流式 `stream=true` + 哨兵 prompt | 首 chunk `delta.role=assistant`；全程 `id/created/model` 唯一；末 chunk `finish_reason=stop`；`data: [DONE]` 收尾；拼接文本含哨兵；记录首字节耗时与 `: keep-alive` 次数（软观测） | SSE 编码、**`_delta_piece` 节点替换丢/重字** |
 | B6 | `POST /v1/responses`（stream） | 事件序列含 `response.output_text.done`、`response.completed`；`sequence_number` 严格递增；completed 的 output 文本非空 | Responses 兼容层（Codex 路径） |
@@ -95,8 +115,12 @@ Gemini 是非确定性生成模型：同一 prompt 两次直连的回复也不�
 
 | ID | 用例 | 断言 | 覆盖风险 |
 | --- | --- | --- | --- |
-| C1 | 带 `tools=[get_weather]` 的强制调用 prompt | **直连**：用 `prompting.build_prompt(..., tools=)` 构造**同源指令**，原始回复须含 `TOOL_CALL` 与 `get_weather`（否则 SKIP=模型不配合）；**bridge**：`message.tool_calls[0].function.name == get_weather` 且 `arguments` 可 `json.loads` | 工具指令注入、**DOM 提取/markdown 转义破坏 JSON**、`parse_tool_calls` 主路径、护栏误杀 |
-| C2 | 同 C1 但 `stream=true` | chunk 序列 `finish_reason=tool_calls`；`delta.tool_calls` 拼出的 name/arguments 完整可解析 | 流式工具缓冲（`RESPONSES_TOOL_BUFFER`）与分片编码 |
+| C1 | 带 `tools=[get_weather]` 的强制调用 prompt（非流式） | **直连基线**（`E2ECase.tool_call_baseline`，同源 `build_prompt(..., tools=)`）：原始回复须含 `TOOL_CALL` 与 `get_weather`（否则 SKIP=模型不配合）；**bridge**：`message.tool_calls[0].function.name == get_weather` 且 `arguments` 可 `json.loads` | 工具指令注入、**DOM 提取/markdown 转义破坏 JSON**、`parse_tool_calls` 主路径、护栏误杀 |
+| C2 | 同 C1 但 `stream=true` | 复用同一份直连基线；chunk 序列 `finish_reason=tool_calls`；`delta.tool_calls` 拼出的 name/arguments 完整可解析 | 流式工具缓冲（`RESPONSES_TOOL_BUFFER`）与分片编码（与 C1 是两条不同的编码路径） |
+
+> **基线共享（本次优化）**：C1/C2 之前各自决定“要不要直连基线”：C1 有、C2 没有。
+> 现在统一走 `tool_call_baseline()`（进程内缓存）——两个用例一起跑只付一次直连调用，
+> 单跑 C2 也不会把“上游不配合”误判成 bridge 缺陷。
 
 ### 组 D：会话与上下文（Bridge 为主）
 
@@ -134,8 +158,27 @@ E2E_PORT=8001    # bridge 端口（默认取 .env 的 PORT）
 E2E_FULL=1       # 额外启用 B8（openai SDK 联调）
 ```
 
-- 未设置 `GEMINI_E2E=1` 时全部 **skip**，常规 `unittest discover`（123 用例）不受影响、不发起任何网络请求。
+- 未设置 `GEMINI_E2E=1` 时全部 **skip**，常规套件（`pytest -q`，284 passed / 18 skipped）不受影响、不发起任何网络请求。
 - bridge 子进程日志：临时目录 `gemini_e2e_uvicorn.log`（失败时查看）。
+
+### 4.1 定向运行：只跑改动过的用例
+
+联调用例很贵（bridge 侧每例一次真实的模型生成，约 20–40s；用到直连基线的用例再加一次），
+因此**改哪个用例就只跑哪个用例**：
+
+```bash
+# 例：本次改动 = A1（新增 token 预算断言）、B2（新增 context_window 契约）、C1/C2（基线共享）
+GEMINI_E2E=1 .venv/bin/python -m unittest \
+  tests.e2e.test_parity.TestAContentParity.test_a1_sentinel_parity \
+  tests.e2e.test_parity.TestBProtocol.test_b2_models \
+  tests.e2e.test_parity.TestCToolParity -v
+```
+
+判定口径：
+
+- 只跑改过的用例时，**其余用例保持“未验证”状态**，不得当成通过；
+- 改动共享脚手架（`bridge.py` / `direct.py`）时，至少跑一个**同时用到两侧**的用例（如 A1）来覆盖那些路径；
+- 全量套件（约 15–20 分钟）只在发版前或大改后跑。
 
 ---
 
@@ -155,6 +198,8 @@ E2E_FULL=1       # 额外启用 B8（openai SDK 联调）
 | 本文档 | 任务（doc/tasks.md） | 分析条目（doc/update_codex.md） |
 | --- | --- | --- |
 | 组 A/B 基础部分 | T4.1（client_test 联调雏形）、T4.2 前置校验 | §2.1 id 一致性 → B6 事件断言 |
+| A1 的 token 预算护栏 | T7.6（edit_markdown 注入收敛） | P1-5（无工具请求 970 → 93 tokens） |
+| B2 的 context_window | T8.7（context_window 一致化） | P2-7 |
 | B4 流式 | T3.1 验收补充 | §3.2 `_delta_piece` 替换语义 |
 | C 组 | T1.3 真实输出验证、T5.2 契约实测 | §2.2 解析契约、DOM 提取风险 |
 | D3 | T2.3 播种链路验收 | §1 任务快照设计 |
