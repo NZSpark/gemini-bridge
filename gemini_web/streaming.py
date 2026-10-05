@@ -87,7 +87,8 @@ async def _stream_chat_completion(
 
     task = asyncio.create_task(runner())
 
-    streamed = False
+    # 已下发给客户端的文本（用于收尾对账，见下方 T6.1）
+    streamed = ""
     reply_content = ""
     error: Optional[str] = None
     error_type = "server_error"
@@ -113,7 +114,7 @@ async def _stream_chat_completion(
             continue
 
         if kind == "delta":
-            streamed = True
+            streamed += payload
             yield encode({"content": payload})
         else:
             reply_content, _blocks, error, error_type = payload
@@ -143,8 +144,21 @@ async def _stream_chat_completion(
                 yield encode({"tool_calls": [{"index": index, "function": {"arguments": piece}}]})
         yield encode(None, finish="tool_calls")
     else:
-        if not streamed and reply_content:
-            for piece in _chunk_text(reply_content):
+        # 收尾对账（T6.1）：必须保证客户端最终持有的文本 == reply_content。
+        #
+        # 生成中途回复节点可能被整体替换，此时 _delta_piece 会停发增量（避免拼出错乱
+        # 文本），但旧实现只在「从未发过任何增量」时才补全文，导致客户端少一截且
+        # **没有任何报错**。这里按与已发内容的前缀关系补齐差额。
+        final_text = reply_content if reply_content is not None else streamed
+        if final_text and final_text != streamed:
+            if final_text.startswith(streamed):
+                missing = final_text[len(streamed):]
+            else:
+                # 追加语义无法修复（已下发的内容不是最终内容的前缀）。SSE 没有「撤回」
+                # 语义，只能补发全文：宁可重复，也绝不静默丢尾。
+                print("[流式] 回复被整体改写，已补发全文（客户端可能看到重复内容）。")
+                missing = final_text
+            for piece in _chunk_text(missing):
                 yield encode({"content": piece})
         yield encode(None, finish="stop")
 

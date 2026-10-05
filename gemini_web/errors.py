@@ -4,6 +4,8 @@
 也便于上层（``server`` / ``streaming``）只依赖异常类型而不依赖 Driver。
 """
 
+from . import config
+
 
 class GeminiTimeoutError(RuntimeError):
     """等待网页版回复超时。区别于普通运行时错误，可触发会话恢复。"""
@@ -23,5 +25,6 @@ class GeminiBusyError(RuntimeError):
 
 # 未指定任务标识时使用的会话桶（保持与历史行为一致：全局共用一条会话）
 DEFAULT_SESSION_KEY = "default"
-# Gemini 网页版入口（每桶新开对话的落点）。
-HOME_URL = "https://gemini.google.com/app"
+# Gemini 网页版入口（每桶新开对话的落点）。值来自 config.WEBSITE（.env 可覆盖），
+# 不再是硬编码常量 —— 否则 .env 里的 WEBSITE 是个“改了不生效”的死配置。
+HOME_URL = config.WEBSITE

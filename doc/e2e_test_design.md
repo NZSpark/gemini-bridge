@@ -152,7 +152,7 @@ E2E_FULL=1       # 额外启用 B8（openai SDK 联调）
 
 ## 6. 与项目任务/分析文档的对应
 
-| 本文档 | 任务（doc/tasks.md） | 分析条目（doc/update.md） |
+| 本文档 | 任务（doc/tasks.md） | 分析条目（doc/update_codex.md） |
 | --- | --- | --- |
 | 组 A/B 基础部分 | T4.1（client_test 联调雏形）、T4.2 前置校验 | §2.1 id 一致性 → B6 事件断言 |
 | B4 流式 | T3.1 验收补充 | §3.2 `_delta_piece` 替换语义 |

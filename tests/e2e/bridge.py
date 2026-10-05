@@ -52,6 +52,15 @@ class BridgeServer:
 
         host = os.environ.get("HOST") or "127.0.0.1"
         port = self.base_url.rsplit(":", 1)[-1]
+        # 端口必须是可用 TCP 端口：环境变量 PORT=0 会覆盖 .env（真实环境变量优先），
+        # 而 uvicorn --port 0 会绑定一个随机端口——测试随手探活失败，还会误起一个
+        # 第二实例去抢同一个浏览器 profile。宁可直接报错，也不要静默跑错端口。
+        if not port.isdigit() or not (1 <= int(port) <= 65535):
+            raise RuntimeError(
+                f"bridge 端口非法：{port!r}（BASE_URL={self.base_url}）。\n"
+                "常见原因：环境变量 PORT=0（或未设置合法值）覆盖了 .env 的 PORT。\n"
+                "请显式指定正在运行的服务端口，例如：E2E_PORT=8001"
+            )
         self._log_file = open(self.log_path, "w", encoding="utf-8")
         self.proc = subprocess.Popen(
             [
@@ -69,13 +78,26 @@ class BridgeServer:
         deadline = time.monotonic() + STARTUP_TIMEOUT_S
         while time.monotonic() < deadline:
             if self.proc.poll() is not None:
+                self.stop()  # 清理句柄，避免残留日志文件描述符
                 raise RuntimeError(
                     f"uvicorn 启动即退出（exit={self.proc.returncode}），日志：{self.log_path}"
                 )
             probe = self.healthz(timeout=2.0)
             if probe and probe[0] == 200:
                 return True
+            # 已能连上但浏览器起不来（HTTP 503 + init_error）：多半是另一个实例
+            # 占着同一个 user_data profile。不要白等满 90s，直接把原因抛出来，
+            # 同时杀掉自己拉起的进程，避免留下孤儿 uvicorn。
+            if probe and isinstance(probe[1], dict) and probe[1].get("init_error"):
+                init_error = probe[1]["init_error"]
+                self.stop()
+                raise RuntimeError(
+                    f"bridge 已响应但浏览器未就绪：init_error={init_error!r}。\n"
+                    "常见原因：同一个 user_data profile 已被另一个实例占用；"
+                    "请复用已在运行的服务（E2E_PORT=<其端口>）或先停掉占用 profile 的实例。"
+                )
             time.sleep(1.0)
+        self.stop()  # 超时也要清理，绝不留下孤儿 uvicorn
         raise RuntimeError(f"bridge {STARTUP_TIMEOUT_S:.0f}s 内未就绪，日志：{self.log_path}")
 
     def stop(self) -> None:

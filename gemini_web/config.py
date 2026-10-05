@@ -68,6 +68,9 @@ def env_bool(key: str, default: bool = False) -> bool:
 # ==================== 服务监听 ====================
 HOST = env_str("HOST", "127.0.0.1")
 PORT = env_int("PORT", 8001)
+# 入口 URL（每桶新开对话的落点）。此前这个值只存在于 .env 与文档里，代码却硬编码在
+# errors.HOME_URL —— 改 .env 不生效，是个排障陷阱（update.md P1-1）。现在真正生效。
+WEBSITE = env_str("WEBSITE", "https://gemini.google.com/app")
 
 
 # ==================== 路径 ====================
@@ -85,6 +88,8 @@ SAVE_FILES = env_bool("SAVE_FILES")
 # 落盘目录的保留策略（0 = 不限制）：超出后在启动时清理最旧的文件。
 OUTPUT_MAX_FILES = env_int("OUTPUT_MAX_FILES", 0)
 OUTPUT_MAX_AGE_DAYS = env_float("OUTPUT_MAX_AGE_DAYS", 0)
+# 后台周期清理间隔（秒）。启动时必定清理一次；0 = 关闭周期任务（只保留启动清理）。
+OUTPUT_PRUNE_INTERVAL_S = env_float("OUTPUT_PRUNE_INTERVAL_S", 3600.0)
 
 
 # ==================== 运行模式 / 调试 ====================
@@ -202,6 +207,10 @@ RESPONSES_KEEPALIVE_S = env_float("RESPONSES_KEEPALIVE_S", 10.0)
 EDIT_MARKDOWN_LOCAL = env_bool("EDIT_MARKDOWN_LOCAL", False)
 # edit_markdown 落盘前的备份目录。
 EDIT_MARKDOWN_BACKUP_DIR = env_str("EDIT_MARKDOWN_BACKUP_DIR", "output/backups")
+# 客户端**没有声明任何工具**时，是否仍把内置 edit_markdown 注入本轮工具列表。
+# 默认 false：自动注入会给每个请求附带 ~970 tokens 的脚手架（实测，见 update.md P1-5），
+# 还可能让客户端收到自己从未声明过的 tool_calls。设为 true 恢复旧行为。
+EDIT_MARKDOWN_ALWAYS_REGISTER = env_bool("EDIT_MARKDOWN_ALWAYS_REGISTER", False)
 
 
 # 工具模式下：是否先缓冲整段回复再判断 tool_calls（true = 需要缓冲，

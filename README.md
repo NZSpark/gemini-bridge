@@ -140,8 +140,12 @@ codex --profile gemini
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `HOST` / `PORT` | `127.0.0.1` / `8001` | 监听地址 |
+| `WEBSITE` | `https://gemini.google.com/app` | 入口 URL（每桶新开对话的落点），改这里会真的生效 |
 | `HEADLESS` | `false` | 无头模式，推荐正式运行时设为 `1`；首次登录需 `false` |
 | `GEMINI_DEBUG` | `false` | 打印轮询状态、开放 `/debug/dom` |
+
+> **真实环境变量优先于 `.env`**。若环境里已存在同名变量（例如 `PORT=0`），它以环境为准，
+> 见「故障排查」最后一条。
 
 **结束判定与超时**
 
@@ -151,8 +155,12 @@ codex --profile gemini
 | `POLL_INTERVAL_S` | `1.5` | 轮询间隔 |
 | `STABLE_POLLS` | `2` | 内容不变连续次数判定结束 |
 | `LEN_STABLE_POLLS` | `4` | 仅长度不变时的保守阈值 |
-| `GEMINI_RETRIES` | `2` | 上游超时重试次数 |
+| `STALL_POLLS` | `20` | 连续多少次既无正文也无「生成中」信号即提前失败 |
+| `CAP_CHECK_EVERY` | `4` | 每多少轮检查一次「会话到顶」提示 |
+| `CAP_NOTICE_PATTERNS` | 见模板 | 「会话到顶」提示语正则（`||` 分隔） |
+| `GEMINI_RETRIES` | `2` | 上游**最大尝试次数**（不是“额外重试次数”：2 表示最多发 2 次） |
 | `RETRY_BACKOFF_S` | `1.0` | 退避基数（×n） |
+| `READY_TIMEOUT_MS` | `15000` | 新建/恢复页面后等输入框就绪的超时（毫秒） |
 
 **会话生命周期**
 
@@ -166,7 +174,10 @@ codex --profile gemini
 | `BUCKET_IDLE_TTL_S` | `900` | 空闲回收 |
 | `PARALLEL_BUCKETS` | `false` | 各桶并行页面 |
 | `BUCKET_LOCK_TIMEOUT_S` | `0` | 同桶排队超时，>0 超时返回 503 `upstream_busy` |
+| `GEMINI_NEW_SESSION` | `false` | 启动时忽略已保存状态直接开新会话 |
+| `SESSION_KEY_MAX_LEN` | `64` | 分桶键长度上限 |
 | `SEED_MAX_CHARS` | `12000` | 轮转播种字符预算 |
+| `SEED_SYSTEM_MAX_CHARS` | `2000` | 播种时单条 system 消息的字符上限（harness 每轮注入的系统提示会被截断） |
 | `TOOL_RESULT_MAX_CHARS` | `20000` | 单条 tool 结果注入 prompt 的最大字符数（0 不限） |
 | `PROMPT_MAX_CHARS` | `100000` | 单次 fill() 入参硬上限，兜底防输入框溢出（0 不限） |
 | `SESSION_MAX_TURNS` | `60` | 轮数到顶阈值（0 禁用） |
@@ -183,8 +194,17 @@ codex --profile gemini
 | `SAVE_FILES` | `false` | 是否把回复代码块落盘（请求字段仅在显式传入时覆盖） |
 | `OUTPUT_MAX_FILES` | `0` | `output/` 保留文件数上限（0 不限） |
 | `OUTPUT_MAX_AGE_DAYS` | `0` | `output/` 最长保留天数（0 不限） |
+| `OUTPUT_PRUNE_INTERVAL_S` | `3600` | 后台周期清理间隔（秒）；启动时一定清一次，0 = 只保留启动清理 |
 | `RESET_TOKEN` | 空 | 设置后 `/session/reset` 需带 `X-Reset-Token` 头 |
 | `CHAT_KEEPALIVE_S` | `10.0` | chat 流式 keep-alive 间隔（0 关闭） |
+
+**内置工具：edit_markdown**
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `EDIT_MARKDOWN_LOCAL` | `false` | 允许桥接层本地执行 `edit_markdown`（默认只注册 schema，由客户端执行） |
+| `EDIT_MARKDOWN_ALWAYS_REGISTER` | `false` | 客户端未声明任何工具时是否仍注入 `edit_markdown`。开启会给每个请求多付约 970 tokens 脚手架 |
+| `EDIT_MARKDOWN_BACKUP_DIR` | `output/backups` | 落盘前的备份目录 |
 
 **Responses API**
 
@@ -203,10 +223,11 @@ codex --profile gemini
 | `TASK_NAMESPACE` | 派生自包名 | 多桥共用目录时的命名空间 |
 | `TASK_GOAL_MAX_CHARS` | `2000` | 任务目标保留上限 |
 | `TASK_KEEP_MESSAGES` | `8` | 滚动保留的最近消息数 |
+| `TASK_RECENT_ITEM_MAX_CHARS` | `500` | 快照里单条 recent 文本的上限（防 harness 系统块灌满 prompt） |
 
 **DOM 选择器**（网页版改版时改这里）
 
-`RESPONSE_SELECTORS`、`INPUT_SELECTORS`、`READY_SELECTOR`、`NEW_CHAT_SELECTOR`、`CODE_BLOCK_SELECTOR`、`CODE_TAG_SELECTOR`、`CAP_NOTICE_PATTERNS`。
+`RESPONSE_SELECTORS`、`INPUT_SELECTORS`、`SEND_BUTTON_SELECTORS`、`READY_SELECTOR`、`NEW_CHAT_SELECTOR`、`CODE_BLOCK_SELECTOR`、`CODE_TAG_SELECTOR`、`CAP_NOTICE_PATTERNS`。
 
 ## 项目结构
 

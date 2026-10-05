@@ -14,6 +14,7 @@
 """
 
 import json
+import logging
 import re
 import time
 from pathlib import Path
@@ -22,6 +23,8 @@ from typing import Any, Dict, List, Optional
 from . import config
 from .models import ChatMessage
 from .prompting import _content_to_text
+
+logger = logging.getLogger(__name__)
 
 
 def _namespace() -> str:
@@ -171,8 +174,9 @@ def record(bucket: str, messages: List[ChatMessage]) -> None:
         _file(bucket).write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-    except Exception:
-        pass
+    except OSError as exc:
+        # 快照丢失败会导致“轮转后丢任务”，必须可观测（T8.2）
+        logger.warning("任务快照写入失败（bucket=%s）：%s", bucket, exc)
 
 
 def resume_block(bucket: str) -> str:

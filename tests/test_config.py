@@ -99,5 +99,24 @@ class EnvFileTests(unittest.TestCase):
         config._load_env_file(Path("/nonexistent/path/to/.env"))
 
 
+class WebsiteConfigTests(unittest.TestCase):
+    """T7.1：入口 URL 必须真的由 config.WEBSITE 驱动（.env 可覆盖）。"""
+
+    def test_home_url_is_taken_from_config_website(self):
+        import importlib
+
+        from gemini_web import errors
+
+        with unittest.mock.patch.object(config, "WEBSITE", "https://example.test/app"):
+            reloaded = importlib.reload(errors)
+            self.assertEqual(reloaded.HOME_URL, "https://example.test/app")
+        # 退出 patch 后再 reload 才恢复到真实值（证明它不是写死的常量）
+        importlib.reload(errors)
+        self.assertEqual(errors.HOME_URL, config.WEBSITE)
+
+    def test_default_entry_url_is_gemini(self):
+        self.assertTrue(config.WEBSITE.startswith("https://gemini.google.com"))
+
+
 if __name__ == "__main__":
     unittest.main()

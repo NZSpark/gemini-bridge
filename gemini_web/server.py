@@ -1,9 +1,11 @@
 """FastAPI 应用与路由（OpenAI 兼容层）。"""
 
+import asyncio
 import hashlib
+import logging
 import re
 import traceback
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import List, Optional
 
 from fastapi import FastAPI, Header, HTTPException
@@ -37,10 +39,34 @@ from .toolcalls import (
     EDIT_MARKDOWN_TOOL_NAME,
     execute_edit_markdown,
     parse_tool_calls,
+    should_register_edit_markdown,
     to_tool_call_models,
 )
+from .chat_io import prune_output_dir
+
+logger = logging.getLogger(__name__)
 
 driver = GeminiWebDriver()
+
+
+def _prune_output_now() -> None:
+    """启动 / 后台周期调用的落盘目录清理（T7.2）。"""
+    try:
+        removed = prune_output_dir(config.OUTPUT_DIR)
+        if removed:
+            print(f"[清理] 已从 {config.OUTPUT_DIR} 回收 {removed} 个文件。")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("清理落盘目录失败（%s）：%s", config.OUTPUT_DIR, exc)
+
+
+async def _output_prune_loop() -> None:
+    """按 OUTPUT_PRUNE_INTERVAL_S 周期清理（0 = 关闭，只保留启动清理）。"""
+    interval = config.OUTPUT_PRUNE_INTERVAL_S
+    if not interval or interval <= 0:
+        return
+    while True:
+        await asyncio.sleep(interval)
+        _prune_output_now()
 
 
 @asynccontextmanager
@@ -56,8 +82,16 @@ async def lifespan(app: FastAPI):
             f"\n[启动警告] 浏览器初始化失败：{exc}\n"
             "服务仍会启动，可用 GET /healthz 查看状态。\n"
         )
-    yield
-    await driver.close()
+    # 启动时清理一次落盘目录；随后交给后台周期任务（T7.2）。
+    _prune_output_now()
+    prune_task = asyncio.create_task(_output_prune_loop())
+    try:
+        yield
+    finally:
+        prune_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await prune_task
+        await driver.close()
 
 
 def _error_response(status_code: int, message: str, err_type: str):
@@ -319,7 +353,7 @@ async def chat_completions(
     tasks.record(bucket, request.messages)
     task_block = tasks.resume_block(bucket)
 
-    if config.EDIT_MARKDOWN_LOCAL and EDIT_MARKDOWN_TOOL_NAME not in _tool_names(request.tools):
+    if should_register_edit_markdown(request.tools):
         request.tools = list(request.tools or []) + [EDIT_MARKDOWN_TOOL]
 
     # 两份文本：增量版（现有会话已有上下文）与播种版（新会话 / 轮转后需要重放历史）。

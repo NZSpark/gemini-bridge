@@ -15,6 +15,10 @@ from playwright.sync_api import sync_playwright
 from gemini_web import config
 from gemini_web.errors import HOME_URL
 
+# 入口 URL 前缀：导航后必须真的落在 Gemini 上。空白页 / 被重定向到登录、同意页
+# 都要在测试代码里立刻报错，而不是留一个空白窗口让调用方去猜。
+ENTRY_URL_PREFIX = "https://gemini.google.com"
+
 POLL_S = max(0.5, config.POLL_INTERVAL_S)
 # 独立稳定阈值：文本连续这么多轮逐字不变即认为生成结束
 STABLE_REQUIRED = 8
@@ -62,17 +66,43 @@ class DirectGeminiClient:
     # ---------- 生命周期 ----------
 
     def start(self) -> None:
+        """启动浏览器并**显式导航到 Gemini 入口**。
+
+        两个必须遵守的约束：
+
+        * **一定要 goto(HOME_URL)**：持久化上下文的首个页面初值就是 ``about:blank``
+          （profile 还可能恢复上次的标签页），不导航就永远停在空白页。
+        * **失败也要关掉浏览器**：此前 start() 中途抛错时，半启动的 Chromium 无人
+          回收，桌面上会留下一个停在 about:blank 的空白窗口（headed 模式尤其明显）。
+        """
         self._pw = sync_playwright().start()
-        self.context = self._pw.chromium.launch_persistent_context(
-            user_data_dir=self.user_data_dir,
-            headless=self.headless,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
-        self.page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
-        self.page.wait_for_selector(
-            config.READY_SELECTOR, timeout=config.READY_TIMEOUT_MS, state="visible"
-        )
+        try:
+            self.context = self._pw.chromium.launch_persistent_context(
+                user_data_dir=self.user_data_dir,
+                headless=self.headless,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+            self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
+            self.page.goto(HOME_URL, wait_until="domcontentloaded", timeout=60000)
+
+            current = (self.page.url or "").strip()
+            if not current.startswith(ENTRY_URL_PREFIX):
+                title = ""
+                try:
+                    title = self.page.title() or ""
+                except Exception:  # noqa: BLE001  页面可能已不可用，标题仅作诊断
+                    pass
+                raise RuntimeError(
+                    f"直连页未落在 Gemini 入口：url={current!r} title={title!r}"
+                    f"（期望 {HOME_URL}；空白页/登录页请检查 profile 副本的登录态）"
+                )
+            self.page.wait_for_selector(
+                config.READY_SELECTOR, timeout=config.READY_TIMEOUT_MS, state="visible"
+            )
+        except Exception as exc:  # noqa: BLE001
+            # 关键：先关掉浏览器再抛错，避免泄漏空白窗口
+            self.close()
+            raise RuntimeError(f"直连浏览器启动/导航失败（浏览器已关闭）：{exc}") from exc
 
     def close(self) -> None:
         for closer in (

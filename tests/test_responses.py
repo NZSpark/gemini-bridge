@@ -163,6 +163,53 @@ class StreamResponsesToolTests(unittest.TestCase):
         )
 
 
+class PartialStreamDriver(FakeDriver):
+    """只流出一段，最终回复更长（模拟生成中途回复节点被整体替换，T6.1）。"""
+
+    def __init__(self, streamed_piece, final_reply):
+        super().__init__(final_reply)  # FakeDriver.reply = final_reply
+        self.streamed_piece = streamed_piece
+
+    async def send_chat(self, prompt, on_delta=None, seeded_prompt=None, key=None):
+        if on_delta:
+            await on_delta(self.streamed_piece)
+        return self.reply, []
+
+
+def _text_of(events):
+    return "".join(p["delta"] for t, p in events if t == "response.output_text.delta")
+
+
+class StreamResponsesTailTests(unittest.TestCase):
+    def _run(self, streamed_piece, final_reply, tools=None):
+        driver = PartialStreamDriver(streamed_piece, final_reply)
+        lines = _collect(stream_responses(_request(stream=True, tools=tools), driver, None))
+        return _parse_events(lines)
+
+    def test_deltas_add_up_to_full_reply_when_stream_stopped_early(self):
+        events = self._run("Hello", "Hello world")
+        self.assertEqual(_text_of(events), "Hello world")
+
+    def test_no_duplication_when_stream_is_complete(self):
+        events = self._run("Hello world", "Hello world")
+        self.assertEqual(_text_of(events), "Hello world")
+
+    def test_output_text_done_and_completed_carry_full_reply(self):
+        events = self._run("Hello", "Hello world")
+        done = next(p for t, p in events if t == "response.output_text.done")
+        self.assertEqual(done["text"], "Hello world")
+        completed = next(p for t, p in events if t == "response.completed")
+        text = completed["response"]["output"][0]["content"][0]["text"]
+        self.assertEqual(text, "Hello world")
+
+    def test_buffered_tool_mode_still_replays_whole_text(self):
+        """工具模式先缓冲、不吐 delta，收尾必须补发全文（RESPONSES_TOOL_BUFFER）。"""
+        with mock.patch.object(config, "RESPONSES_TOOL_BUFFER", True):
+            events = self._run("", "buffered reply", tools=TOOLS)
+        self.assertEqual(_text_of(events), "buffered reply")
+        self.assertNotIn("response.function_call_arguments.delta", [t for t, _ in events])
+
+
 class NonStreamingFromChatTests(unittest.TestCase):
     def test_tool_calls_shape(self):
         from gemini_web.responses import from_chat_response

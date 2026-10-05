@@ -114,6 +114,62 @@ class StreamTests(unittest.TestCase):
         self.assertIn("tool_calls", finishes_of(events))
 
 
+class PartialStreamDriver:
+    """模拟 T6.1 的真实故障：生成中途只吐了一段，最终回复更长。
+
+    网页版在长会话下会回收/替换回复节点，`_delta_piece` 遇到非前缀替换就停发增量。
+    旧实现在收尾时只在「从未发过任何增量」时才补全文，于是客户端永久少一截，
+    而且不会有任何报错。
+    """
+
+    def __init__(self, streamed_piece, final_reply):
+        self.streamed_piece = streamed_piece
+        self.final_reply = final_reply
+
+    async def send_chat(self, prompt, on_delta=None, seeded_prompt=None, key=None):
+        if on_delta:
+            await on_delta(self.streamed_piece)
+        return self.final_reply, []
+
+
+def _content_of(events):
+    return "".join(
+        e["choices"][0]["delta"].get("content", "")
+        for e in events
+        if e.get("choices") and e["choices"][0].get("delta")
+    )
+
+
+class StreamTailReconciliationTests(unittest.TestCase):
+    def _request(self, **kw):
+        return ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **kw)
+
+    def test_tail_is_backfilled_when_deltas_stopped_early(self):
+        """增量只发了一段 -> 收尾必须把剩下的一次性补齐。"""
+        driver = PartialStreamDriver("Hello", "Hello world")
+        events = _events(_collect(_stream_chat_completion(self._request(), "p", driver)))
+        self.assertEqual(_content_of(events), "Hello world")
+
+    def test_no_duplication_when_deltas_complete(self):
+        """增量已经完整时不得重复补发。"""
+        driver = PartialStreamDriver("Hello world", "Hello world")
+        events = _events(_collect(_stream_chat_completion(self._request(), "p", driver)))
+        self.assertEqual(_content_of(events), "Hello world")
+
+    def test_divergent_reply_resends_full_text_instead_of_losing_tail(self):
+        """已下发内容不是最终内容的前缀：SSE 无法撤回，宁重复不丢全文。"""
+        driver = PartialStreamDriver("stale", "rewritten text")
+        events = _events(_collect(_stream_chat_completion(self._request(), "p", driver)))
+        content = _content_of(events)
+        self.assertTrue(content.endswith("rewritten text"))
+        self.assertIn("rewritten text", content)
+
+    def test_empty_reply_does_not_emit_empty_content_chunk(self):
+        driver = PartialStreamDriver("", "")
+        events = _events(_collect(_stream_chat_completion(self._request(), "p", driver)))
+        self.assertEqual(_content_of(events), "")
+
+
 def finishes_of(events):
     return [
         e["choices"][0]["finish_reason"]

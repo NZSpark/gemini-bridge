@@ -32,6 +32,7 @@ from .toolcalls import (
     EDIT_MARKDOWN_TOOL_NAME,
     execute_edit_markdown,
     parse_tool_calls,
+    should_register_edit_markdown,
 )
 
 
@@ -241,15 +242,10 @@ def _map_exception(exc: Exception) -> Tuple[int, str]:
 
 
 def _maybe_register_edit_markdown(request: ChatCompletionRequest) -> None:
-    """本地执行开启时，把 edit_markdown 注册进本轮工具列表（客户端未提供时）。"""
-    if not config.EDIT_MARKDOWN_LOCAL:
+    """本地执行开启时，把 edit_markdown 注册进本轮工具列表（见 should_register_...）。"""
+    if not should_register_edit_markdown(request.tools):
         return
-    names = _tool_names(request.tools)
-    if EDIT_MARKDOWN_TOOL_NAME in names:
-        return
-    tools = list(request.tools or [])
-    tools.append(EDIT_MARKDOWN_TOOL)
-    request.tools = tools
+    request.tools = list(request.tools or []) + [EDIT_MARKDOWN_TOOL]
 
 
 def _maybe_run_edit_markdown(tool_calls):
@@ -275,18 +271,6 @@ def _maybe_run_edit_markdown(tool_calls):
 
 
 # ==================== 共享执行（流式/非流式都走这里）====================
-
-
-def _resolve_session(request: ChatCompletionRequest, session_key: Optional[str], seed: bool) -> str:
-    delta = build_prompt(request.messages, request.tools, request.tool_choice)
-    seeded = build_prompt(
-        request.messages,
-        request.tools,
-        request.tool_choice,
-        seed=True,
-        seed_max_chars=config.SEED_MAX_CHARS,
-    )
-    return seeded if seed else delta
 
 
 async def run_chat(
@@ -584,14 +568,22 @@ async def stream_responses(
         for line in open_message_item():
             yield line
         full = reply if reply is not None else streamed
-        if not streamed and full:
-            # 工具模式缓冲后未流式吐字，这里补发
-            for i in range(0, len(full), 64):
+        # 收尾对账（T6.1）：保证客户端累计收到的 delta == 最终文本。
+        # 工具模式缓冲后本来就没吐字（missing = full）；生成中途节点被整体替换时
+        # 增量会停发，旧实现只在「从未发过增量」时补全文 —— 会静默丢尾。
+        if full and full != streamed:
+            if full.startswith(streamed):
+                missing = full[len(streamed):]
+            else:
+                # SSE 无撤回语义：追加无法修复，只能补发全文（宁可重复不丢）
+                print("[responses] 回复被整体改写，已补发全文（客户端可能看到重复内容）。")
+                missing = full
+            for i in range(0, len(missing), 64):
                 yield evt("response.output_text.delta", {
                     "item_id": msg_id,
                     "output_index": 0,
                     "content_index": 0,
-                    "delta": full[i:i + 64],
+                    "delta": missing[i:i + 64],
                 })
         yield evt("response.output_text.done", {
             "item_id": msg_id,

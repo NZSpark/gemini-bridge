@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import logging
 import re
 import time
 import uuid
@@ -20,22 +21,34 @@ from .errors import (
 from .prompting import _delta_piece, estimate_tokens
 
 
-def _prune_output_dir(output_dir: str) -> None:
-    """按 config 的保留策略清理落盘目录（0 = 不限，出错静默忽略）。"""
+logger = logging.getLogger(__name__)
+
+
+def prune_output_dir(output_dir: str) -> int:
+    """按 config 的保留策略清理落盘目录（0 = 不限）。返回删除的文件数。
+
+    调用点有两处（T7.2）：`save_extracted_files` 落盘前，以及服务启动 / 后台周期任务。
+    此前只在落盘时调用，纯读取的长跑进程永远不会回收旧文件。
+    失败不再静默：目录不可读 / 删不掉时至少留一条 warning（否则磁盘默默长满）。
+    """
     max_files = config.OUTPUT_MAX_FILES
     max_age_days = config.OUTPUT_MAX_AGE_DAYS
     if not max_files and not max_age_days:
-        return
+        return 0
     try:
         entries = [p for p in Path(output_dir).iterdir() if p.is_file()]
-    except Exception:
-        return
+    except OSError as exc:
+        logger.debug("清理落盘目录时无法读取 %s：%s", output_dir, exc)
+        return 0
+    removed = 0
     now = time.time()
     for path in entries:
         try:
             if max_age_days and now - path.stat().st_mtime > max_age_days * 86400:
                 path.unlink()
-        except Exception:
+                removed += 1
+        except OSError as exc:
+            logger.debug("删除过期文件 %s 失败：%s", path, exc)
             continue
     if max_files:
         try:
@@ -43,13 +56,21 @@ def _prune_output_dir(output_dir: str) -> None:
                 (p for p in Path(output_dir).iterdir() if p.is_file()),
                 key=lambda p: p.stat().st_mtime,
             )
-            for path in remaining[: max(0, len(remaining) - max_files)]:
-                try:
-                    path.unlink()
-                except Exception:
-                    continue
-        except Exception:
-            return
+        except OSError as exc:
+            logger.debug("统计落盘目录 %s 失败：%s", output_dir, exc)
+            return removed
+        for path in remaining[: max(0, len(remaining) - max_files)]:
+            try:
+                path.unlink()
+                removed += 1
+            except OSError as exc:
+                logger.debug("按数量上限删除 %s 失败：%s", path, exc)
+                continue
+    return removed
+
+
+# 向后兼容：旧名字（既有调用 / 测试 / 文档里的复现命令都可能还在用）
+_prune_output_dir = prune_output_dir
 
 
 class ChatIOMixin:
@@ -562,7 +583,7 @@ class ChatIOMixin:
     def save_extracted_files(raw_text: str, code_blocks: List[dict], output_dir: str) -> List[str]:
         """将提取的代码落地为对应格式的文件"""
         Path(output_dir).mkdir(parents=True, exist_ok=True)
-        _prune_output_dir(output_dir)
+        prune_output_dir(output_dir)
         saved = []
 
         ext_map = {

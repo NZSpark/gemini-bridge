@@ -66,34 +66,42 @@ GeminiBridge/
 ├── gemini_api_server.py      # 入口薄封装：重导出历史公开名字 + 启动 uvicorn
 ├── gemini_web/
 │   ├── __init__.py
-│   ├── config.py             # 解析 .env，导出全部 GEMINI_* 配置与默认值
+│   ├── config.py             # 解析 .env，导出全部可调参数（运行期按属性读取）
+│   ├── errors.py             # 异常类型 + DEFAULT_SESSION_KEY / HOME_URL（来自 config.WEBSITE）
 │   ├── models.py             # OpenAI 兼容 Pydantic 模型（chat / responses / 错误）
-│   ├── prompting.py          # messages 数组 -> 输入框文本（含工具注入模板）
-│   ├── toolcalls.py          # 工具描述注入 + 输出解析成 tool_calls
-│   ├── driver.py             # Playwright Driver：会话持久化、发消息、轮询、读 DOM
+│   ├── prompting.py          # messages 数组 -> 输入框文本（含工具注入模板、播种）
+│   ├── toolcalls.py          # 工具描述注入 + 输出解析成 tool_calls + 内置工具
+│   ├── markdown_io.py        # Markdown 围栏安全的按行读写（纯逻辑，内置工具用）
+│   ├── tasks.py              # 任务快照（轮转后不丢任务目标）
+│   ├── driver.py             # Driver 组装 + 浏览器生命周期（5 个 mixin）
+│   ├── session_store.py      # 会话状态与落盘（SessionStoreMixin）
+│   ├── page_pool.py          # 页面池 / 空闲回收 / LRU / 按桶加锁（PagePoolMixin）
+│   ├── completion.py         # 新建对话 / 轮转 / 到顶判定（CompletionMixin）
+│   ├── chat_io.py            # 发送 / 轮询 / 提取 / 落盘清理（ChatIOMixin）
 │   ├── streaming.py          # chat completions 的 SSE 编码
 │   ├── responses.py          # Responses API 兼容层（命名 SSE 事件）
 │   └── server.py             # FastAPI app、路由、会话桶、健康检查
-├── tests/                    # stdlib unittest，全部用假 page/driver
-│   ├── test_config.py
-│   ├── test_prompting.py
-│   ├── test_toolcalls.py
-│   ├── test_ending.py        # 结束判定（STABLE_POLLS / LEN_STABLE_POLLS）
-│   ├── test_sessions.py      # 播种 / 到顶 / 轮转 / 分桶 / 锁
-│   ├── test_routes_chat.py
-│   └── test_routes_responses.py
-├── client_test.py            # 用 openai SDK 打本地服务的示例
+├── tests/                    # unittest + pytest 混合，全部用假 page / driver
+│   ├── test_config.py        test_config_drift.py   test_doc_sync.py
+│   ├── test_models.py        test_prompting.py      test_toolcalls.py
+│   ├── test_parsing.py       test_seed_prompt.py    test_markdown_io.py
+│   ├── test_end_detection.py test_sessions.py       test_responses.py
+│   ├── test_streaming.py     test_routes_chat.py    test_output_prune.py
+│   ├── test_e2e_harness.py   # E2E 脚手架的定向回归（不联网）
+│   └── e2e/                  # 真实联网对等测试（GEMINI_E2E=1 才跑）
 ├── requirements.txt
-├── .env                      # 已存在，实际生效配置
-├── .env.example              # 从 .env 生成，补注释
-├── .gitignore                # user_data/ output/ .venv/ __pycache__/
+├── .env                      # 已存在，实际生效配置（gitignore）
+├── .env.example              # 全量配置模板（防漂移测试双向守护）
+├── .gitignore
 ├── README.md
-├── INSTALL.md
-├── cmdlog.md
 └── doc/
     ├── design.md             # 本文件
     ├── tasks.md              # 任务分解与状态跟踪
-    └── update.md             # 代码现状与重构分析
+    ├── update.md             # 全项目复审 + 联网实测记录 + 建议
+    ├── update_codex.md       # 既有视角分析（Codex）
+    ├── update_pi.md          # 既有视角分析（Pi）
+    ├── markdown_io_design.md # markdown_io 设计稿（已实现，归档）
+    └── e2e_test_design.md    # E2E 对等测试设计
 ```
 
 ---
@@ -102,10 +110,18 @@ GeminiBridge/
 
 全部来自根目录 `.env`，由 `gemini_web/config.py` 读取并提供默认值。
 
+> **默认值的单一事实来源是 `.env.example`**（与 `config.py` 双向对齐，由
+> `tests/test_config_drift.py` 守护）。下表只列出最常调的项，不再逐键重复，
+> 避免再次出现“改了一处、另一处漂移”的情况。
+
 ### 服务监听
 - `HOST`：默认 `127.0.0.1`，不要绑定 `0.0.0.0`（转发的是登录会话）。
 - `PORT`：默认 `8001`。
-- `WEBSITE`：默认 `https://gemini.google.com/app`。
+- `WEBSITE`：默认 `https://gemini.google.com/app`。入口 URL，由 `errors.HOME_URL` 读取，
+  改 `.env` 会真的生效（此前是硬编码死配置）。
+
+> 注意：**真实环境变量优先于 `.env`**。例如环境里存在 `PORT=0` 时，实际生效的端口是 `0`
+> （`uvicorn --port 0` 会绑定随机端口），这曾让 E2E 测试误起第二个实例。
 
 ### 上游等待 / 重试
 - `GEMINI_TIMEOUT`：单轮生成总超时（秒），默认 `180`，须小于客户端 HTTP 超时。
@@ -116,6 +132,8 @@ GeminiBridge/
 - `POLL_INTERVAL_S`：轮询间隔（秒），默认 `1.5`。
 - `STABLE_POLLS`：文本完全相同的连续次数，默认 `5`。
 - `LEN_STABLE_POLLS`：仅长度不再增长的连续次数（更保守），默认 `8`。
+- `STALL_POLLS`：连续多少次既无正文也无「生成中」信号即提前失败，默认 `20`。
+- `CAP_CHECK_EVERY`：每多少轮检查一次「会话到顶」提示，默认 `4`。
 
 ### 运行模式 / 调试
 - `HEADLESS`：无头模式，首次登录需 `false`，默认 `false`。
@@ -141,8 +159,10 @@ GeminiBridge/
 - `MAX_SESSION_BUCKETS`：最大会话桶数，默认 `3`，应 >= 同时访问的 Agent 数。
 - `PARALLEL_BUCKETS`：是否真正并行驱动多会话，默认 `true`。
 - `BUCKET_LOCK_TIMEOUT_S`：同一桶排队上限（秒），默认 `15`，超时返回 503 `upstream_busy`；`0` = 一直等。
-- `SESSION_MAX_TURNS`：单会话最大轮次，默认 `80`。
-- `SESSION_MAX_TOKENS`：单会话最大估算 token，默认 `240000`。
+- `SESSION_MAX_TURNS`：单会话最大轮次，默认 `60`。
+- `SESSION_MAX_TOKENS`：单会话最大估算 token，默认 `60000`（本机 `.env` 覆盖为 `1000000`）。
+- `MAX_SESSION_STATE_CACHE`：内存会话状态缓存上限，默认 `64`（LRU，`0` 不限）。
+- `BUCKET_IDLE_TTL_S`：空闲页面回收秒数，默认 `900`（`0` 关闭）。
 
 ### Responses API（Codex CLI）
 - `ENABLE_RESPONSES_API`：是否启用 `/v1/responses`，默认 `true`；关闭返回 404，不影响 chat。
@@ -223,7 +243,8 @@ GeminiBridge/
 
 ## 7. 测试策略
 
-- 全部使用标准库 `unittest`，用假 page / 假 driver 驱动，不启动浏览器、不需额外依赖。
+- 以标准库 `unittest` 为主，部分文件（如 `test_config_drift.py`、`test_output_prune.py`）为 pytest 风格；两者都由 `pytest -q` 统一收集。
+- 用假 page / 假 driver 驱动，不启动浏览器、不需额外依赖；`tests/e2e/` 是真实联网对等测试，`GEMINI_E2E=1` 才运行，否则全部 skip。
 - 覆盖：配置解析与默认值、prompting 拼接、toolcalls 注入与解析、结束判定、会话生命周期（播种 / 到顶 / 轮转 / 重试 / 分桶 / 回收 / 锁）、chat 路由、Responses 路由。
 - 运行：`.venv/bin/python -m unittest discover -s tests -t . -v`。
 

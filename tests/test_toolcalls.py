@@ -7,11 +7,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from unittest import mock  # noqa: E402
+
+from gemini_web import config  # noqa: E402
 from gemini_web.toolcalls import (  # noqa: E402
     _normalize_tool_entry,
     _tool_names,
     format_tools_instruction,
     parse_tool_calls,
+    should_register_edit_markdown,
     to_tool_call_models,
 )
 
@@ -420,6 +424,40 @@ class ToToolCallModelsTests(unittest.TestCase):
     def test_id_prefix(self):
         models = to_tool_call_models([{"name": "f", "arguments": {}}])
         self.assertTrue(models[0].id.startswith("call_"))
+
+
+class ShouldRegisterEditMarkdownTests(unittest.TestCase):
+    """T7.6：内置工具只在客户端已声明工具时才注入（否则每请求多付 ~970 tokens）。"""
+
+    def test_not_registered_when_client_has_no_tools(self):
+        with mock.patch.object(config, "EDIT_MARKDOWN_LOCAL", True), \
+                mock.patch.object(config, "EDIT_MARKDOWN_ALWAYS_REGISTER", False):
+            self.assertFalse(should_register_edit_markdown(None))
+            self.assertFalse(should_register_edit_markdown([]))
+
+    def test_registered_when_client_has_tools(self):
+        with mock.patch.object(config, "EDIT_MARKDOWN_LOCAL", True), \
+                mock.patch.object(config, "EDIT_MARKDOWN_ALWAYS_REGISTER", False):
+            self.assertTrue(should_register_edit_markdown(TOOLS))
+
+    def test_not_registered_when_client_already_declares_it(self):
+        tools = list(TOOLS) + [{
+            "type": "function",
+            "function": {"name": "edit_markdown", "parameters": {}},
+        }]
+        with mock.patch.object(config, "EDIT_MARKDOWN_LOCAL", True), \
+                mock.patch.object(config, "EDIT_MARKDOWN_ALWAYS_REGISTER", False):
+            self.assertFalse(should_register_edit_markdown(tools))
+
+    def test_not_registered_when_local_execution_disabled(self):
+        with mock.patch.object(config, "EDIT_MARKDOWN_LOCAL", False), \
+                mock.patch.object(config, "EDIT_MARKDOWN_ALWAYS_REGISTER", True):
+            self.assertFalse(should_register_edit_markdown(TOOLS))
+
+    def test_escape_hatch_restores_old_behaviour(self):
+        with mock.patch.object(config, "EDIT_MARKDOWN_LOCAL", True), \
+                mock.patch.object(config, "EDIT_MARKDOWN_ALWAYS_REGISTER", True):
+            self.assertTrue(should_register_edit_markdown(None))
 
 
 if __name__ == "__main__":

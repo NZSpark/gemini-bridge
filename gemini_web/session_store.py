@@ -5,12 +5,16 @@
 """
 
 import json
+import logging
+import os
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
 from . import config
 from .errors import DEFAULT_SESSION_KEY, HOME_URL
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -138,18 +142,25 @@ class SessionStoreMixin:
 
     # ---------- 会话状态持久化（不再涉及会话 URL）----------
     def _read_state_file(self) -> Dict[str, Any]:
-        """读取原始状态文件（解析失败或非 JSON 时返回空字典）。"""
+        """读取原始状态文件（解析失败或非 JSON 时返回空字典）。
+
+        注意：解析失败一律回退成 {}——上层会把“读不到”当成“没有状态”，因此**写坏
+        文件 = 状态凭空清零**。写侧必须保证原子性（见 _save_session_state）。
+        """
         try:
             if not config.SESSION_FILE.exists():
                 return {}
             raw = config.SESSION_FILE.read_text(encoding="utf-8").strip()
-        except Exception:
+        except OSError as exc:
+            logger.warning("读取会话状态文件失败：%s", exc)
             return {}
         if not raw.startswith("{"):
+            logger.warning("会话状态文件内容异常（不以 { 开头），已忽略：%s", config.SESSION_FILE)
             return {}
         try:
             data = json.loads(raw)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("会话状态文件 JSON 解析失败（将视为无状态）：%s", exc)
             return {}
         return data if isinstance(data, dict) else {}
 
@@ -164,7 +175,17 @@ class SessionStoreMixin:
         return own if isinstance(own, dict) else {}
 
     def _save_session_state(self, key: Optional[str] = None) -> None:
-        """落盘某个会话桶的状态，供轮转决策与跨重启延续预算使用。"""
+        """落盘某个会话桶的状态，供轮转决策与跨重启延续预算使用。
+
+        **不变量（勿破坏）**：本方法必须保持“纯同步、无 await”。单事件循环下，
+        没有 await 的临界区是不可被打断的——不同会话桶并发调用时，读-改-写因此
+        天然互斥（`tests/test_sessions.py::StateFileConcurrencyTests` 已锁住这一点）。
+        一旦在里面引入 await，就必须补一把跨桶的 asyncio.Lock。
+
+        写入采用“临时文件 + os.replace”原子替换：直接 write_text 会在崩溃 / 被 kill
+        时留下被截断的 JSON，而 `_read_state_file` 对解析失败一律返回 {}，
+        表现为**状态（轮数 / token 预算）凭空清零**。
+        """
         bucket = key or DEFAULT_SESSION_KEY
         state = self._state(bucket)
         state.updated_at = int(time.time())
@@ -182,11 +203,11 @@ class SessionStoreMixin:
             payload = data
         try:
             config.SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
-            config.SESSION_FILE.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-        except Exception:
-            pass
+            tmp = config.SESSION_FILE.with_name(config.SESSION_FILE.name + ".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, config.SESSION_FILE)  # 原子替换（同目录同文件系统）
+        except OSError as exc:
+            logger.warning("会话状态落盘失败（key=%s）：%s", bucket, exc)
 
     async def _remember_session(self, key: Optional[str] = None) -> None:
         """刷新落盘的会话状态（保留此名字，兼容既有调用）。"""

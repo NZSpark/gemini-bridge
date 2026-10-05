@@ -29,7 +29,36 @@ from .direct import DirectGeminiClient
 GATE = os.environ.get("GEMINI_E2E") == "1"
 E2E_FULL = os.environ.get("E2E_FULL") == "1"
 E2E_HEADED = os.environ.get("E2E_HEADED") == "1"
-PORT = int(os.environ.get("E2E_PORT") or config.PORT)
+# 端口解析：E2E_PORT 优先，否则用 config.PORT（真实环境变量 > .env）。
+_DEFAULT_PORT = 8001
+
+
+def _resolve_port(raw: Any) -> int:
+    """把候选端口归一化成一个可用的 TCP 端口；非法值回退默认端口。
+
+    真实环境变量优先于 .env，因此一个随手设置的 ``PORT=0`` 会让 BASE_URL 变成
+    ``http://127.0.0.1:0``：探活必然失败，BridgeServer 还会误起一个绑定随机端口的
+    第二实例，去抢同一个浏览器 profile（表现为 90s 超时或一个无人负责的浏览器窗口）。
+    """
+    # bool 是 int 的子类（True -> 1）；非整数浮点会被 int() 静默截断（3.5 -> 3，
+    # 变成一个特权端口）。两者都不是合法端口来源，直接判非法。
+    if isinstance(raw, bool) or (isinstance(raw, float) and not raw.is_integer()):
+        port = 0
+    else:
+        try:
+            port = int(raw)
+        except (TypeError, ValueError):
+            port = 0
+    if not (1 <= port <= 65535):
+        print(
+            f"[E2E] 端口 {raw!r} 非法（环境变量 PORT 会覆盖 .env），"
+            f"回退到 {_DEFAULT_PORT}；可用 E2E_PORT=<端口> 显式指定。"
+        )
+        return _DEFAULT_PORT
+    return port
+
+
+PORT = _resolve_port(os.environ.get("E2E_PORT") or config.PORT)
 BASE_URL = f"http://127.0.0.1:{PORT}"
 MODEL_ID = "gemini-chat"
 
@@ -78,6 +107,9 @@ def _ensure_direct() -> DirectGeminiClient:
         try:
             client.start()
         except Exception as exc:  # noqa: BLE001
+            # start() 内部失败时已自清理；这里再兜底关一次，确保 headed 模式下
+            # 不会留下一个无人负责的空白浏览器窗口。
+            client.close()
             raise unittest.SkipTest(f"直连浏览器启动失败（环境问题）：{exc}") from exc
         DIRECT = client
     return DIRECT

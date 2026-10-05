@@ -11,6 +11,7 @@ import json
 import re
 from typing import Any, Dict, List, Optional
 
+from . import config
 from .models import FunctionCall, ToolCall
 
 # 当前注入格式：行首 ``TOOL_CALL:`` 纯文本标记（大小写不敏感）。
@@ -97,6 +98,25 @@ BUILTIN_TOOLS: List[Dict[str, Any]] = [EDIT_MARKDOWN_TOOL]
 
 def builtin_tool_names() -> set:
     return {t["function"]["name"] for t in BUILTIN_TOOLS}
+
+
+def should_register_edit_markdown(client_tools: Optional[List[Dict[str, Any]]]) -> bool:
+    """本轮是否要把内置 ``edit_markdown`` 追加进工具列表。
+
+    默认**只在客户端已经声明了工具**时才注入。原因（实测，见 doc/update.md P1-5）：
+    无条件注入会给每个请求额外附带约 970 tokens 的脚手架（工具说明 + 格式强调 +
+    edit_markdown 说明），既挤占网页会话预算，又可能让客户端收到自己从未声明过的
+    ``tool_calls``（`finish_reason=tool_calls`）。
+
+    需要恢复旧行为时设 ``EDIT_MARKDOWN_ALWAYS_REGISTER=true``。
+    """
+    if not config.EDIT_MARKDOWN_LOCAL:
+        return False
+    if EDIT_MARKDOWN_TOOL_NAME in _tool_names(client_tools):
+        return False
+    if config.EDIT_MARKDOWN_ALWAYS_REGISTER:
+        return True
+    return bool(client_tools)
 
 
 def edit_markdown_spec() -> str:
