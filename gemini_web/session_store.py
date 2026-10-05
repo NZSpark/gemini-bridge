@@ -256,4 +256,4 @@ class SessionStoreMixin:
         state.cap_hit = False
         state.has_history = False
         self._save_session_state(key=bucket)
-        print(f"[会话] 已请求重置 key={bucket} 的会话，下一轮将开启新会话并播种上下文。")
+        logger.info("[会话] 已请求重置 key=%s 的会话，下一轮将开启新会话并播种上下文。", bucket)

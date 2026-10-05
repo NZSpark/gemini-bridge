@@ -5,12 +5,15 @@
 """
 
 import asyncio
+import logging
 import time
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
 from . import config
 from .errors import DEFAULT_SESSION_KEY, HOME_URL, GeminiBusyError
+
+logger = logging.getLogger(__name__)
 
 
 class PagePoolMixin:
@@ -92,9 +95,9 @@ class PagePoolMixin:
         try:
             await page.close()
         except Exception as exc:  # noqa: BLE001
-            print(f"[回收] 关闭 key={bucket} 的页面时出错（已忽略）：{exc}")
+            logger.warning("[回收] 关闭 key=%s 的页面时出错（已忽略）：%s", bucket, exc)
         else:
-            print(f"[回收] 已关闭 key={bucket} 的页面（{reason}），会话状态保留。")
+            logger.info("[回收] 已关闭 key=%s 的页面（%s），会话状态保留。", bucket, reason)
         return True
 
     async def _recycle_idle_pages(self, exclude: Optional[str] = None) -> int:
@@ -134,7 +137,7 @@ class PagePoolMixin:
             )
             return True
         except Exception:
-            print("[会话] 页面已打开，但未检测到输入框，请检查登录状态。")
+            logger.warning("[会话] 页面已打开，但未检测到输入框，请检查登录状态。")
             return False
 
     async def _ensure_page(self, key: Optional[str]) -> None:
@@ -175,4 +178,4 @@ class PagePoolMixin:
             await self._open_new_chat(page)
             await self._wait_ready(page)
             state.has_history = False
-        print(f"[会话] 已为 key={bucket} 创建独立会话页面（{HOME_URL}）")
+        logger.info("[会话] 已为 key=%s 创建独立会话页面（%s）", bucket, HOME_URL)

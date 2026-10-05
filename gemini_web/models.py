@@ -90,10 +90,19 @@ class ChatCompletionResponse(BaseModel):
 
 
 class ModelCard(BaseModel):
+    """模型卡。
+
+    ``context_window`` 由会话轮转预算（``config.SESSION_MAX_TOKENS``）填充，
+    由 ``/v1/models`` 透出：网页版没有公开的上下文数值，这里给出的是
+    「桥接层在累计多少估算 token 后轮转会话」的上限，客户端据此裁剪即可
+    与桥接层行为一致，不需要手填（T8.7）。
+    """
+
     id: str
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "gemini-web-bridge"
+    context_window: Optional[int] = None
 
 
 class ModelListResponse(BaseModel):
@@ -101,8 +110,11 @@ class ModelListResponse(BaseModel):
     data: List[ModelCard]
 
 
-# Pi 的 models.json 里引用的 id 需要与这里一致
+# Pi 的 models.json 里引用的 id 需要与这里一致。
+# 这里**不再**硬编码 context_window：旧的 65536 与 README 示例（1000000）互相矛盾，
+# 而 /v1/models 又不透出该字段，三方各说各话（update.md P2-7）。
+# 现在唯一权威数值 = config.SESSION_MAX_TOKENS，由 server.list_models 透出。
 SUPPORTED_MODELS = [
-    {"id": "gemini-chat", "context_window": 65536},
-    {"id": "gemini-reasoner", "context_window": 65536},
+    {"id": "gemini-chat"},
+    {"id": "gemini-reasoner"},
 ]

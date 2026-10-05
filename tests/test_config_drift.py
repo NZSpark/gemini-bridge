@@ -59,7 +59,63 @@ def test_env_example_keys_are_uppercase_identifiers():
     assert not bad, f".env.example 存在非法键名：{bad}"
 
 
-@pytest.mark.parametrize("key", ["WEBSITE", "OUTPUT_PRUNE_INTERVAL_S", "EDIT_MARKDOWN_ALWAYS_REGISTER"])
+@pytest.mark.parametrize("key", [
+    "WEBSITE", "OUTPUT_PRUNE_INTERVAL_S", "EDIT_MARKDOWN_ALWAYS_REGISTER",
+    "BRIDGE_TOKEN", "EDIT_MARKDOWN_ROOT",
+])
 def test_newly_added_keys_are_documented(key):
-    """本轮新增/生效的键必须出现在模板里（T7.1 / T7.2 / T7.6）。"""
+    """本轮新增/生效的键必须出现在模板里（T7.1 / T7.2 / T7.6 / T8.9 / T8.10）。"""
     assert key in _example_keys()
+
+
+# ==================== 依赖防漂移（T8.4）====================
+
+
+def _requirement_name(spec: str) -> str:
+    """``fastapi>=0.110,<1.0`` -> ``fastapi``（去掉版本区间 / extras / 环境标记）。"""
+    return re.split(r"[<>=!;\[]", spec.strip(), maxsplit=1)[0].strip().lower()
+
+
+def _requirements_txt_names() -> set:
+    names = set()
+    for line in (ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            names.add(_requirement_name(line))
+    return names
+
+
+def _pyproject() -> dict:
+    tomllib = pytest.importorskip("tomllib", reason="Python <3.11 无标准库 TOML 解析")
+    with open(ROOT / "pyproject.toml", "rb") as fh:
+        return tomllib.load(fh)
+
+
+def test_pyproject_declares_python_and_runtime_deps():
+    data = _pyproject()["project"]
+    assert data["requires-python"].startswith(">=3.10"), "必须声明最低支持的 Python 版本"
+    deps = [_requirement_name(d) for d in data["dependencies"]]
+    # 关键依赖必须有版本区间，而不是无约束（否则上游大版本会静默进来）
+    for spec in data["dependencies"]:
+        assert any(op in spec for op in (">=", "==", "~=")), f"{spec} 没有版本约束"
+    for name in ("fastapi", "uvicorn", "playwright", "pydantic"):
+        assert name in deps, f"pyproject 缺少运行时依赖 {name}"
+
+
+def test_requirements_txt_matches_pyproject_runtime_deps():
+    """requirements.txt 与 pyproject 的运行时依赖必须同一套名字，防止两边各写一份。"""
+    pyproject_names = {_requirement_name(d) for d in _pyproject()["project"]["dependencies"]}
+    assert _requirements_txt_names() == pyproject_names, (
+        "requirements.txt 与 pyproject.toml 的运行时依赖不一致："
+        f"requirements={sorted(_requirements_txt_names())} pyproject={sorted(pyproject_names)}"
+    )
+
+
+def test_openai_is_dev_only():
+    """openai SDK 只是联调/示例用，不能是运行时依赖（否则给所有用户增加安装负担）。"""
+    data = _pyproject()["project"]
+    runtime = {_requirement_name(d) for d in data["dependencies"]}
+    dev = {_requirement_name(d) for d in data["optional-dependencies"]["dev"]}
+    assert "openai" not in runtime
+    assert "openai" in dev
+    assert "pytest" in dev

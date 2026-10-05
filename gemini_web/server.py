@@ -4,11 +4,10 @@ import asyncio
 import hashlib
 import logging
 import re
-import traceback
 from contextlib import asynccontextmanager, suppress
 from typing import List, Optional
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import config
@@ -43,8 +42,13 @@ from .toolcalls import (
     to_tool_call_models,
 )
 from .chat_io import prune_output_dir
+from .logging_setup import setup_logging
 
 logger = logging.getLogger(__name__)
+
+# 统一日志面（T8.1）：GEMINI_DEBUG=1 → DEBUG，否则 INFO；格式含时间 / 级别 / 模块名。
+# 幂等，且在 pytest 下不自动接管（测试输出保持干净）。
+setup_logging()
 
 driver = GeminiWebDriver()
 
@@ -54,7 +58,7 @@ def _prune_output_now() -> None:
     try:
         removed = prune_output_dir(config.OUTPUT_DIR)
         if removed:
-            print(f"[清理] 已从 {config.OUTPUT_DIR} 回收 {removed} 个文件。")
+            logger.info("[清理] 已从 %s 回收 %s 个文件。", config.OUTPUT_DIR, removed)
     except Exception as exc:  # noqa: BLE001
         logger.warning("清理落盘目录失败（%s）：%s", config.OUTPUT_DIR, exc)
 
@@ -78,9 +82,8 @@ async def lifespan(app: FastAPI):
         # 浏览器起不来时也让服务先启动：便于用 /healthz 定位问题，
         # 并让 /v1/chat/completions 返回可读错误，而不是整个进程直接挂掉
         driver.init_error = str(exc)
-        print(
-            f"\n[启动警告] 浏览器初始化失败：{exc}\n"
-            "服务仍会启动，可用 GET /healthz 查看状态。\n"
+        logger.warning(
+            "浏览器初始化失败：%s\n服务仍会启动，可用 GET /healthz 查看状态。", exc
         )
     # 启动时清理一次落盘目录；随后交给后台周期任务（T7.2）。
     _prune_output_now()
@@ -232,15 +235,41 @@ async def root():
 
 @app.get("/v1/models", response_model=ModelListResponse)
 async def list_models():
-    """Pi (models.json) 会用该端点做模型发现。"""
-    candidates = {m["id"]: m for m in SUPPORTED_MODELS}
-    candidates.setdefault("gemini-chat", {"id": "gemini-chat"})
+    """Pi (models.json) 会用该端点做模型发现。
+
+    ``context_window`` 透出 ``SESSION_MAX_TOKENS``（会话轮转预算），作为**唯一**权威
+    数值：客户端据此裁剪上下文即可，不会再出现“代码 65536 / README 1000000 /
+    端点又不透出”的三方矛盾（T8.7）。
+    """
     return ModelListResponse(
-        data=[ModelCard(id=m["id"]) for m in candidates.values()]
+        data=[
+            ModelCard(id=m["id"], context_window=config.SESSION_MAX_TOKENS)
+            for m in SUPPORTED_MODELS
+        ]
     )
 
 
-@app.post("/v1/responses")
+async def _require_bridge_token(
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+) -> None:
+    """可选 Bearer 鉴权（T8.10）；``BRIDGE_TOKEN`` 留空时完全不校验（默认）。
+
+    只保护**有副作用的生成端点**（``/v1/chat/completions``、``/v1/responses``）；
+    ``/healthz`` 与 ``/v1/models`` 保持开放，便于探活与模型发现。
+    默认关闭，因此对 Pi / Codex 的现有配置零影响。
+    """
+    token = config.BRIDGE_TOKEN
+    if not token:
+        return
+    if authorization != f"Bearer {token}":
+        raise HTTPException(
+            status_code=401,
+            detail="BRIDGE_TOKEN 校验失败",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+@app.post("/v1/responses", dependencies=[Depends(_require_bridge_token)])
 async def responses(
     request: ResponsesRequest,
     x_gemini_session: Optional[str] = Header(None, alias=config.SESSION_KEY_HEADER),
@@ -255,7 +284,7 @@ async def responses(
         raise HTTPException(status_code=404, detail="Responses API 未启用（ENABLE_RESPONSES_API=false）")
     session_key = _session_key(request, x_gemini_session, user_agent)
     if config.DEBUG:
-        print(f"[debug] responses session_key={session_key!r}")
+        logger.debug("responses session_key=%r", session_key)
     return await handle_responses(request, session_key, driver)
 
 
@@ -326,7 +355,11 @@ def _run_local_edit_markdown(tool_calls):
     return out
 
 
-@app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
+@app.post(
+    "/v1/chat/completions",
+    response_model=ChatCompletionResponse,
+    dependencies=[Depends(_require_bridge_token)],
+)
 async def chat_completions(
     request: ChatCompletionRequest,
     x_gemini_session: Optional[str] = Header(None, alias=config.SESSION_KEY_HEADER),
@@ -346,7 +379,7 @@ async def chat_completions(
     # 按任务隔离会话：同一客户端 / 同一 X-Gemini-Session 取值的请求共用一条网页会话
     session_key = _session_key(request, x_gemini_session, user_agent)
     if config.DEBUG:
-        print(f"[debug] session_key={session_key!r}")
+        logger.debug("session_key=%r", session_key)
 
     # 任务快照：记录本轮 messages，供轮转播种时续接任务（不丢任务目标）。
     bucket = session_key or DEFAULT_SESSION_KEY
@@ -394,25 +427,21 @@ async def chat_completions(
             prompt, seeded_prompt=seeded_prompt, key=session_key
         )
     except GeminiContextLimitError as exc:
-        print("\n[ERR] 网页会话已达上下文长度上限:")
-        traceback.print_exc()
+        logger.warning("网页会话已达上下文长度上限：%s", exc)
         return _error_response(400, str(exc), "context_length_exceeded")
     except GeminiBusyError as exc:
         # 本地保护：同一会话桶已有请求在跑且等锁超时。稍后重试即可，不是上游故障。
-        print(f"\n[繁忙] {exc}")
+        logger.warning("上游繁忙：%s", exc)
         return _error_response(503, str(exc), "upstream_busy")
     except GeminiTimeoutError as exc:
-        print("\n[ERR] 等待 Gemini 回复超时（已重试）:")
-        traceback.print_exc()
+        logger.error("等待 Gemini 回复超时（已重试）：%s", exc, exc_info=True)
         return _error_response(504, str(exc), "timeout")
     except RuntimeError as exc:
         # 浏览器不可用 / 找不到输入框等上游问题
-        print("\n[ERR] 上游浏览器不可用:")
-        traceback.print_exc()
+        logger.error("上游浏览器不可用：%s", exc, exc_info=True)
         return _error_response(502, str(exc), "upstream_error")
     except Exception as exc:  # noqa: BLE001
-        print("\n[ERR] 处理请求失败:")
-        traceback.print_exc()
+        logger.error("处理请求失败：%s", exc, exc_info=True)
         return _error_response(500, str(exc), "server_error")
 
     # usage 用真正发出去的 prompt 估算（driver 可能选了播种版 / 中途轮转过）。

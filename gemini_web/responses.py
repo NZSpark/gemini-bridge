@@ -9,8 +9,8 @@ Codex CLI 只发送 ``POST /v1/responses``（Responses API），不再支持 cha
 """
 
 import json
+import logging
 import time
-import traceback
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -34,6 +34,8 @@ from .toolcalls import (
     parse_tool_calls,
     should_register_edit_markdown,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ==================== 请求模型（宽松接收）====================
@@ -148,7 +150,7 @@ def to_chat_request(req: ResponsesRequest) -> ChatCompletionRequest:
             if converted is not None:
                 messages.append(converted)
             else:
-                print(f"[responses] 跳过未知 input item: {item!r}")
+                logger.debug("跳过未知 input item: %r", item)
     elif raw_input is None:
         pass
     else:
@@ -356,19 +358,22 @@ async def handle_responses(
     try:
         reply, _blocks, tool_calls, sent_prompt = await run_chat(chat_req, driver, session_key)
     except GeminiContextLimitError as exc:
-        print("\n[ERR] responses: 上下文超限:")
-        traceback.print_exc()
+        logger.warning("responses: 上下文超限：%s", exc)
         return JSONResponse(status_code=400, content=_error_payload(str(exc), "context_length_exceeded"))
     except GeminiBusyError as exc:
+        logger.warning("responses: 上游繁忙：%s", exc)
         return JSONResponse(status_code=503, content=_error_payload(str(exc), "upstream_busy"))
     except GeminiTimeoutError as exc:
+        logger.error("responses: 等待回复超时：%s", exc, exc_info=True)
         return JSONResponse(status_code=504, content=_error_payload(str(exc), "timeout"))
     except ValueError as exc:
+        logger.warning("responses: 请求非法：%s", exc)
         return JSONResponse(status_code=400, content=_error_payload(str(exc), "invalid_request_error"))
     except RuntimeError as exc:
+        logger.error("responses: 上游浏览器不可用：%s", exc, exc_info=True)
         return JSONResponse(status_code=502, content=_error_payload(str(exc), "upstream_error"))
     except Exception as exc:  # noqa: BLE001
-        traceback.print_exc()
+        logger.error("responses: 处理请求失败：%s", exc, exc_info=True)
         return JSONResponse(status_code=500, content=_error_payload(str(exc), "server_error"))
 
     tool_calls = _maybe_run_edit_markdown(tool_calls)
@@ -439,7 +444,7 @@ async def stream_responses(
             )
             await queue.put(("done", (reply, blocks, tool_calls, sent_prompt, None, None)))
         except Exception as exc:  # noqa: BLE001
-            traceback.print_exc()
+            logger.error("responses: 流式生成失败：%s", exc, exc_info=True)
             status, err_type = _map_exception(exc)
             await queue.put(("done", (None, [], [], None, str(exc), err_type)))
 
@@ -576,7 +581,7 @@ async def stream_responses(
                 missing = full[len(streamed):]
             else:
                 # SSE 无撤回语义：追加无法修复，只能补发全文（宁可重复不丢）
-                print("[responses] 回复被整体改写，已补发全文（客户端可能看到重复内容）。")
+                logger.warning("[responses] 回复被整体改写，已补发全文（客户端可能看到重复内容）。")
                 missing = full
             for i in range(0, len(missing), 64):
                 yield evt("response.output_text.delta", {

@@ -2,8 +2,8 @@
 
 import asyncio
 import json
+import logging
 import time
-import traceback
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -12,6 +12,8 @@ from .driver import GeminiBusyError, GeminiContextLimitError, GeminiTimeoutError
 from .models import ChatCompletionRequest
 from .prompting import estimate_tokens
 from .toolcalls import _tool_names, parse_tool_calls
+
+logger = logging.getLogger(__name__)
 
 
 def _chunk_text(text: str, size: int = 64) -> List[str]:
@@ -69,20 +71,18 @@ async def _stream_chat_completion(
             await queue.put(("done", (reply, blocks, None, None)))
         except GeminiContextLimitError as exc:
             # 给客户端一个可区分的类型，而不是笼统的 server_error
-            print("\n[ERR] 网页会话已达上下文长度上限:")
-            traceback.print_exc()
+            logger.warning("网页会话已达上下文长度上限：%s", exc)
             await queue.put(("done", (None, [], str(exc), "context_length_exceeded")))
         except GeminiBusyError as exc:
             # 本地排队保护：同一会话桶已有请求在跑且等锁超时，对应 HTTP 503 / upstream_busy
-            print(f"\n[繁忙] {exc}")
+            logger.warning("上游繁忙：%s", exc)
             await queue.put(("done", (None, [], str(exc), "upstream_busy")))
         except GeminiTimeoutError as exc:
             # 与 server.py 的非流式分支保持一致：超时是 504/timeout，而不是 500
-            print("\n[ERR] 等待 Gemini 回复超时（已重试）:")
-            traceback.print_exc()
+            logger.error("等待 Gemini 回复超时（已重试）：%s", exc, exc_info=True)
             await queue.put(("done", (None, [], str(exc), "timeout")))
         except Exception as exc:  # noqa: BLE001
-            traceback.print_exc()
+            logger.error("流式生成失败：%s", exc, exc_info=True)
             await queue.put(("done", (None, [], str(exc), "server_error")))
 
     task = asyncio.create_task(runner())
@@ -106,9 +106,9 @@ async def _stream_chat_completion(
             # 因此这段时间客户端看不到内容 —— 用注释保活 + 日志保持可观测。
             keepalives += 1
             if config.DEBUG:
-                print(
-                    f"[debug] 等待上游回复中（已发 {keepalives} 次 keep-alive，"
-                    f"工具模式={wants_tools}）"
+                logger.debug(
+                    "等待上游回复中（已发 %s 次 keep-alive，工具模式=%s）",
+                    keepalives, wants_tools,
                 )
             yield ": keep-alive\n\n"
             continue
@@ -156,7 +156,7 @@ async def _stream_chat_completion(
             else:
                 # 追加语义无法修复（已下发的内容不是最终内容的前缀）。SSE 没有「撤回」
                 # 语义，只能补发全文：宁可重复，也绝不静默丢尾。
-                print("[流式] 回复被整体改写，已补发全文（客户端可能看到重复内容）。")
+                logger.warning("[流式] 回复被整体改写，已补发全文（客户端可能看到重复内容）。")
                 missing = final_text
             for piece in _chunk_text(missing):
                 yield encode({"content": piece})

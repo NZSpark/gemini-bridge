@@ -36,11 +36,17 @@ def _content_to_text(content: Any) -> str:
 
 
 def estimate_tokens(text: str) -> int:
-    """估算 token 数（仅用于填充 OpenAI 的 usage 字段，不是精确值）。
+    """**量级估算**（order-of-magnitude）token 数，不是精确值，也不追求精确。
 
     CJK 字符约 1 char/token，其余字符约 4 char/token。
     不引入 tiktoken：那是 OpenAI 的分词器，算 Gemini 的 token 只会
     得到一个“看起来很精确但其实是错的”数字，反而更容易误导客户端做上下文裁剪。
+
+    它同时充当三个地方的“计价单位”，三处必须用同一个函数，不得各算各的：
+
+    * ``usage.prompt_tokens`` / ``completion_tokens``（OpenAI 兼容字段）；
+    * ``SESSION_MAX_TOKENS`` 会话轮转预算（超过即轮转，见 ``chat_io``）；
+    * ``/v1/models`` 的 ``context_window``（既然对外报了这个数，就必须同源）。
     """
     if not text:
         return 0

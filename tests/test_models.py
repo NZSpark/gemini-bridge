@@ -112,9 +112,16 @@ class ModelListTests(unittest.TestCase):
         ids = {m["id"] for m in SUPPORTED_MODELS}
         self.assertIn("gemini-chat", ids)
 
-    def test_entries_have_context_window(self):
+    def test_context_window_is_not_hardcoded_in_models(self):
+        """T8.7：唯一权威数值是 SESSION_MAX_TOKENS，由 /v1/models 透出。
+
+        旧实现把 65536 写在 SUPPORTED_MODELS 里，与 README 示例（1000000）
+        互相矛盾，而端点又不透出该字段。现在模型表只保留 id。
+        """
         for model in SUPPORTED_MODELS:
-            self.assertIn("context_window", model)
+            self.assertNotIn("context_window", model)
+        card = ModelCard(id="gemini-chat", context_window=123)
+        self.assertEqual(card.context_window, 123)
 
     def test_model_card_defaults(self):
         card = ModelCard(id="gemini-chat")

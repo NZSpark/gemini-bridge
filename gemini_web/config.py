@@ -5,9 +5,12 @@
 这样测试可以直接 ``patch.object(config, "NAME", value)`` 生效。
 """
 
+import logging
 import os
 import re
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # ==================== 0. 配置加载 (.env) ====================
 # 所有可调参数集中在项目根目录的 .env（模板见 .env.example）。
@@ -24,7 +27,7 @@ def _load_env_file(path: Path) -> None:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except Exception as exc:  # noqa: BLE001
-        print(f"[配置] 读取 {path} 失败，将使用默认值：{exc}")
+        logger.warning("读取 %s 失败，将使用默认值：%s", path, exc)
         return
     for raw in lines:
         line = raw.strip()
@@ -102,6 +105,10 @@ DEBUG = env_bool("GEMINI_DEBUG")
 # 该端点会让指定会话桶的下一轮重开对话，属于有副作用的本地操作，
 # 同机多用户环境下建议设置 RESET_TOKEN，调用时带 X-Reset-Token 头。
 RESET_TOKEN = env_str("RESET_TOKEN", "")
+# /v1/chat/completions 与 /v1/responses 的可选 Bearer 鉴权（T8.10）。
+# 留空 = 默认关闭，保持向后兼容（本机回环使用无需鉴权）。
+# 设为非空后，这两个端点必须带 `Authorization: Bearer <同值>`，否则 401。
+BRIDGE_TOKEN = env_str("BRIDGE_TOKEN", "")
 
 # /v1/chat/completions 流式生成期间的 keep-alive 注释间隔（秒）；0 = 关闭。
 # 工具模式需要先缓冲整段回复才能判断 tool_calls，这期间客户端看不到内容，
@@ -211,6 +218,10 @@ EDIT_MARKDOWN_BACKUP_DIR = env_str("EDIT_MARKDOWN_BACKUP_DIR", "output/backups")
 # 默认 false：自动注入会给每个请求附带 ~970 tokens 的脚手架（实测，见 update.md P1-5），
 # 还可能让客户端收到自己从未声明过的 tool_calls。设为 true 恢复旧行为。
 EDIT_MARKDOWN_ALWAYS_REGISTER = env_bool("EDIT_MARKDOWN_ALWAYS_REGISTER", False)
+# edit_markdown 允许读写的**工作区根**（T8.9）。留空 = 项目根目录。
+# 路径会先 resolve，再校验必须落在该目录内：`../` 逃逸、指向外部的绝对路径、
+# 经软链接跳出根目录的路径一律拒绝，避免模型把本地编辑跑到工作区之外。
+EDIT_MARKDOWN_ROOT = env_str("EDIT_MARKDOWN_ROOT", "") or str(PROJECT_ROOT)
 
 
 # 工具模式下：是否先缓冲整段回复再判断 tool_calls（true = 需要缓冲，

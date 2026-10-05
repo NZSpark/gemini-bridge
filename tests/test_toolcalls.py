@@ -2,6 +2,7 @@
 
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from gemini_web import config  # noqa: E402
 from gemini_web.toolcalls import (  # noqa: E402
     _normalize_tool_entry,
     _tool_names,
+    execute_edit_markdown,
     format_tools_instruction,
     parse_tool_calls,
     should_register_edit_markdown,
@@ -458,6 +460,67 @@ class ShouldRegisterEditMarkdownTests(unittest.TestCase):
         with mock.patch.object(config, "EDIT_MARKDOWN_LOCAL", True), \
                 mock.patch.object(config, "EDIT_MARKDOWN_ALWAYS_REGISTER", True):
             self.assertTrue(should_register_edit_markdown(None))
+
+
+class EditMarkdownPathGuardTests(unittest.TestCase):
+    """T8.9：本地 edit_markdown 只能碰工作区根内的文件。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        (self.root / "doc").mkdir()
+        (self.root / "doc" / "a.md").write_text("# A\n\nbody\n", encoding="utf-8")
+        patcher = mock.patch.object(config, "EDIT_MARKDOWN_ROOT", str(self.root))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _edit(self, path, **kw):
+        args = {"path": path, "start": 1, "end": 1, "new_text": "# B"}
+        args.update(kw)
+        return execute_edit_markdown(args, backup_dir=str(self.root / "backups"))
+
+    def test_relative_path_inside_root_is_allowed(self):
+        result = self._edit("doc/a.md")
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["written"])  # 默认 dry-run
+        self.assertEqual(Path(result["path"]), (self.root / "doc" / "a.md").resolve())
+
+    def test_dotdot_escape_is_rejected(self):
+        result = self._edit("../../etc/hosts")
+        self.assertFalse(result["ok"])
+        self.assertIn("路径越界", result["error"])
+
+    def test_absolute_path_outside_root_is_rejected(self):
+        result = self._edit("/etc/hosts")
+        self.assertFalse(result["ok"])
+        self.assertIn("路径越界", result["error"])
+
+    def test_write_true_still_rejects_escape(self):
+        """dry-run 与 write=true 必须用同一道关卡，不能只在读取时校验。"""
+        with tempfile.TemporaryDirectory() as other:
+            outside = Path(other) / "outside.md"
+            outside.write_text("# outside\n", encoding="utf-8")
+            result = self._edit(str(outside), write=True)
+            self.assertFalse(result["ok"])
+            self.assertIn("路径越界", result["error"])
+            # 未被改动：闸门必须在写盘之前生效
+            self.assertEqual(outside.read_text(encoding="utf-8"), "# outside\n")
+
+    def test_write_true_inside_root_persists(self):
+        result = self._edit("doc/a.md", write=True)
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["written"])
+        self.assertTrue(result["backup"])
+        self.assertTrue((self.root / "backups").exists())
+        first_line = (self.root / "doc" / "a.md").read_text(encoding="utf-8").splitlines()[0]
+        self.assertEqual(first_line, "# B")
+
+    def test_directory_target_returns_error_instead_of_raising(self):
+        """目标是目录（或根本读不动）时也必须返回结构化 error，不能抛给上层。"""
+        result = self._edit(".")
+        self.assertFalse(result["ok"])
+        self.assertIn("读取失败", result["error"])
 
 
 if __name__ == "__main__":

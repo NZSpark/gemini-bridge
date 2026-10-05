@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geminibridge"
+version = "0.1.0"
+description = "把 Gemini 网页版包装成 OpenAI 兼容的本地 API（Pi / Codex CLI）"
+readme = "README.md"
+requires-python = ">=3.10"
+# 运行时依赖。区间而不是无约束，避免上游破坏性大版本悄悄进来；
+# playwright 装完还需要 `playwright install chromium`（见 README）。
+dependencies = [
+    "fastapi>=0.110,<1.0",
+    "uvicorn>=0.27,<1.0",
+    "playwright>=1.40,<2.0",
+    "pydantic>=2.5,<3.0",
+]
+
+[project.optional-dependencies]
+# 只跑测试用。`httpx2` 是 starlette TestClient 的 HTTP 后端（starlette>=1.7 起从 httpx 换名），
+# `openai` 仅用于 README 示例与 E2E 联调（运行时代码**不**依赖它）。
+dev = [
+    "pytest>=8.0,<10.0",
+    "httpx2>=2.0,<3.0",
+    "openai>=1.0,<4.0",
+]
+
+[tool.setuptools]
+packages = ["gemini_web"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# 真实联网 E2E 需要登录态，由 GEMINI_E2E=1 显式开启（见 doc/e2e_test_design.md），
+# 这里只保证默认入口 `python -m pytest` 收集的是同一批用例。

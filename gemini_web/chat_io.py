@@ -115,10 +115,10 @@ class ChatIOMixin:
                 pass
             elif attempt < max_attempts:
                 # 不做 URL 恢复：退避后在同一页面重试一次（页面可能只是慢）
-                print(f"[恢复] 第 {attempt}/{max_attempts} 次重试：等待后重试……")
+                logger.info("[恢复] 第 %s/%s 次重试：等待后重试……", attempt, max_attempts)
                 await asyncio.sleep(config.RETRY_BACKOFF_S * attempt)
             else:
-                print("[恢复] 重试无效，改为开启新对话并重放历史……")
+                logger.warning("[恢复] 重试无效，改为开启新对话并重放历史……")
                 await self._start_new_session(bucket)
 
             # 会话是新开的（或被轮转过）-> 必须播种，否则模型收不到任何上下文
@@ -133,12 +133,16 @@ class ChatIOMixin:
                 # 到顶了：下次不要再恢复同一个会话，直接轮转
                 last_error = exc
                 self._state(bucket).pending_rotation = True
-                print(f"[恢复] 第 {attempt}/{max_attempts} 次失败：会话已达上下文上限。")
+                logger.warning(
+                    "[恢复] 第 %s/%s 次失败：会话已达上下文上限。", attempt, max_attempts
+                )
             except GeminiTimeoutError as exc:
                 # 只有「超时 / 到顶」才可重试；找不到输入框、profile 被占用等不可重试
                 last_error = exc
                 self._state(bucket).last_error = str(exc)
-                print(f"[恢复] 第 {attempt}/{max_attempts} 次失败：等待回复超时。")
+                logger.warning(
+                    "[恢复] 第 %s/%s 次失败：等待回复超时。", attempt, max_attempts
+                )
 
         if last_error is not None:
             raise last_error
@@ -479,12 +483,14 @@ class ChatIOMixin:
                         # 否则会读到被截断的半截回复（如 TOOL_CALL 的 JSON 参数）。
                         if await self._has_pending_tokens(latest_node):
                             if config.DEBUG:
-                                print(f"[debug] poll={poll} 停止按钮已消失，但仍有 pending token，继续等待")
+                                logger.debug(
+                                    "poll=%s 停止按钮已消失，但仍有 pending token，继续等待", poll
+                                )
                             # 落到下面的稳定判定 / 下一轮轮询
                         else:
                             last_text = current_text
                             if config.DEBUG:
-                                print(f"[debug] poll={poll} 停止按钮已消失且无 pending，判定结束")
+                                logger.debug("poll=%s 停止按钮已消失且无 pending，判定结束", poll)
                             break
 
                     # 2.2 兜底判定：文本一模一样算一轮不变；
@@ -499,9 +505,9 @@ class ChatIOMixin:
                         if stable_count >= threshold:
                             last_text = current_text
                             if config.DEBUG:
-                                print(
-                                    f"[debug] poll={poll} 内容稳定 {stable_count} 次"
-                                    f"（same_text={same_text}），判定结束"
+                                logger.debug(
+                                    "poll=%s 内容稳定 %s 次（same_text=%s），判定结束",
+                                    poll, stable_count, same_text,
                                 )
                             break
                     else:
@@ -535,10 +541,10 @@ class ChatIOMixin:
                     )
 
                 if config.DEBUG:
-                    print(
-                        f"[debug] poll={poll} nodes={len(responses)} len={len(normalized)} "
-                        f"stable={stable_count} generating={generating} saw={saw_generating} "
-                        f"stalled={stalled} before_len={len(before_text)}"
+                    logger.debug(
+                        "poll=%s nodes=%s len=%s stable=%s generating=%s saw=%s stalled=%s before_len=%s",
+                        poll, len(responses), len(normalized), stable_count,
+                        generating, saw_generating, stalled, len(before_text),
                     )
 
                 # 总超时判定：若这期间其实已经读到实质回复，就直接返回已产生的内容，
@@ -546,7 +552,7 @@ class ChatIOMixin:
                 if asyncio.get_event_loop().time() > deadline:
                     await self._remember_session(bucket)
                     if last_text:
-                        print("[超时] 已读取到回复内容，直接返回，不重发。")
+                        logger.warning("[超时] 已读取到回复内容，直接返回，不重发。")
                         break
                     # 超时前最后确认一次是否“到顶”，否则错误信息会误导排查方向
                     if await self._page_shows_context_limit(bucket):
@@ -568,10 +574,9 @@ class ChatIOMixin:
             state.last_error = None
             if self._session_over_budget(bucket):
                 state.pending_rotation = True
-                print(
-                    f"[轮转] 会话已达预算（轮数={state.turns}，"
-                    f"估算 token={state.est_tokens}），"
-                    "下一轮将开启新会话并播种上下文。"
+                logger.info(
+                    "[轮转] 会话已达预算（轮数=%s，估算 token=%s），下一轮将开启新会话并播种上下文。",
+                    state.turns, state.est_tokens,
                 )
 
             # 成功产生回复后：刷新会话状态（可能刚创建了新会话）并续期页面使用时间
@@ -609,7 +614,7 @@ class ChatIOMixin:
                 with open(filepath, "w", encoding="utf-8") as f:
                     f.write(code)
                 saved.append(str(filepath))
-                print(f"[已保存文件] {filepath}")
+                logger.info("[已保存文件] %s", filepath)
         else:
             filename = f"response_{int(time.time())}_{unique}.md"
             filepath = Path(output_dir) / filename

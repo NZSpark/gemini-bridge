@@ -1,5 +1,8 @@
-fastapi
-uvicorn
-playwright
-pydantic
-openai
+# 运行时依赖。版本区间与 pyproject.toml 的 [project].dependencies 保持一致，
+# 由 tests/test_config_drift.py 的依赖防漂移用例守护。
+# 测试 / 联调专用依赖（pytest、httpx2、openai）见 pyproject.toml 的 dev extras：
+#   pip install -e ".[dev]"
+fastapi>=0.110,<1.0
+uvicorn>=0.27,<1.0
+playwright>=1.40,<2.0
+pydantic>=2.5,<3.0

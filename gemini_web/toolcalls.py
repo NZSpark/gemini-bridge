@@ -8,11 +8,15 @@ Gemini 网页版并不原生支持 OpenAI 的 function calling，因此这里采
 """
 
 import json
+import logging
 import re
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import config
 from .models import FunctionCall, ToolCall
+
+logger = logging.getLogger(__name__)
 
 # 当前注入格式：行首 ``TOOL_CALL:`` 纯文本标记（大小写不敏感）。
 # 只认行首（允许前导空白），避免正文里偶然出现的 "TOOL_CALL:" 被误触发；
@@ -78,7 +82,13 @@ EDIT_MARKDOWN_TOOL: Dict[str, Any] = {
         "parameters": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "目标 Markdown 文件路径"},
+                "path": {
+                    "type": "string",
+                    "description": (
+                        "目标 Markdown 文件路径：必须是工作区内的相对路径，"
+                        "不得使用 .. 或指向工作区之外的绝对路径"
+                    ),
+                },
                 "start": {"type": "integer", "description": "起始行号（1-based，闭区间）"},
                 "end": {"type": "integer", "description": "结束行号（1-based，闭区间）"},
                 "new_text": {"type": "string", "description": "替换 [start, end] 的新文本"},
@@ -132,18 +142,49 @@ def edit_markdown_spec() -> str:
     ])
 
 
+def _resolve_edit_path(raw_path: str) -> Tuple[Optional[Path], Optional[str]]:
+    """把 edit_markdown 的目标路径限制在工作区根内（T8.9）。
+
+    工作区根 = ``config.EDIT_MARKDOWN_ROOT``（留空时默认为项目根目录）。
+    路径先 ``resolve()`` 再校验归属，因此以下情形一律拒绝：
+
+    * 相对路径里用 ``..`` 逃出根目录；
+    * 绝对路径指向根目录之外（如 ``/etc/passwd``）；
+    * 经软链接跳出根目录的路径。
+
+    返回 ``(绝对路径, None)`` 或 ``(None, 错误信息)``，错误直接作为工具结果回传，
+    不抛给上层（与其它结构错误一致）。
+    """
+    root = Path(config.EDIT_MARKDOWN_ROOT or config.PROJECT_ROOT).resolve()
+    candidate = Path(raw_path)
+    resolved = (candidate if candidate.is_absolute() else root / candidate).resolve()
+    if resolved != root and root not in resolved.parents:
+        return None, (
+            f"路径越界：{raw_path!r} 不在工作区根 {root} 内。"
+            "edit_markdown 只允许编辑工作区内的文件；如需放宽，请调整 EDIT_MARKDOWN_ROOT。"
+        )
+    return resolved, None
+
+
 def execute_edit_markdown(args: Dict[str, Any], *, backup_dir: str = "output/backups") -> Dict[str, Any]:
     """桥接层本地执行 edit_markdown。返回可直接回传的结构化结果。
 
     - 默认 dry-run：只返回统一 diff，不落盘。
     - write=true 时先备份原文件，再原子写回。
-    - 任何结构性错误（围栏不配对、行号越界）都作为 error 返回，不抛给上层。
+    - 路径必须落在工作区根内（``EDIT_MARKDOWN_ROOT``，见 ``_resolve_edit_path``）。
+    - 任何结构性错误（围栏不配对、行号越界、路径越界）都作为 error 返回，不抛给上层。
     """
     from . import markdown_io
 
     path = args.get("path")
     if not isinstance(path, str) or not path:
         return {"ok": False, "error": "edit_markdown 需要 path"}
+    resolved_path, path_error = _resolve_edit_path(path)
+    if path_error:
+        logger.warning("edit_markdown 路径被拒绝：%s", path)
+        return {"ok": False, "error": path_error}
+    # 读写 / 备份 / 回传统一用解析后的绝对路径，避免“校验时解析、落盘时又换一份”
+    path = str(resolved_path)
     try:
         start = int(args["start"])
         end = int(args["end"])
@@ -160,6 +201,9 @@ def execute_edit_markdown(args: Dict[str, Any], *, backup_dir: str = "output/bac
         return {"ok": False, "error": f"文件不存在：{path}"}
     except markdown_io.MarkdownError as exc:
         return {"ok": False, "error": str(exc)}
+    except OSError as exc:
+        # 目标是目录 / 权限不足 / 编码错误等：一律作为结构化错误回传，不抛给上层
+        return {"ok": False, "error": f"读取失败：{exc}"}
 
     total = len(doc.lines)
     if start < 1 or end > total or start > end:

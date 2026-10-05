@@ -6,6 +6,7 @@
 
 import asyncio
 import json
+import logging
 import re
 from typing import Any, Dict, List, Optional
 
@@ -15,6 +16,8 @@ from .errors import (
     HOME_URL,
     GeminiContextLimitError,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class CompletionMixin:
@@ -39,7 +42,7 @@ class CompletionMixin:
         self.session_turns = 0
         self.session_est_tokens = 0
         self.session_cap_hit = False
-        print("[系统提示] 服务启动成功！请确保 Gemini 页面保持登录状态。\n")
+        logger.info("[系统提示] 服务启动成功！请确保 Gemini 页面保持登录状态。")
 
     async def _open_new_chat(self, page) -> None:
         """点击「新建对话」，确保从干净会话开始（点不到就沿用当前页）。"""
@@ -56,7 +59,7 @@ class CompletionMixin:
             except Exception:
                 continue
         if config.DEBUG:
-            print("[debug] 未找到新建对话按钮，沿用当前会话页。")
+            logger.debug("未找到新建对话按钮，沿用当前会话页。")
 
     async def _start_new_session(self, key: Optional[str] = None) -> None:
         """轮转到新会话，并重置会话状态（调用方必须使用“播种”prompt）。"""
@@ -74,7 +77,7 @@ class CompletionMixin:
         state.pending_rotation = False
         state.last_error = None
         self._save_session_state(key=key)
-        print("[轮转] 已开启新的网页会话（本轮会用完整历史播种上下文）。")
+        logger.info("[轮转] 已开启新的网页会话（本轮会用完整历史播种上下文）。")
 
     _CAP_CHECK_JS_TEMPLATE = (
         "() => { let text = document.body ? (document.body.innerText || '') : '';"
@@ -124,19 +127,19 @@ class CompletionMixin:
         """
         page = self._page_for(key)
         if page is None:
-            print("[恢复] 没有可用页面，无法恢复。")
+            logger.warning("[恢复] 没有可用页面，无法恢复。")
             return False
         try:
             await page.goto(HOME_URL, wait_until="domcontentloaded")
             await self._open_new_chat(page)
             if not await self._wait_ready(page):
-                print("[恢复] 已打开页面，但未检测到输入框，请检查登录状态。")
+                logger.warning("[恢复] 已打开页面，但未检测到输入框，请检查登录状态。")
                 return False
             self._state(key).has_history = False
-            print("[恢复] 已重开新对话（本轮将重新播种上下文）。")
+            logger.info("[恢复] 已重开新对话（本轮将重新播种上下文）。")
             return True
         except Exception as exc:  # noqa: BLE001
-            print(f"[恢复] 重开会话失败: {exc}")
+            logger.warning("[恢复] 重开会话失败: %s", exc)
             return False
 
     # 主判定所用的 JS：扫描页面上可见的「停止生成」控件

@@ -42,3 +42,21 @@ class ChatRouteTests(unittest.TestCase):
         data = res.json()
         self.assertEqual(data.get('object'), 'list')
         self.assertTrue(len(data.get('data', [])) > 0)
+
+    def test_models_endpoint_exposes_context_window(self):
+        """T8.7：/v1/models 必须透出 context_window，且与 SESSION_MAX_TOKENS 同源。"""
+        from gemini_web import config
+
+        res = self.client.get('/v1/models')
+        self.assertEqual(res.status_code, 200)
+        for card in res.json()['data']:
+            self.assertEqual(card['context_window'], config.SESSION_MAX_TOKENS)
+
+    def test_context_window_follows_config(self):
+        from unittest import mock
+
+        from gemini_web import config
+
+        with mock.patch.object(config, 'SESSION_MAX_TOKENS', 4321):
+            res = self.client.get('/v1/models')
+        self.assertEqual(res.json()['data'][0]['context_window'], 4321)
