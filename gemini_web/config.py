@@ -177,6 +177,13 @@ SEED_MAX_CHARS = env_int("SEED_MAX_CHARS", 12000)
 # 完整的系统提示作为 system 消息发来，动辄上万字；播种时若原样重放，
 # 会把简单请求灌成一大段系统提示。超出即截断。0 = 不限制（不推荐）。
 SEED_SYSTEM_MAX_CHARS = env_int("SEED_SYSTEM_MAX_CHARS", 2000)
+# 单条 tool 结果（role=="tool"）注入 prompt 时的最大字符数。
+# Codex/Pi 的 read 结果动辄几十万字符，直接 fill 会撑爆 Gemini 网页版输入框
+# （Playwright fill 超时）。超出即截断并标注。0 = 不限制（不推荐）。
+TOOL_RESULT_MAX_CHARS = env_int("TOOL_RESULT_MAX_CHARS", 20000)
+# 单次 fill() 入参（整段 prompt）的最大字符数硬上限，兜底防止输入框溢出。
+# 这是发送侧最后一道护栏：无论上游怎么拼 prompt，都不超过它。0 = 不限制。
+PROMPT_MAX_CHARS = env_int("PROMPT_MAX_CHARS", 100000)
 # 网页会话超过以下任一阈值后，下一轮自动轮转到新会话（0 表示禁用该维度）
 SESSION_MAX_TURNS = env_int("SESSION_MAX_TURNS", 60)
 SESSION_MAX_TOKENS = env_int("SESSION_MAX_TOKENS", 60000)

@@ -88,6 +88,13 @@ def _render_message(message: ChatMessage) -> str:
     raw = _content_to_text(message.content)
     if message.role == "tool":
         tag = f" {message.tool_call_id}" if message.tool_call_id else ""
+        limit = config.TOOL_RESULT_MAX_CHARS
+        if limit and len(raw) > limit:
+            dropped = len(raw) - limit
+            raw = (
+                raw[:limit]
+                + f"\n…（工具结果过长，已截断 {dropped} 字符）"
+            )
         return f"[工具执行结果{tag}]\n{raw}"
     content = raw.strip()
     if message.role == "system":

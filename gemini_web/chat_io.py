@@ -306,6 +306,27 @@ class ChatIOMixin:
                 "无法提交 prompt：输入框 Enter 事件无效，且未找到发送按钮。"
             )
 
+    @staticmethod
+    def _clamp_prompt(prompt: str) -> str:
+        """发送侧最后一道护栏：把整段 prompt 压到输入框能承受的字符上限内。
+
+        Gemini 网页版 composer 有字符上限，超出后 Playwright ``fill`` 会超时
+        （ElementHandle.fill: Timeout 30000ms exceeded）。这里保留**头部**
+        （系统/工具说明、任务目标通常在前）与**尾部**（最新用户指令）各一半，
+        中间截断并标注，保证最新指令一定送达。
+        """
+        limit = config.PROMPT_MAX_CHARS
+        if not limit or len(prompt) <= limit:
+            return prompt
+        head = limit // 2
+        tail = limit - head
+        dropped = len(prompt) - limit
+        return (
+            prompt[:head]
+            + f"\n\n…（prompt 过长，已省略中间 {dropped} 字符）\n\n"
+            + prompt[-tail:]
+        )
+
     async def _send_chat_locked(self, prompt: str, on_delta=None,
                                 key: Optional[str] = None) -> tuple[str, List[dict]]:
         """发送单条消息并获取响应及提取的代码块。
@@ -355,6 +376,7 @@ class ChatIOMixin:
             except Exception:
                 before_text = ""
 
+            prompt = self._clamp_prompt(prompt)
             await chat_input.fill(prompt)
             await self._submit_prompt(page, chat_input)
 

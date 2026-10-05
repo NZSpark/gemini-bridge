@@ -167,6 +167,8 @@ codex --profile gemini
 | `PARALLEL_BUCKETS` | `false` | 各桶并行页面 |
 | `BUCKET_LOCK_TIMEOUT_S` | `0` | 同桶排队超时，>0 超时返回 503 `upstream_busy` |
 | `SEED_MAX_CHARS` | `12000` | 轮转播种字符预算 |
+| `TOOL_RESULT_MAX_CHARS` | `20000` | 单条 tool 结果注入 prompt 的最大字符数（0 不限） |
+| `PROMPT_MAX_CHARS` | `100000` | 单次 fill() 入参硬上限，兜底防输入框溢出（0 不限） |
 | `SESSION_MAX_TURNS` | `60` | 轮数到顶阈值（0 禁用） |
 | `SESSION_MAX_TOKENS` | `60000` | 估算 token 到顶阈值（0 禁用） |
 
