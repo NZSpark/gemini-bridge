@@ -187,6 +187,7 @@ codex --profile gemini
 | `BUCKET_LOCK_TIMEOUT_S` | `0` | 同桶排队超时，>0 超时返回 503 `upstream_busy` |
 | `GEMINI_NEW_SESSION` | `false` | 启动时忽略已保存状态直接开新会话 |
 | `SESSION_KEY_MAX_LEN` | `64` | 分桶键长度上限 |
+| `FILL_CHUNK_CHARS` | `4000` | 写入输入框时每块插入的字符数（分块写入，避免超长结果把网页输入框卡死） |
 | `SEED_MAX_CHARS` | `12000` | 轮转播种字符预算 |
 | `SEED_SYSTEM_MAX_CHARS` | `2000` | 播种时单条 system 消息的字符上限（harness 每轮注入的系统提示会被截断） |
 | `TOOL_RESULT_MAX_CHARS` | `50000` | **单条** tool 结果注入 prompt 的最大字符数：超出只保留开头一段并标注“已截断 N 字符”（0 不限）。多条合计另有成品预算：超过 `PROMPT_MAX_CHARS` 时按同样的“留开头 + 标注”策略继续压缩 |

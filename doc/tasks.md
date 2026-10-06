@@ -4,7 +4,7 @@
 
 状态标记：`[ ]` 未开始、`[~]` 进行中、`[x]` 完成（实现 + 验收测试齐备）。
 
-核对时间：2026-10-07（实施轮 + 随行轮 + 载体改造轮，阶段 6–11 已全部落地）；基线：`.venv/bin/python -m pytest -q` → **325 passed, 18 skipped, 31 subtests passed**（随行轮 238 → 279；E2E 重组轮 284；载体改造轮 +19 → 303；fill 重试轮 +5 → 308；长度控制核查轮 +10 → 318；长度控制修复轮 +7 → 325）。
+核对时间：2026-10-07（实施轮 + 随行轮 + 载体改造轮，阶段 6–11 已全部落地）；基线：`.venv/bin/python -m pytest -q` → **335 passed, 18 skipped, 31 subtests passed**（随行轮 238 → 279；E2E 重组轮 284；载体改造轮 +19 → 303；fill 重试轮 +5 → 308；长度控制核查轮 +10 → 318；长度控制修复轮 +7 → 325；分块写入轮 +4 → 329；ChatGPTBridge 方案合并轮 +4 → 333；光标与整段 fill 回退轮 +2 → 335）。
 
 **联网实测状态（见 `doc/update.md` 第 10 节，真实 Gemini 登录）**：chat（流式/非流式）、tools（流式/非流式）、Responses（流式/非流式）、长文本结束判定、多轮增量、session 分桶**均已实测通过**。两点关于 P0 的结论要分开看：
 
@@ -160,6 +160,28 @@
   - 实测（离线，50K/100K）：1 条 50KB → 50,032 字符；2 条 50KB（100,066）→ 75,069；3 条 50KB（150,100）→ 75,109；6 条 50KB（300,202）→ 87,720；1 条 80KB → 50,035；每段开头都保住且都带截断标注。
   - 验收：`pytest -q` → **325 passed, 18 skipped, 31 subtests**（新增 `SubmitVerificationTests` 4 例 + 预算落地用例）；**区分力实验**：换回旧 `chat_io.py` → `SubmitVerificationTests` + `PromptLengthGuardTests` **4 failed**，恢复后 18 passed。
   - **未真机验证**：曾以隔离 profile 副本 + 独立端口 8011 起第二实例做端到端验证，被用户中止（已清理，未触碰 8001 实例）。提交阶梯与压缩的真实网页行为目前只有假 page 单测 + 离线实测覆盖；运行中的实例需**重启**才会带上本轮修复与新日志。
+
+- [x] **T11.5 修复「超长工具结果把网页输入框卡死」（分块写入）**（2026-10-07，用户真机报告）
+  - 现象：客户端 `find` 的超长结果导致网页输入框卡死，桥报「写入输入框连续失败 3 次（单次超时 10000ms）：命中的元素始终不处于「可见 / 可编辑」状态」。
+  - 原因：一次性 `fill(整段)` 把几万字符排成网页主线程上的长任务（React 重渲染 + 富文本编辑器同步），期间 Playwright 探测不到元素状态 → 超时；页面本身也卡住。T11.2 的重试只是把同一件事重试三遍。
+  - 修法：`chat_io._insert_prompt_in_chunks` **分块写入**——新增 `FILL_CHUNK_CHARS`（默认 4000）；每块前重读输入框文本只补缺失段（幂等、可续写、不重复）；首选 `execCommand('insertText')`，无效退回 CDP `keyboard.insert_text`；每次插入用 `asyncio.wait_for` 受 `FILL_TIMEOUT_MS` 约束；句柄失效则重新定位续写；“已写入字符数不前进”连续 `FILL_RETRIES` 次即报错（带进度）；读不到输入框文本的页面退回整段 `fill`。
+  - 验收：`pytest -q` → **329 passed, 18 skipped, 31 subtests**（新增 `ChunkedInsertTests` 4 例）；**区分力实验**：换回分块之前的 `chat_io.py` → 3 failed（报的正是用户看到的 `waiting for element to be visible, enabled and editable`），恢复后 4 passed。
+  - **未验证**：真实网页端未跑（需重启服务；本轮不再起第二实例）。`FILL_CHUNK_CHARS=4000` 的手感待真机确认，偶发卡顿可先调到 2000。
+
+- [x] **T11.6 对比姊妹项目 ChatGPTBridge 的输入框方案并合并更优实现**（2026-10-07）
+  - 对比结论：**他们的插入/聚焦/清空/提交原语更强**（`keyboard.insert_text` 走 CDP 真实编辑管线、真实 click 聚焦、循环校验清空草稿、**真实键盘 Enter 优先**——合成事件 `isTrusted=false` 常被受控编辑器忽略）；**本项目的分块与双重校验更强**（他们不分块，超长文本仍会卡；也无提交后验证）。
+  - 合并：`_focus_composer`（真实 click 优先）/ `_insert_chunk`（键盘优先，无进展时交换原语）/ `_clear_composer`（多手法 + 循环校验 + 残留 warning）/ `_keyboard_enter`（真实键盘 Enter）/ `_submit_prompt` 阶梯改为「真实键盘 Enter → 发送按钮 → 合成 Enter」，每级后都验证。未采纳 `_shrink_seed_if_repeated_cap`（属“会话到顶死循环”，与本问题无关）。
+  - 验收：`pytest -q` → **333 passed, 18 skipped, 31 subtests**（新增 4 例守护）；**区分力实验**：换回合并前 `chat_io.py` → 4 failed，恢复后 26 passed。
+  - **未验证**：真机（需重启服务）。详见 `doc/update.md` §19。
+
+- [x] **T11.7 修复「分块插入零字符」：插入前必须显式放置光标 + 零进展退回整段 `fill()`**（2026-10-07）
+  - **真机现象**（用户贴出日志）：prompt 仅 9633 字符，三次尝试全部报 `分块写入无进展：已写入 0/9633 字符`；输入框诊断显示 `active: DIV(self)`、可见、可编辑、`connected`。日志里**没有**任何 `keyboard.insert_text 失败` / `execCommand 插入失败` 的 DEBUG 行（而 DEBUG 是开着的）——说明原语没报错，却一个字也没写。
+  - **根因（已从 Playwright 源码证实）**：`page.keyboard.insert_text()` 发的是 CDP `Input.insertText`，`document.execCommand('insertText')` 同理，**都只在「当前选区」处插入**。输入框往往已经是 `document.activeElement`，此时 `el.focus()` 是空操作，页面里没有任何落在编辑器内的选区 → 两种插入退化成**静默空操作**（不抛错、0 字符）。对照 Playwright 自己的 `fill()`：它对 contenteditable 先 `selectText(element)`（`focus` + `range.selectNodeContents` + `addRange` 建立选区），**再**调 `keyboard.insertText`——这正是它一直可用的原因。
+  - 修法：新增 `_SET_CARET_JS` / `_set_caret`（focus + `selectNodeContents` + **折叠到末尾**，与 `fill()` 同源但只追加不覆盖），`_insert_chunk` 每次插入前调用；插入原语返回**真正生效的原语名**，零进展时记 warning（含 `caret_in_composer` 诊断）并抛 `ChunkedInsertUnavailable`，由 `_fill_prompt` **退回整段 `fill()`**（本页面上被证实的可用原语），而不是直接失败。
+  - `_COMPOSER_DIAG_JS` 增记 `caret_in_composer` / `child_nodes`：下次真机失败可直接看出“选区是否在编辑器内”。
+  - 验收：`pytest -q` → **335 passed, 18 skipped, 31 subtests**（新增 2 例守护：`test_caret_is_placed_before_writing` / `test_silent_noop_inserts_fall_back_to_whole_fill`）。
+  - **区分力实验**：去掉 `_set_caret` 调用 → `test_caret_is_placed_before_writing` failed；去掉整段 fill 回退 → `test_silent_noop_inserts_fall_back_to_whole_fill` failed；两处恢复后 28 passed。
+  - **未验证**：真机（需重启服务）。详见 `doc/update.md` §20。
 
 ---
 

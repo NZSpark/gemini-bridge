@@ -40,6 +40,9 @@ class FakeKeyboard:
     async def press(self, key):
         return None
 
+    async def insert_text(self, text):
+        return None
+
 
 class FakeNode:
     """假回复节点。
@@ -397,16 +400,32 @@ class _ComposerInput:
         self.state["text"] = text
         return None
 
-    async def evaluate(self, script):
+    async def click(self, timeout=None):
+        self.state["focus_clicks"] += 1
+        return None
+
+    async def evaluate(self, script, arg=None):
+        if arg is not None and "insertText" in script:  # _INSERT_TEXT_JS（分块写入退路）
+            self.state["text"] = (self.state["text"] or "") + arg
+            return True
+        if "selectNodeContents" in script:  # _CLEAR_COMPOSER_JS
+            self.state["text"] = ""
+            return True
         if "el.value" in script:  # _COMPOSER_TEXT_JS
             if self.state["unverifiable"]:
                 return True  # 非字符串 ⇒ 读不到 ⇒ 无法验证
             return "" if self.state["sent"] else self.state["text"]
-        if "KeyboardEvent" in script:  # _ENTER_JS
+        if "activeElement" in script:  # _IS_ACTIVE_JS
+            return True
+        if "KeyboardEvent" in script:  # _ENTER_JS（合成事件）
             self.state["enters"] += 1
+            self.state["synthetic_enters"] += 1
             if self.state["enter_works"]:
                 self.state["sent"] = True
             return True
+        return True
+
+    async def dispatch_event(self, name):
         return True
 
     async def dispatch_event(self, name):
@@ -414,6 +433,26 @@ class _ComposerInput:
         if self.state["enter_works"]:
             self.state["sent"] = True
         return True
+
+
+class _StateKeyboard:
+    """假“真实键盘通道”（对应 CDP `keyboard.insert_text` / `press`）。"""
+
+    def __init__(self, state):
+        self.state = state
+        self.presses = []  # 记录真实按键，供断言“首选键盘 Enter”
+
+    async def insert_text(self, text):
+        self.state["text"] = (self.state["text"] or "") + text
+
+    async def press(self, key):
+        self.presses.append(key)
+        if key == "Backspace":
+            self.state["text"] = ""
+        elif key == "Enter":
+            self.state["enters"] += 1
+            if self.state["enter_works"]:
+                self.state["sent"] = True
 
 
 class _SendButton:
@@ -474,7 +513,8 @@ class SubmitVerificationTests(unittest.TestCase):
 
     def _page(self, *, enter_works, button=None, unverifiable=False):
         state = {
-            "text": "", "sent": False, "enters": 0, "clicks": 0,
+            "text": "", "sent": False, "enters": 0, "clicks": 0, "focus_clicks": 0,
+            "synthetic_enters": 0,
             "enter_works": enter_works, "button_usable": bool(button),
             "unverifiable": unverifiable, "gen_while_sent": 0,
         }
@@ -485,6 +525,7 @@ class SubmitVerificationTests(unittest.TestCase):
         page.input = _ComposerInput(state)
         page.state = state
         page.button = _SendButton(state) if button else None
+        page.keyboard = _StateKeyboard(state)
 
         async def wait_for_selector(selector, timeout=0, **kwargs):
             return page.input
@@ -539,12 +580,298 @@ class SubmitVerificationTests(unittest.TestCase):
         self.assertEqual(page.state["enters"], 1)
         self.assertEqual(page.state["clicks"], 0)
 
+    def test_real_keyboard_enter_is_preferred_over_synthetic(self):
+        """提交首选**真实键盘 Enter**（CDP）：合成事件 isTrusted=false 常被编辑器忽略。
+
+        参照姊妹项目 ChatGPTBridge 的 `_keyboard_enter`。
+        """
+        page = self._page(enter_works=True)
+        self._run(page)
+        self.assertEqual(page.keyboard.presses, ["Enter"])  # 只用了真实键盘
+        self.assertEqual(page.state["synthetic_enters"], 0)  # 合成事件一次都没用
+        self.assertEqual(page.state["clicks"], 0)  # 也没点按钮
+
+    def test_synthetic_enter_is_last_resort(self):
+        # 键盘 Enter 无效且没有发送按钮 → 才用合成 Enter（最后一级）
+        page = self._page(enter_works=False, button=False)
+        with self.assertRaises(RuntimeError):
+            self._run(page)
+        self.assertEqual(page.keyboard.presses.count("Enter"), 1)  # 第一级：真实键盘
+        self.assertEqual(page.state["synthetic_enters"], 1)  # 末级：合成事件
+
     def test_unverifiable_composer_does_not_fail_or_retry(self):
         # 读不到输入框内容（页面差异）：只按旧行为派发一次 Enter，不报错、不空等
         page = self._page(enter_works=False, button=True, unverifiable=True)
         text, _ = self._run(page)
         self.assertEqual(text, "新答案")
         self.assertEqual(page.state["enters"], 1)
+
+
+class _ChunkyKeyboard:
+    """假“真实键盘通道”（对应 CDP `keyboard.insert_text` / `press`）。"""
+
+    def __init__(self, page):
+        self.page = page
+
+    async def insert_text(self, text):
+        if self.page.keyboard_broken:
+            raise RuntimeError("keyboard channel unavailable")
+        self.page.record_insert(text, source="keyboard")
+
+    async def press(self, key):
+        self.page.presses.append(key)
+        if key == "Backspace":  # 模拟“全选 + 删除”
+            self.page.store["text"] = ""
+        elif key == "Enter" and self.page.enter_works:  # 真实键盘 Enter = 提交
+            self.page.submitted_text = self.page.store["text"]
+            self.page.store["text"] = ""
+
+
+class _ChunkyInput:
+    """假输入框：只接受**小区块**插入；一次塞太长就报“元素不可编辑”（模拟主线程卡死）。"""
+
+    def __init__(self, page, state):
+        self.page = page
+        self.state = state
+
+    @property
+    def store(self):
+        return self.page.store
+
+    async def click(self, timeout=None):
+        self.page.focus_clicks += 1
+        return None
+
+    async def evaluate(self, script, arg=None):
+        if arg is not None and "insertText" in script:  # _INSERT_TEXT_JS
+            self.page.record_insert(arg, source="execCommand")
+            return True
+        if "collapse(false)" in script:  # _SET_CARET_JS（折到末尾）
+            self.page.caret_sets += 1
+            self.page.caret_in_composer = True
+            return True
+        if "selectNodeContents" in script:  # _CLEAR_COMPOSER_JS
+            self.store["text"] = ""
+            return True
+        if "el.value" in script:  # _COMPOSER_TEXT_JS
+            if self.page.unreadable:
+                return True
+            return self.store["text"]
+        if "activeElement" in script:  # _IS_ACTIVE_JS
+            return True
+        if "KeyboardEvent" in script:  # _ENTER_JS（合成事件）
+            self.page.synthetic_enters += 1
+            if self.page.enter_works:
+                self.page.submitted_text = self.store["text"]
+                self.store["text"] = ""
+            return True
+        return True
+
+    async def fill(self, text, timeout=None):
+        # 旧的“整段一次写入”：在长文本下一律报超时（正是真机故障）
+        self.page.whole_fills += 1
+        if len(text) > self.page.max_chunk:
+            raise TimeoutError("waiting for element to be visible, enabled and editable")
+        self.store["text"] = text
+        return None
+
+    async def dispatch_event(self, name):
+        return True
+
+
+class _ChunkyPage(FakePage):
+    """分块写入用的假页面（同一个 store 保存输入框文本，重建句柄不会丢文本）。"""
+
+    def __init__(
+        self, *, max_chunk=4000, fail_at=None, unreadable=False, enter_works=True,
+        require_caret=True, ignore_inserts=False,
+    ):
+        super().__init__(
+            baseline=["旧"], script=[["新答案"], ["新答案"]],
+            generating=[True, False, False],
+        )
+        self.store = {"text": ""}
+        self.input = _ChunkyInput(self, self.store)
+        self.max_chunk = max_chunk
+        self.fail_at = fail_at
+        self.failed_once = False
+        self.unreadable = unreadable
+        self.enter_works = enter_works
+        self.inserts = 0
+        self.pieces = []
+        self.sources = []
+        self.presses = []  # 记录真实键盘按键（Enter / Control+A / Backspace）
+        self.oversized = 0
+        self.whole_fills = 0
+        self.submitted_text = None
+        self.focus_clicks = 0
+        self.synthetic_enters = 0
+        self.keyboard_broken = False
+        # 真机根因模型：插入原语只作用于**当前选区**；输入框里没有落在编辑器内的光标时，
+        # 两种插入都「不报错、也一个字不写」（这就是生产日志里 0 字符的签名）。
+        self.require_caret = require_caret
+        self.caret_in_composer = False
+        self.caret_sets = 0
+        self.silent_noops = 0
+        # 真机故障模型：两种原语都静默失效（连光标也救不了），用于验证整段 fill 回退。
+        self.ignore_inserts = ignore_inserts
+        self.keyboard = _ChunkyKeyboard(self)
+
+    def record_insert(self, text: str, *, source: str) -> None:
+        """记录一次插入（两个原语都走这里）：模块级共享的“超长就卡死”行为。"""
+        if self.ignore_inserts:
+            self.silent_noops += 1
+            return
+        if self.require_caret and not self.caret_in_composer:
+            self.silent_noops += 1
+            return
+        if self.failed_once is False and self.fail_at is not None and self.inserts == self.fail_at:
+            self.failed_once = True
+            raise RuntimeError("Execution context was destroyed (composer remounted)")
+        if len(text) > self.max_chunk:
+            self.oversized += 1
+            raise TimeoutError("waiting for element to be visible, enabled and editable")
+        self.inserts += 1
+        self.pieces.append(len(text))
+        self.sources.append(source)
+        self.store["text"] += text
+
+    async def wait_for_selector(self, selector, timeout=0, **kwargs):
+        # 模拟重挂载：每次重定位都返回一个新句柄，但文本框内容存在 store 里
+        self.input = _ChunkyInput(self, self.store)
+        return self.input
+
+    async def query_selector(self, selector):
+        return None
+
+    async def evaluate(self, script):
+        if "stop" in script or "\u505c\u6b62" in script:
+            return bool(self.submitted_text is not None)
+        return ""
+
+
+class ChunkedInsertTests(unittest.TestCase):
+    """真实故障回归：超长工具结果（如 find 输出）把网页输入框卡死。
+
+    用户现象：客户端 find 的超长结果导致网页输入框卡死，桥报
+    「写入输入框连续失败 3 次（单次超时 10000ms）：命中的元素始终不处于
+    「可见 / 可编辑」状态」。
+
+    原因：一次性 `fill()` 把几万字符排成网页主线程上的一个长任务（React 重渲染 +
+    富文本编辑器同步），期间连“元素是否可编辑”都探测不到。
+    修法：分块插入 + 每块前重读输入框文本续写（可重挂载后继续、不重复写）。
+    """
+
+    def setUp(self):
+        self._tmp_session = Path(self.id().replace(".", "_") + ".session")
+        patch = unittest.mock.patch.object(config, "SESSION_FILE", self._tmp_session)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.addCleanup(lambda: self._tmp_session.exists() and self._tmp_session.unlink())
+        for name, value in (
+            ("POLL_INTERVAL_S", 0),
+            ("RESPONSE_TIMEOUT_S", 5.0),
+            ("PARALLEL_BUCKETS", False),
+            ("BUCKET_LOCK_TIMEOUT_S", 0),
+            ("FILL_TIMEOUT_MS", 200),
+            ("FILL_RETRIES", 2),
+            ("FILL_CHUNK_CHARS", 4000),
+            ("RETRY_BACKOFF_S", 0),
+            ("SUBMIT_VERIFY_MS", 40),
+            ("PROMPT_MAX_CHARS", 100000),
+            ("MAX_UPSTREAM_RETRIES", 1),
+        ):
+            p = unittest.mock.patch.object(config, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _run(self, page, prompt):
+        driver = GeminiWebDriver()
+        driver.page = page
+        return asyncio.run(driver.send_chat(prompt))
+
+    def test_long_prompt_is_split_into_chunks(self):
+        page = _ChunkyPage()
+        prompt = "A" * 12000
+        text, _ = self._run(page, prompt)
+        self.assertEqual(text, "新答案")
+        # 每块都不超过 FILL_CHUNK_CHARS，且没有用旧的整体 fill
+        self.assertEqual(page.whole_fills, 0)
+        self.assertEqual(page.oversized, 0)
+        self.assertEqual(page.pieces, [4000, 4000, 4000])
+        # 原语：真实键盘 insert_text 优先（参照姊妹项目 ChatGPTBridge）
+        self.assertEqual(set(page.sources), {"keyboard"})
+        # 写入前真实 click 聚焦（否则键盘事件会落到别处），提交用真实键盘 Enter
+        self.assertGreaterEqual(page.focus_clicks, 1)
+        self.assertEqual(page.presses, ["Enter"])
+        self.assertEqual(page.synthetic_enters, 0)
+        # 提交的正是完整 prompt（逐字一致）
+        self.assertEqual(page.submitted_text, prompt)
+
+    def test_resumes_after_composer_remount(self):
+        # 第 3 块时句柄失效（重挂载）：必须重新定位后**续写**，不重复也不丢
+        page = _ChunkyPage(fail_at=2)
+        prompt = "B" * 10000
+        text, _ = self._run(page, prompt)
+        self.assertEqual(text, "新答案")
+        self.assertEqual(page.submitted_text, prompt)
+
+    def test_partial_insert_from_previous_attempt_is_not_duplicated(self):
+        # 上一轮已经写入前 6000 字符：本轮应从 6000 继续，而不是从头再来
+        page = _ChunkyPage()
+        page.store["text"] = "C" * 6000
+        prompt = "C" * 9000
+        self._run(page, prompt)
+        self.assertEqual(page.submitted_text, prompt)
+        self.assertEqual(len(page.pieces), 1)  # 只补了剩下 3000
+
+    def test_unreadable_composer_falls_back_to_whole_fill(self):
+        # 读不到输入框文本（页面差异）时不能用分块，退回整段 fill（且短文本能成功）
+        page = _ChunkyPage(unreadable=True)
+        text, _ = self._run(page, "go")
+        self.assertEqual(text, "新答案")
+        self.assertEqual(page.whole_fills, 1)
+
+    def test_keyboard_primary_falls_back_to_exec_command(self):
+        # 真实键盘通道不可用时，退到 execCommand，仍然能完整写入并提交
+        page = _ChunkyPage()
+        page.keyboard_broken = True
+        prompt = "D" * 6000
+        self._run(page, prompt)
+        self.assertEqual(set(page.sources), {"execCommand"})
+        self.assertEqual(page.submitted_text, prompt)
+
+    def test_caret_is_placed_before_writing(self):
+        # 真机根因守护：插入原语只作用于「当前选区」，写之前必须显式把光标放进输入框；
+        # 否则两种插入都静默无效（不报错、0 字符）——这正是本轮生产故障的签名。
+        page = _ChunkyPage()
+        prompt = "F" * 5000
+        text, _ = self._run(page, prompt)
+        self.assertEqual(text, "新答案")
+        self.assertGreaterEqual(page.caret_sets, 1)
+        self.assertEqual(page.silent_noops, 0)
+        self.assertEqual(page.submitted_text, prompt)
+
+    def test_silent_noop_inserts_fall_back_to_whole_fill(self):
+        # 两种原语都静默失效时，不能直接报错：必须退回整段 fill（本页面上可用的原语）
+        page = _ChunkyPage(ignore_inserts=True)
+        prompt = "G" * 3000
+        text, _ = self._run(page, prompt)
+        self.assertEqual(text, "新答案")
+        self.assertGreaterEqual(page.silent_noops, 1)
+        self.assertEqual(page.whole_fills, 1)
+        self.assertEqual(page.submitted_text, prompt)
+
+    def test_residue_is_cleared_before_writing(self):
+        # 输入框里有上一次没发出去的草稿：必须先清干净，否则新 prompt 会被拼接
+        page = _ChunkyPage()
+        page.store["text"] = "OLD-RESIDUE-" * 50
+        prompt = "E" * 5000
+        self._run(page, prompt)
+        self.assertEqual(page.submitted_text, prompt)
+        self.assertNotIn("OLD-RESIDUE", page.submitted_text)
+        # 清空手法：全选 + 删除（参照姊妹项目 ChatGPTBridge 的 _clear_input）
+        self.assertIn("Backspace", page.presses)
 
 
 if __name__ == "__main__":

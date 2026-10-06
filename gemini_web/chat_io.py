@@ -73,6 +73,14 @@ def prune_output_dir(output_dir: str) -> int:
 _prune_output_dir = prune_output_dir
 
 
+class ChunkedInsertUnavailable(RuntimeError):
+    """分块插入在本页面**一个字都写不进去**：调用方应退回整段 ``fill()``。
+
+    与「写了但慢」区分开：只有 ``written == 0`` 才抛这个，表示两种插入原语在本页面上
+    完全无效（真机故障），继续分块只会白等到报错。
+    """
+
+
 class ChatIOMixin:
     async def send_chat(
         self,
@@ -294,6 +302,37 @@ class ChatIOMixin:
     }
     """
 
+    _IS_ACTIVE_JS = "(el) => document.activeElement === el"
+
+    async def _keyboard_enter(self, page, chat_input) -> bool:
+        """用**真实键盘事件**提交（首选）。
+
+        为什么优先于合成事件（参照姊妹项目 ChatGPTBridge 的 `_keyboard_enter`）：
+        `dispatchEvent(new KeyboardEvent(...))` 的 `isTrusted=false`，受控编辑器
+        （ProseMirror / Gemini 的 rich-textarea）常常直接忽略它——这正是「文字在输入框里、
+        消息没发出去」的根源之一；只有 CDP 通道的真实按键才会走编辑器的提交 handler。
+
+        不依赖窗口是否在前台：Playwright 的键盘事件走 CDP，直接投递给页面内当前焦点元素；
+        这里先确认输入框仍是 activeElement，不是就先真实 click 聚焦。
+        """
+        if page is None or chat_input is None:
+            return False
+        try:
+            focused = bool(await chat_input.evaluate(self._IS_ACTIVE_JS))
+        except Exception:
+            focused = False
+        if not focused:
+            try:
+                await self._focus_composer(page, chat_input)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("聚焦输入框失败：%s", exc)
+        try:
+            await page.keyboard.press("Enter")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("真实键盘 Enter 失败：%s", exc)
+            return False
+
     async def _dispatch_enter(self, chat_input) -> bool:
         """在页面内对输入框派发 Enter 键事件（纯 DOM，不碰 OS 焦点）。
 
@@ -427,11 +466,21 @@ class ChatIOMixin:
 
     # 输入框写入失败时的诊断脚本：把“为什么不可编辑”留下来，而不是只丢一个
     # Playwright 超时。字段都是 DOM 事实，不依赖具体选择器。
+    # `caret_in_composer` 是写入失败时最关键的一条：插入原语只在**当前选区**处生效，
+    # 选区不在编辑器内时它们会静默空操作（真机故障根因）。
     _COMPOSER_DIAG_JS = """
     (el) => {
       const style = getComputedStyle(el);
       const rect = el.getBoundingClientRect();
       const active = document.activeElement;
+      let caret_in_composer = false;
+      try {
+        const sel = window.getSelection();
+        if (sel && sel.rangeCount) {
+          const node = sel.getRangeAt(0).startContainer;
+          caret_in_composer = (node === el || el.contains(node));
+        }
+      } catch (e) { caret_in_composer = false; }
       return JSON.stringify({
         tag: el.tagName,
         ce: el.getAttribute('contenteditable'),
@@ -442,7 +491,27 @@ class ChatIOMixin:
         visibility: style.visibility,
         size: Math.round(rect.width) + 'x' + Math.round(rect.height),
         active: active ? active.tagName + (active === el ? '(self)' : '') : null,
+        caret_in_composer: caret_in_composer,
+        child_nodes: el.childNodes.length,
       });
+    }
+    """
+
+    # 把光标（**折叠**选区）显式放进输入框内容末尾。
+    # 这一段等于 Playwright `fill()` 内部对 contenteditable 做的前半段
+    # （`selectText`：focus + range.selectNodeContents + addRange），
+    # 只是折叠到末尾而不是全选——分块追加不能覆盖已有内容。
+    _SET_CARET_JS = """
+    (el) => {
+      el.focus();
+      const sel = window.getSelection();
+      if (!sel) return false;
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      range.collapse(false);
+      sel.removeAllRanges();
+      sel.addRange(range);
+      return true;
     }
     """
 
@@ -470,18 +539,264 @@ class ChatIOMixin:
         except Exception as exc:  # noqa: BLE001  拿到不到就退化成一句话
             return f"（诊断不可用：{exc}）"
 
+    # 分块写入用的两个 JS：都是浏览器**真实编辑命令**（触发 beforeinput/input，
+    # 富文本编辑器会同步内部模型），且不碰 OS 焦点。
+    _INSERT_TEXT_JS = """
+    (el, text) => {
+      el.focus();
+      return document.execCommand('insertText', false, text) === true;
+    }
+    """
+
+    _CLEAR_COMPOSER_JS = """
+    (el) => {
+      el.focus();
+      const sel = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      sel.removeAllRanges();
+      sel.addRange(range);
+      return document.execCommand('delete') === true;
+    }
+    """
+
+    def _insert_timeout_s(self) -> float:
+        return max(0.1, (config.FILL_TIMEOUT_MS or 10000) / 1000.0)
+
+    async def _focus_composer(self, page, handle) -> None:
+        """让输入框真正获得焦点：**真实 `click()` 优先**（参照姊妹项目 ChatGPTBridge 的
+        `_call_fill`），失败再退 JS `el.focus()`。
+
+        为什么不能只调 JS focus：受控编辑器（ProseMirror / Gemini 的 rich-textarea）
+        只把**真实交互**后的焦点当成“激活”，否则后续插入的文本可能不进它的内部模型；
+        而且 `page.keyboard` 走的是页面内焦点，不聚焦就等于把按键送到别处。
+        """
+        if handle is None:
+            return
+        try:
+            await asyncio.wait_for(
+                handle.click(timeout=config.FILL_TIMEOUT_MS or 5000), timeout=self._insert_timeout_s()
+            )
+            return
+        except Exception as exc:  # noqa: BLE001  不可见/被遮挡/超时
+            logger.debug("聚焦输入框的 click 失败（%s），退回 JS focus", exc)
+        try:
+            await asyncio.wait_for(
+                handle.evaluate("(el) => el.focus()"), timeout=self._insert_timeout_s()
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError("无法聚焦输入框：click 与 JS focus 均失败") from exc
+
+    async def _set_caret(self, handle) -> bool:
+        """把光标显式放进输入框（最佳努力；失败返回 False，由调用方继续尝试插入）。
+
+        为什么必须显式设置（真机根因，已从 Playwright 源码证实）：
+        `page.keyboard.insert_text()` 发的是 CDP `Input.insertText`，它**只在当前选区处插入**；
+        `document.execCommand('insertText')` 同理。而输入框往往**已经是** `document.activeElement`
+        ——此时 `el.focus()` 是空操作（规范和实现都不会改变选区），页面里于是没有任何落在编辑器
+        内的选区；两种插入随之变成**静默空操作**：不抛错、一个字也不进。
+        真机日志正对应这个签名：`keyboard.insert_text` 没有任何报错，输入框却始终读到 0 字符。
+
+        对照 Playwright 自己的 `fill()`（本页面上运行多年的可用原语）：它对 contenteditable
+        先 `selectText(element)`（focus + `range.selectNodeContents` + `addRange`）建立选区，
+        再走 `keyboard.insertText`。这里做同一件事，只把选区折叠到末尾以便追加。
+        """
+        if handle is None:
+            return False
+        try:
+            return bool(await asyncio.wait_for(
+                handle.evaluate(self._SET_CARET_JS), timeout=self._insert_timeout_s()
+            ))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("设置输入框光标失败：%s", exc)
+            return False
+
+    async def _insert_chunk(self, page, handle, text: str, prefer_keyboard: bool = True):
+        """把**一块**文本插入输入框；返回真正生效的原语名，两种都失败时返回 None。
+
+        原语顺序参照姊妹项目 ChatGPTBridge 的 `_call_fill`：
+        `page.keyboard.insert_text()`（CDP，走浏览器真实编辑管线，会触发
+        beforeinput/input，受控编辑器（ProseMirror / rich-textarea）才会同步内部模型）
+        **优先**；`document.execCommand('insertText')`（同样触发真实编辑事件）退路。
+
+        插入**之前先显式放置光标**（见 `_set_caret`）：两种原语都只在当前选区处生效，
+        没有选区它们既不报错也不写入。
+
+        真正“写进去了没有”由调用方逐块读回文本校验（见 `_insert_prompt_in_chunks`），
+        所以这里不把“没报错”当成成功。
+        """
+        timeout = self._insert_timeout_s()
+        insert_text = getattr(getattr(page, "keyboard", None), "insert_text", None)
+
+        async def via_keyboard() -> bool:
+            if insert_text is None:
+                return False
+            try:
+                await asyncio.wait_for(insert_text(text), timeout=timeout)
+                return True
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("keyboard.insert_text 失败：%s", exc)
+                return False
+
+        async def via_exec_command() -> bool:
+            try:
+                return bool(await asyncio.wait_for(
+                    handle.evaluate(self._INSERT_TEXT_JS, text), timeout=timeout
+                ))
+            except Exception as exc:  # noqa: BLE001  句柄失效 / 页面卡住 / 超时
+                logger.debug("execCommand 插入失败：%s", exc)
+                return False
+
+        await self._set_caret(handle)
+        if prefer_keyboard:
+            primitives = (("keyboard", via_keyboard), ("execCommand", via_exec_command))
+        else:
+            primitives = (("execCommand", via_exec_command), ("keyboard", via_keyboard))
+        for name, primitive in primitives:
+            if await primitive():
+                return name
+        return None
+
+    async def _clear_composer(self, page, handle) -> None:
+        """把输入框清到「读回来是空的」为止（多手法 + 循环校验）。
+
+        参照姊妹项目 ChatGPTBridge 的 `_clear_input`：编辑器会把草稿持久化，页面上可能
+        残留上一次没发出去的内容，若不清空就会与新 prompt **拼接**后一起发出去。
+        单一手法都不可靠（Ctrl+A 在 macOS 未必生效、直接改 DOM 会被编辑器回滚），
+        所以组合使用并循环校验；清不干净至少留一条 warning。
+        """
+        keyboard = getattr(page, "keyboard", None)
+        press = getattr(keyboard, "press", None)
+        for _round in range(3):
+            current = await self._composer_text(handle)
+            if current is None or not current.strip():
+                return
+            if press is not None:
+                for modifier in ("Control+A", "Meta+A"):
+                    try:
+                        await press(modifier)
+                        await press("Backspace")
+                    except Exception:  # noqa: BLE001
+                        pass
+            try:
+                await handle.fill("", timeout=config.FILL_TIMEOUT_MS or 5000)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await asyncio.wait_for(
+                    handle.evaluate(self._CLEAR_COMPOSER_JS), timeout=self._insert_timeout_s()
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            await asyncio.sleep(0.1)
+        leftover = await self._composer_text(handle)
+        if leftover:
+            logger.warning(
+                "[输入] 清空输入框后仍读到 %s 字符残留，新 prompt 可能被拼接", len(leftover)
+            )
+
+    async def _insert_prompt_in_chunks(self, page, prompt: str, handle=None) -> Optional[int]:
+        """**分块**把 prompt 写进输入框，返回已写入的字符数；读不到输入框文本时返回 None。
+
+        为什么必须分块（真机复现）：客户端的 `find` / `read` 结果很长时，一次性
+        `fill()` 会在网页主线程上排成一个长任务（React 重渲染 + 富文本编辑器同步），
+        期间 Playwright 连“元素是否可见/可编辑”都探测不到，直接抛
+        `waiting for element to be visible, enabled and editable`；网页本身也卡住，
+        于是整轮请求失败、客户端拿不到任何回复（用户侧看到的就是“输入框卡死”）。
+
+        做法：按 ``FILL_CHUNK_CHARS`` 逐块插入；每块之前**重新读一遍输入框文本**，
+        只补写缺的那一段——因此可重挂载后续写、不会重复写入，也能从上次失败处继续。
+        每块之间 ``await asyncio.sleep(0)`` 让出主线程。
+
+        :param handle: 已经定位好的输入框句柄（复用，避免重复定位）；None 表示自己定位。
+        """
+        chunk = max(200, config.FILL_CHUNK_CHARS or 4000)
+        stalls = 0
+        last_written = -1
+        last_source: Optional[str] = None
+        focused = False
+        while True:
+            if handle is None:
+                handle = await self._locate_input(page)
+                if handle is None:
+                    raise RuntimeError("分块写入时找不到输入框")
+                focused = False  # 重挂载后的新节点要重新聚焦
+            current = await self._composer_text(handle)
+            if current is None:
+                return None  # 读不到文本的页面：改用整段 fill 兜底
+            if not prompt.startswith(current):
+                # 输入框里有残留/被改写的内容：先清空（循环校验）再从 0 写
+                await self._clear_composer(page, handle)
+                current = await self._composer_text(handle)
+                if current is None:
+                    return None
+                if not prompt.startswith(current):
+                    current = ""
+            written = len(current)
+            if written >= len(prompt):
+                return written
+            if written == last_written:
+                stalls += 1
+                if stalls > max(1, config.FILL_RETRIES):
+                    detail = await self._composer_diag(handle)
+                    if written == 0:
+                        # 一个字都写不进去：分块插入在本页面根本不生效。
+                        # 交给调用方退回整段 fill（本页面上被证实的可用原语）。
+                        logger.warning(
+                            "[输入] 分块插入完全无效（已写入 0/%s 字符，最后原语=%s）：%s",
+                            len(prompt), last_source or "无", detail,
+                        )
+                        raise ChunkedInsertUnavailable(
+                            "分块插入在本页面写不进去（已写入 0 字符）"
+                        )
+                    logger.warning(
+                        "[输入] 分块写入无进展：已写入 %s/%s 字符（最后原语=%s）：%s",
+                        written, len(prompt), last_source or "无", detail,
+                    )
+                    raise RuntimeError(
+                        f"分块写入无进展：已写入 {written}/{len(prompt)} 字符"
+                    )
+            else:
+                stalls = 0
+            last_written = written
+            if not focused:
+                # 真实 click 聚焦（优先）：`page.keyboard.insert_text` 走页面内焦点，
+                # 不聚焦就会把文本送到别处；受控编辑器也只认“真实交互”后的焦点。
+                await self._focus_composer(page, handle)
+                focused = True
+            try:
+                # 上一次“没进展”说明这个原语可能被编辑器忽略：换另一个原语再试
+                last_source = await self._insert_chunk(
+                    page, handle, prompt[written:written + chunk],
+                    prefer_keyboard=(stalls == 0),
+                )
+                if last_source is None:
+                    logger.debug(
+                        "本块两种插入原语都报错（已写入 %s/%s 字符）", written, len(prompt)
+                    )
+            except Exception as exc:  # noqa: BLE001  句柄失效 / 页面卡住
+                logger.warning(
+                    "分块写入失败（已写入 %s/%s 字符）：%s；重新定位后继续写",
+                    written, len(prompt), exc,
+                )
+                handle = None
+                stalls += 1
+                if stalls > max(1, config.FILL_RETRIES) * 2:
+                    raise
+            await asyncio.sleep(0)
+
     async def _fill_prompt(self, page, prompt: str):
         """把 prompt 写进输入框，返回可提交的句柄；每次尝试都**重新定位**。
 
-        为什么不是“定位一次 + 一次 fill”（参照姊妹项目 ChatGPTBridge 的
-        FILL_TIMEOUT_MS / FILL_RETRIES）：
+        两条路径：
 
-        * ``fill`` 默认超时 30s。网页版重挂载 composer 后，我们手里的旧句柄会
-          一直卡在“等它变得可见/可编辑”上直到超时——整轮请求直接失败，而客户端
-          重试又拿到同样的失效句柄，把窗口期全部耗光（真实故障已复现）；
-        * 所以每次尝试都重新定位（拿到重挂载后的新节点），单次超时收紧到
-          ``FILL_TIMEOUT_MS``，失败后按 ``RETRY_BACKOFF_S`` 退避再试，
-          最多 ``FILL_RETRIES`` 次；仍不行才报错，并附上输入框诊断。
+        1. **分块写入**（默认，见 ``_insert_prompt_in_chunks``）：超长 prompt 不再
+           一次性塞入，不会把网页主线程卡死（真机故障根因），且可断点续写；
+        2. **整段 ``fill``**（兜底）：页面读不到输入框文本时无法判断写到哪，
+           退回旧行为（单次超时仍受 ``FILL_TIMEOUT_MS`` 约束）。
+
+        每次尝试都重新定位（拿到重挂载后的新节点）；失败按 ``RETRY_BACKOFF_S``
+        退避再试，最多 ``FILL_RETRIES`` 次；仍不行才报错，并附输入框诊断。
         """
         attempts = max(1, config.FILL_RETRIES)
         timeout = config.FILL_TIMEOUT_MS or None
@@ -493,8 +808,24 @@ class ChatIOMixin:
                 logger.warning("写入输入框失败（第 %s/%s 次）：找不到输入框", attempt, attempts)
             else:
                 try:
-                    await chat_input.fill(prompt, timeout=timeout)
-                    return chat_input
+                    try:
+                        written = await self._insert_prompt_in_chunks(page, prompt, chat_input)
+                    except ChunkedInsertUnavailable as exc:
+                        # 分块插入在这个页面上一个字都写不进去：退回**整段 fill**。
+                        # `fill()` 内部做的正是「先建立选区、再 Input.insertText」，是本页面上
+                        # 被证实的可用原语；分块只是为了绕开「一次性写入把主线程排成长任务」，
+                        # 宁可慢，也不能一个字都写不进。
+                        logger.warning(
+                            "[输入] %s：退回整段 fill（%s 字符）", exc, len(prompt)
+                        )
+                        written = None
+                    if written is None:
+                        # 整段 fill：句柄就是刚定位的那个，直接用它
+                        await chat_input.fill(prompt, timeout=timeout)
+                        return chat_input
+                    logger.info("写入输入框完成：%s 字符（分块）", written)
+                    # 分块过程中节点可能被重挂载，重新定位一个可用的句柄再提交
+                    return await self._locate_input(page) or chat_input
                 except Exception as exc:  # noqa: BLE001  Playwright TimeoutError 等
                     last_error = exc
                     logger.warning(
@@ -509,7 +840,8 @@ class ChatIOMixin:
             "命中的元素始终不处于「可见 / 可编辑」状态。常见原因：登录态失效或被风控"
             "拦住、页面停在非对话视图、有头模式下窗口失焦后输入框被懒卸载"
             "（可试 HEADLESS=1），或单个 prompt 超出输入框字符上限"
-            "（可调小 PROMPT_MAX_CHARS / TOOL_RESULT_MAX_CHARS）。"
+            "（可调小 PROMPT_MAX_CHARS / TOOL_RESULT_MAX_CHARS，"
+            "或调小 FILL_CHUNK_CHARS 让每块插入更短）。"
         ) from last_error
 
     async def _submit_prompt(self, page, chat_input, bucket: Optional[str] = None) -> None:
@@ -517,20 +849,23 @@ class ChatIOMixin:
 
         为什么必须确认（用户报告的真实故障）：`_dispatch_enter` 内嵌的 JS 只要把事件
         派发出去就 `return true`，而旧实现据此直接 `return`——**永远走不到点击发送按钮的
-        兑底路径**。当网页没接住这个合成按键时（长文本刚 `fill` 进去、编辑器还没接管，
+        兜底路径**。当网页没接住这个合成按键时（长文本刚 `fill` 进去、编辑器还没接管，
         或发送按钮处于 disabled），输入框里就是“文字在、消息没发”，网页不产生任何回复，
         客户端只能干等到超时（用户侧看到的就是“prompt 在输入框里但没发送”）。
 
         阶梯（每次尝试后都用 `_wait_submitted` 验证）：
-          1. 派发 Enter；
+          1. **真实键盘 Enter**（CDP，受控编辑器才认；合成事件常被忽略）；
           2. 点真正的发送按钮（先原生 click，再 DOM click）；
-          3. 再派发一次 Enter（给编辑器消化大文本留出时间）。
+          3. 再派发一次合成 Enter（给编辑器消化大文本留出时间）。
         三次都验证不到提交 -> 抛可行动错误（附按钮状态），不再静默等待。
+        原语顺序与理由参照姊妹项目 ChatGPTBridge 的 `_submit_prompt`。
         """
-        plan = ("Enter", "发送按钮", "Enter")
+        plan = ("真实键盘 Enter", "发送按钮", "合成 Enter")
         last_detail = "（未知）"
         for index, action in enumerate(plan, start=1):
-            if action == "Enter":
+            if action == "真实键盘 Enter":
+                await self._keyboard_enter(page, chat_input)
+            elif action == "合成 Enter":
                 await self._dispatch_enter(chat_input)
             else:
                 await self._click_send_button(page)
@@ -548,7 +883,7 @@ class ChatIOMixin:
                 index, len(plan), action, last_detail, await self._send_button_state(page),
             )
         raise RuntimeError(
-            f"prompt 已写入输入框但未能提交（尝试 {len(plan)} 次：Enter → 发送按钮 → Enter）；"
+            f"prompt 已写入输入框但未能提交（尝试 {len(plan)} 次：键盘 Enter → 发送按钮 → 合成 Enter）；"
             f"{last_detail}。常见原因：发送按钮处于 disabled（编辑器还在消化长文本/粘贴）、"
             "页面停在非对话视图，或按键被网页忽略。可调大 SUBMIT_VERIFY_MS；"
             "若与长 prompt 相关，可调小 PROMPT_MAX_CHARS / TOOL_RESULT_MAX_CHARS。"

@@ -526,3 +526,164 @@ enabled and editable`）。日志显示 **04:35:06 / 04:35:54 / 04:36:39 / 04:37
   被用户中止（已清理该实例与副本，未触碰运行中的 8001 实例）。因此提交阶梯与压缩的**真实网页行为
   尚未端到端验证**，只有假 page 单测 + 离线长度实测覆盖。
 - 新配置 `SUBMIT_VERIFY_MS`（3000）已写入 `config.py` / `.env` / `.env.example`（键数 63 → 64）。
+
+## 18. 超长工具结果把输入框卡死：改为分块写入（2026-10-07）
+
+**用户现象（真机复现）**：客户端跑 `find . -maxdepth 3 ...`，超长结果经桥回灌后网页输入框卡死，桥报
+
+```
+Error: 写入输入框连续失败 3 次（单次超时 10000ms）：命中的元素始终不处于「可见 / 可编辑」状态。
+```
+
+**原因（机制）**：旧实现是「定位一次句柄 → 一次 `fill(整段 prompt)`」。几万字符会被浏览器排成
+**网页主线程上的一个长任务**（React 重渲染 + 富文本编辑器同步内部模型），期间 Playwright 连
+“元素是否可见/可编辑”都探测不到，于是抛
+`waiting for element to be visible, enabled and editable` 直到 `FILL_TIMEOUT_MS` 超时；
+网页本身在这段时间里也是卡住的（用户看到的“输入框卡死”）。T11.2 的重试只是把同一件事重试了三遍。
+
+**修法：分块写入（`chat_io._insert_prompt_in_chunks`）**
+
+| 要点 | 说明 |
+| --- | --- |
+| 分块 | 新增配置 `FILL_CHUNK_CHARS`（默认 4000）：每次只插入一块，长任务被切碎 |
+| 幂等/续写 | 每块之前**重读输入框文本**，只补写缺的那一段（`prompt[len(current):]`）；因此重挂载换节点、上一轮写了一半、某块失败，都能接着写且不重复 |
+| 让出主线程 | 每块之间 `await asyncio.sleep(0)` |
+| 插入原语 | 首选 `document.execCommand('insertText')`（浏览器真实编辑命令，触发 beforeinput/input，富文本编辑器会同步模型）；无效则退回 CDP `keyboard.insert_text` |
+| 超时 | 每次插入用 `asyncio.wait_for` 受 `FILL_TIMEOUT_MS` 约束（不再依赖 evaluate 的无超时等待） |
+| 句柄失效 | 插入抛错 → 置空句柄 → 重新定位后续写（不从头重来） |
+| 死循环护栏 | 连续 `FILL_RETRIES` 次“已写入字符数没变化”即抛错（带 `已写入 X/Y 字符`） |
+| 兜底 | 页面**读不到输入框文本**时无法判断写到哪，退回旧的整段 `fill`（行为不变） |
+
+**验收**：`pytest -q` → **329 passed, 18 skipped, 31 subtests passed**（新增 `ChunkedInsertTests` 4 例：
+分块长度正确且提交的正是完整 prompt / 句柄重挂载后**续写**不重复不丢 / 上一轮已写入 6000 字符时只补 3000 /
+读不到文本时退回整段 fill）。**区分力实验**：换回分块之前的 `chat_io.py` → 3 failed，
+报的正是用户看到的 `waiting for element to be visible, enabled and editable`；恢复后 4 passed。
+
+**未验证**：真实网页端未跑（需重启运行中的服务；本轮不再起第二实例）。分块大小的实测手感
+（`FILL_CHUNK_CHARS=4000`）也待真机确认——若仍偶发卡顿，可先调到 2000。
+
+## 19. 与姊妹项目 ChatGPTBridge 的输入框方案对比与合并（2026-10-07）
+
+对比对象：<https://github.com/NZSpark/chatgpt-bridge/blob/main/chatgpt_web/chat_io.py>。
+
+### 19.1 两边的做法
+
+**ChatGPTBridge**（`_fill_prompt` / `_call_fill` / `_clear_input` / `_submit_prompt`）：
+
+| 环节 | 做法与理由 |
+| --- | --- |
+| 定位与校验 | 每次重试都重新定位；**填后读回非空**才算成功 |
+| 聚焦 | `chat_input.click()` 真实点击优先，失败退 JS `el.focus()` |
+| 清空 | `_clear_input`：Ctrl+A/Meta+A + Backspace、`fill("")`、JS 清空并派发 `input`，**循环校验直到读回为空**（编辑器会持久化草稿，残留会与新 prompt 拼接） |
+| 插入 | `page.keyboard.insert_text(prompt)`（CDP，走浏览器真实编辑管线）——注释明确：`fill()` 对 ProseMirror 不可靠（受控组件不吃直接设值，元素常被判 not visible） |
+| 提交 | **真实键盘 Enter 优先**（`_keyboard_enter`）→ 合成 `KeyboardEvent` → 发送按钮；理由：合成事件 `isTrusted=false`，ProseMirror keymap 直接忽略，长文本含换行时更会被当成软换行 |
+| 不分块 | 一次整段 `insert_text` |
+
+**本项目 T11.5**：分块 `execCommand('insertText')`（≤`FILL_CHUNK_CHARS`）+ **逐块读回校验**（按已写入字符数续写，
+可重挂载续写、不重复）+ 提交后验证（输入框已清空 / 页面进入生成中）+ 提交阶梯。
+
+### 19.2 对比结论
+
+| 维度 | 谁更强 | 说明 |
+| --- | --- | --- |
+| 超长文本 | **本项目** | 卡死的根因是“一次性插入把主线程排成长任务”。他们不分块，100K 的 prompt 照样会卡；本项目分块后每块只是小任务 |
+| 写入校验 | **本项目** | 逐块按字符数校验，强于“读回非空”；还能断点续写 |
+| 提交可靠性 | **他们** | 真实键盘 Enter 才走受控编辑器的提交 handler，合成事件常被忽略（正是用户报的“文字在框里但没发出去”）；本项目之前只把合成事件当首选 |
+| 焦点与残留 | **他们** | 真实 click 聚焦、循环校验清空草稿；本项目之前只有 JS focus、单次 best-effort 清空 |
+| 提交后确认 | **本项目** | 他们没有提交后验证（键盘 Enter 返回即认为成功） |
+
+### 19.3 本轮采纳（以他们的原语 + 本项目的分块与校验合成）
+
+| 改动 | 内容 |
+| --- | --- |
+| `chat_io._focus_composer`（新） | 真实 `click()` 优先（受控编辑器只认“真实交互”后的焦点），失败退 JS `focus()`；每次（重新）定位句柄后、首次插入前聚焦 |
+| `chat_io._insert_chunk`（改） | **`keyboard.insert_text` 优先**，`execCommand` 退路；“写入没进展”时**交换原语顺序**再试（`prefer_keyboard=(stalls == 0)`） |
+| `chat_io._clear_composer`（改） | 多手法 + **循环校验**：Ctrl+A/Meta+A + Backspace、`fill("")`、JS 全选删除；清不干净留 warning（防草稿与新 prompt 拼接） |
+| `chat_io._keyboard_enter`（新） | 提交首选真实键盘 Enter（先确认 `document.activeElement === input`，不是就先真实 click 聚焦） |
+| `chat_io._submit_prompt`（改） | 阶梯 → **真实键盘 Enter → 发送按钮 → 合成 Enter**，每级之后都验证（输入框已清空 / 页面已生成中） |
+| 未采纳 | 他们的 `_shrink_seed_if_repeated_cap`（针对“会话到顶死循环”，与本项目输入框问题无关，本项目走会话轮转 + 播种） |
+
+### 19.4 验收与未验证项
+
+- `pytest -q` → **333 passed, 18 skipped, 31 subtests passed**（此轮；最新基线见 §20.5：335）（新增 4 例守护：原语优先键盘、合成 Enter 只作末级、
+  键盘通道不可用时退 execCommand、草稿残留先清空再写）。
+- **区分力实验**：换回合并前的 `chat_io.py` → `test_real_keyboard_enter_is_preferred_over_synthetic` /
+  `test_synthetic_enter_is_last_resort` / `test_long_prompt_is_split_into_chunks` /
+  `test_residue_is_cleared_before_writing` **4 failed**；恢复后 26 passed。
+- **未验证**：真实网页端（需重启服务）。两个未知项都属“手感类”：`FILL_CHUNK_CHARS=4000` 与
+  `keyboard.insert_text` 在 Gemini rich-textarea 上的实际接受度——若原语无效，代码会自动换用 execCommand，
+  并在“已写入 X/Y 字符”的错误里暴露。
+
+## 20. 修复「分块插入零字符」：先放光标，再插入（2026-10-07）
+
+### 20.1 真机现象
+
+用户重启服务后跑了一次（prompt 仅 **9633 字符**，远未触及任何上限）：
+
+```
+10:45:54 INFO  gemini_web.chat_io: [发送] bucket=default prompt=9633 字符
+10:45:56 WARNING gemini_web.chat_io: 写入输入框失败（第 1/3 次）：分块写入无进展：已写入 0/9633 字符；
+          输入框状态={"tag":"DIV","ce":"true","aria_disabled":null,"disabled":false,"connected":true,
+          "display":"block","visibility":"visible","size":"433x24","active":"DIV(self)"}
+```
+
+三次尝试后报 `写入输入框连续失败 3 次`。输入框可见、可编辑、已连接、且**已经是 activeElement**，
+长度也只有 9.6K——§16–§19 里所有“太长 / 不可见 / 句柄失效”的解释都不成立。
+
+### 20.2 定位：日志里“没有的东西”才是线索
+
+`GEMINI_DEBUG=1` 已开（同一份日志里有 `DEBUG gemini_web.completion` / `DEBUG gemini_web.server`），
+但**整份日志里没有一条** `keyboard.insert_text 失败` 或 `execCommand 插入失败`（两者都在 DEBUG 级别）。
+
+推论：`keyboard.insert_text` **没有抛错**（所以 `_insert_chunk` 直接返回 True，根本没轮到 execCommand 做主），
+却一个字也没写进输入框。即：**原语“成功”了，但输入框没变**。
+
+### 20.3 根因（从 Playwright 源码证实）
+
+读本机安装的 Playwright（`.venv/.../playwright/driver/package/lib/coreBundle.js`）中 `fill()` 的实现：
+
+```js
+// injectedScript.fill(node, value) —— contenteditable 分支
+this.selectText(element);      // ← focus + range.selectNodeContents + selection.addRange
+return "needsinput";
+
+// frame._fill()
+if (result === "needsinput") { await this._page.keyboard.insertText(progress, value); }
+
+// injectedScript.selectText(node) —— contenteditable 分支
+element.focus();
+const range = element.ownerDocument.createRange();
+range.selectNodeContents(element);
+const selection = element.ownerDocument.defaultView.getSelection();
+selection.removeAllRanges();
+selection.addRange(range);
+```
+
+结论：**`fill()` = 先显式建立选区，再 `Input.insertText`**。而 `page.keyboard.insert_text()` 发的就是同一个
+`Input.insertText`，`document.execCommand('insertText')` 同理——**两者都只在「当前选区」处插入**。
+
+输入框本来就常常已经是 `document.activeElement`，此时 `el.focus()` 是空操作（不会改变选区），
+页面里于是没有任何落在编辑器内的选区 → 两种插入退化成**静默空操作**。
+这也解释了为什么老代码的 `fill()` 一直能用、而换成裸 `insert_text` 后“没报错却不写入”。
+
+### 20.4 修法
+
+| 改动 | 内容 |
+| --- | --- |
+| `chat_io._SET_CARET_JS` / `_set_caret`（新） | `focus` + `selectNodeContents` + **`collapse(false)` 折到末尾**；与 `fill()` 同源，但只追加不覆盖。`_insert_chunk` 每次插入前调用（两种原语都受益）。 |
+| `chat_io._insert_chunk`（改） | 返回**真正生效的原语名**（`"keyboard"` / `"execCommand"` / `None`），调用方据此记日志；不再把“没报错”当成功。 |
+| `chat_io._insert_prompt_in_chunks`（改） | 零进展（`written == 0`）时记 warning（含 `caret_in_composer` 诊断 + 最后原语名）并抛 `ChunkedInsertUnavailable`；有进展但停住仍抛原来的 `RuntimeError`。 |
+| `chat_io._fill_prompt`（改） | 捕获 `ChunkedInsertUnavailable` → **退回整段 `fill()`**（本页面上被证实的可用原语）。分块是为了绕开“一次性写入把主线程排成长任务”，宁可慢也不能一个字都写不进。 |
+| `chat_io._COMPOSER_DIAG_JS`（改） | 增记 `caret_in_composer` / `child_nodes`：下次真机失败可直接看出“选区是否在编辑器内”。 |
+
+回退策略是**单调改进**：光标修好 → 分块照常工作（超长 prompt 不再卡主线程）；光标也救不了 → 退回 `fill()`，
+即回到本次回归之前一直可用的行为。
+
+### 20.5 验收
+
+- `pytest -q` → **335 passed, 18 skipped, 31 subtests passed**（新增 2 例守护：
+  `test_caret_is_placed_before_writing`、`test_silent_noop_inserts_fall_back_to_whole_fill`；
+  测试替身新增 `require_caret` / `ignore_inserts` 两个开关，模拟“没报错却零字符”的真机签名）。
+- **区分力实验**：去掉 `_set_caret` 调用 → `test_caret_is_placed_before_writing` **failed**；
+  去掉整段 fill 回退 → `test_silent_noop_inserts_fall_back_to_whole_fill` **failed**；恢复后 28 passed。
+- **未验证**：真实网页端（需重启运行中的服务）。本轮不再起第二实例。

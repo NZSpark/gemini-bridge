@@ -208,6 +208,12 @@ FILL_TIMEOUT_MS = env_int("FILL_TIMEOUT_MS", 10000)
 # 失效句柄。参照姊妹项目 ChatGPTBridge 的同名开关（chatgpt_web/chat_io.py 的
 # FILL_TIMEOUT_MS / FILL_RETRIES）。退避复用 RETRY_BACKOFF_S。
 FILL_RETRIES = env_int("FILL_RETRIES", 3)
+# 写入输入框时**每块**插入的字符数。真实故障：客户端的 find/read 结果很长时，
+# 一次性 `fill` 会在网页主线程上排成一个长任务（React 重渲染 + 富文本编辑器同步），
+# 期间连「元素是否可编辑」都探测不到——报 `waiting for element to be visible,
+# enabled and editable`，网页本身也卡住。分块插入把长任务切碎（每块之间让出主线程），
+# 并在每块前重新确认已写入的文本，可断点续写、也不会重复写入。
+FILL_CHUNK_CHARS = env_int("FILL_CHUNK_CHARS", 4000)
 # 提交（Enter / 点发送按钮）后：等待「输入框已清空 / 页面已开始生成」的最长时间（毫秒）。
 # 真实故障：文字已经在输入框里，但消息**没被提交**（旧实现里 Enter 派发后无条件认为成功，
 # 从不点发送按钮），网页不产生任何回复，客户端干等到超时。现在每次尝试后都要验证，
