@@ -131,6 +131,16 @@ class StateFileTests(unittest.TestCase):
         self.assertEqual(payload["turns"], 3)  # 默认桶写在顶层
         self.assertEqual(payload["sessions"]["b1"]["turns"], 5)
 
+    def test_session_over_budget_triggers_rotation(self):
+        """当轮数或估算 token 达上限时，标记 pending_rotation 为 True。"""
+        with mock.patch.object(config, "SESSION_MAX_TURNS", 3):
+            with mock.patch.object(config, "SESSION_MAX_TOKENS", 0):
+                state = self.driver._state("b1")
+                state.turns = 2
+                self.assertFalse(self.driver._session_over_budget("b1"))
+                state.turns = 3
+                self.assertTrue(self.driver._session_over_budget("b1"))
+
     def test_corrupt_state_file_is_ignored_not_fatal(self):
         self.state_file.write_text("{\"turns\": 3", encoding="utf-8")  # 截断的 JSON
         state = self.driver._state("b1")
