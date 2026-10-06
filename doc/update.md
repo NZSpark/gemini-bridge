@@ -687,3 +687,117 @@ selection.addRange(range);
 - **区分力实验**：去掉 `_set_caret` 调用 → `test_caret_is_placed_before_writing` **failed**；
   去掉整段 fill 回退 → `test_silent_noop_inserts_fall_back_to_whole_fill` **failed**；恢复后 28 passed。
 - **未验证**：真实网页端（需重启运行中的服务）。本轮不再起第二实例。
+
+## 21. 读回比较必须容忍编辑器对空白的规范化（真兇，2026-10-07）
+
+### 21.1 真机现象（T11.7 修复后仍然卡死）
+
+用户执行 `read doc/update.md`（该文件此时已很大），prompt 变成 **36,265 字符**：
+
+```
+11:13:45 WARNING gemini_web.chat_io: [输入] 分块插入完全无效（已写入 0/36265 字符，最后原语=execCommand）：
+   {"tag":"DIV","ce":"true",...,"size":"433x24","active":"DIV(self)","caret_in_composer":true,"child_nodes":1}
+```
+
+注意 `caret_in_composer: true`——**T11.7 的光标修复确实生效了**，选区就在元素内部，可依然每轮 0 字符。
+
+而同一请求内另一次诊断（`写入输入框失败（第 N 次…）` 附带的 `输入框状态`）却是：
+
+```
+{"size":"391x168","active":"DIV(self)","caret_in_composer":true,"child_nodes":616}
+```
+
+**616 个子节点、391x168** —— 那正是整条 36K prompt 的渲染结果。文本明明写进去了，日志却说「已写入 0」。
+
+### 21.2 根因：读回不含换行，前缀判据因此永远为假
+
+`_insert_prompt_in_chunks` 的续写判据是逐字节前缀：
+
+```python
+if not prompt.startswith(current):
+    await self._clear_composer(page, handle)   # ← 清空重写
+```
+
+富文本编辑器把**每条换行渲染成独立的块级节点**（`<p>`/`<div>`），而 `_COMPOSER_TEXT_JS` 用
+`el.textContent` 读——块级节点之间**没有换行符**。于是对任何多行 prompt：
+
+- `current` = `"line0 line1 …"`（无换行）
+- `prompt`  = `"line0\nline1 …"`
+- `prompt.startswith(current)` → **False**
+
+False 就触发 `_clear_composer`：**把刚写好的整条 prompt 清掉**，从 0 开始重写；下一轮再读到无换行的
+textContent、再判 False、再清空……循环到 `stalls` 上限，报「已写入 0/N 字符」。
+
+`child_nodes` 从 **616 塌缩到 1**、且每轮都「已写入 0」，就是这个自我毁灭循环的指纹——不是写不进去，
+是**写进去了又被自己清掉**。
+
+这同时解释了为什么之前的判断一路跑偏：查了长度、查了光标、查了原语，唯独没查「我们用来判断
+『写进去没有』的那把尺子是否可信」。
+
+### 21.3 修法
+
+| 改动 | 内容 |
+| --- | --- |
+| `chat_io._normalize_for_compare`（新） | 把文本压成可比较形态：所有空白序列（含换行）折成单个空格。 |
+| `chat_io._prompt_present`（改） | 用折叠后的形态比较（开头 120 字符一致 + 长度不短于 prompt），容忍编辑器规范化。 |
+| `chat_io._insert_prompt_in_chunks`（改） | 在进入**清空分支之前**先做一次容错判断：已在框里就直接当写完返回，**绝不清掉已写好的内容**。 |
+| `chat_io._write_prompt`（新） | 顺序校正为「写前先读回（已在框里就跳过）→ `fill()` → 读回确认（**报错但已落地也算成功**）→ 确实没落地才分块」。`fill()` 是 Playwright 内部「`selectText` 建立选区 → `Input.insertText`」那条路，本机实测能写进 100K。 |
+
+### 21.4 验收
+
+- `pytest -q` → **339 passed, 18 skipped, 31 subtests passed**。
+- **区分力实验（决定性）**：把 `_normalize_for_compare` 退回逐字节比较后，
+  `test_editor_normalized_readback_is_not_treated_as_residue` **failed**，且日志**逐字复现真机原签名**：
+
+  ```
+  WARNING [输入] 分块插入完全无效（已写入 0/4689 字符，最后原语=execCommand）：True
+  WARNING 写入输入框失败（第 1/2 次，prompt 4689 字符）：waiting for element to be visible, enabled and editable
+  ```
+
+  恢复后 32 passed。
+- **未验证**：真实网页端（需重启运行中的服务）。
+
+## 22. 修正 T11.8 引入的回归：`fill()` 成功就必须信任它（2026-10-07）
+
+### 22.1 真机现象（重启后的第一轮）
+
+prompt 仅 **9967 字符**：
+
+```
+11:23:32 INFO    [发送] bucket=default prompt=9967 字符
+11:23:32 WARNING [输入] fill 返回成功但读回只有 9834 字符（期望 9967）：改用分块插入
+11:23:34 WARNING [输入] 分块插入完全无效（已写入 0/9967 字符，最后原语=execCommand）：{...,"child_nodes":1}
+11:23:34 WARNING 写入输入框失败（第 1/3 次，prompt 9967 字符）：fill 未真正写入输入框
+... 三次后 RuntimeError
+```
+
+### 22.2 根因：把有损读回用在了**成功路径**上
+
+T11.8 加“读回校验”时，把判据同时挂到了 `fill()` **成功返回**之后：
+
+```python
+elif fill_error is None:
+    logger.warning("[输入] fill 返回成功但读回只有 %s 字符（期望 %s）：改用分块插入", ...)
+```
+
+但读回是**有损**的——编辑器把换行渲染成块级节点、把 `**`/``` 之类的 markdown 标记变成格式。
+真机上 9967 字符的 prompt 读回 9834，那 **133 字符差是正常损耗**，不是失败。
+
+于是：一次**已经成功**的 `fill` 被判死 → 走分块 → 分块先清空（把刚写好的内容删掉）→ 再报
+「已写入 0」→ 三次后整个请求失败。**这一轮的失败完全是校验判据放错位置造成的。**
+
+教训：校验只能用来**发现失败**，不能用来**否决成功**。有损的观测不足以推翻一个明确的成功信号。
+
+### 22.3 修法
+
+| 改动 | 内容 |
+| --- | --- |
+| `chat_io._write_prompt`（改） | `fill()` **没报错就信任它**（恢复其一直以来的行为），读回差异只记 INFO；**只有 `fill()` 报错时**才读回救援（真机见过报超时但文本已落地）。 |
+| `chat_io._insert_prompt_in_chunks`（改） | 清空**只做一次**（`cleared`）；已清过仍对不上读回时进入 `blind` 模式——不再清空，改为按本轮自己插入的字符数推进；进度判据改为「**读回长度是否增长**」（有损读回只改变绝对值，不改变增减）。 |
+
+### 22.4 验收
+
+- `pytest -q` → **340 passed, 18 skipped, 31 subtests passed**。
+- **区分力实验**：把成功路径改回“读回不符即判失败”→ `test_lossy_readback_after_successful_fill_is_trusted`
+  **failed**，日志与真机同形（`写入输入框失败（第 N/M 次…）` 两次后失败）；恢复后 33 passed。
+- **未验证**：真实网页端（需重启运行中的服务）。

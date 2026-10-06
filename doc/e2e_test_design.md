@@ -158,7 +158,7 @@ E2E_PORT=8001    # bridge 端口（默认取 .env 的 PORT）
 E2E_FULL=1       # 额外启用 B8（openai SDK 联调）
 ```
 
-- 未设置 `GEMINI_E2E=1` 时全部 **skip**，常规套件（`pytest -q`，335 passed / 18 skipped）不受影响、不发起任何网络请求。
+- 未设置 `GEMINI_E2E=1` 时全部 **skip**，常规套件（`pytest -q`，339 passed / 18 skipped）不受影响、不发起任何网络请求。
 - bridge 子进程日志：临时目录 `gemini_e2e_uvicorn.log`（失败时查看）。
 
 ### 4.1 定向运行：只跑改动过的用例

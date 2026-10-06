@@ -4,7 +4,7 @@
 
 状态标记：`[ ]` 未开始、`[~]` 进行中、`[x]` 完成（实现 + 验收测试齐备）。
 
-核对时间：2026-10-07（实施轮 + 随行轮 + 载体改造轮，阶段 6–11 已全部落地）；基线：`.venv/bin/python -m pytest -q` → **335 passed, 18 skipped, 31 subtests passed**（随行轮 238 → 279；E2E 重组轮 284；载体改造轮 +19 → 303；fill 重试轮 +5 → 308；长度控制核查轮 +10 → 318；长度控制修复轮 +7 → 325；分块写入轮 +4 → 329；ChatGPTBridge 方案合并轮 +4 → 333；光标与整段 fill 回退轮 +2 → 335）。
+核对时间：2026-10-07（实施轮 + 随行轮 + 载体改造轮，阶段 6–11 已全部落地）；基线：`.venv/bin/python -m pytest -q` → **340 passed, 18 skipped, 31 subtests passed**（随行轮 238 → 279；E2E 重组轮 284；载体改造轮 +19 → 303；fill 重试轮 +5 → 308；长度控制核查轮 +10 → 318；长度控制修复轮 +7 → 325；分块写入轮 +4 → 329；ChatGPTBridge 方案合并轮 +4 → 333；光标与整段 fill 回退轮 +2 → 335；读回规范化容忍轮 +4 → 339；信任 fill 成功返回轮 +1 → 340）。
 
 **联网实测状态（见 `doc/update.md` 第 10 节，真实 Gemini 登录）**：chat（流式/非流式）、tools（流式/非流式）、Responses（流式/非流式）、长文本结束判定、多轮增量、session 分桶**均已实测通过**。两点关于 P0 的结论要分开看：
 
@@ -182,6 +182,23 @@
   - 验收：`pytest -q` → **335 passed, 18 skipped, 31 subtests**（新增 2 例守护：`test_caret_is_placed_before_writing` / `test_silent_noop_inserts_fall_back_to_whole_fill`）。
   - **区分力实验**：去掉 `_set_caret` 调用 → `test_caret_is_placed_before_writing` failed；去掉整段 fill 回退 → `test_silent_noop_inserts_fall_back_to_whole_fill` failed；两处恢复后 28 passed。
   - **未验证**：真机（需重启服务）。详见 `doc/update.md` §20。
+
+- [x] **T11.8 读回比较必须容忍编辑器对空白的规范化（真兇）+ `fill()` 提到首位**（2026-10-07）
+  - **真机现象**（用户贴日志）：`read doc/update.md` 产生 **36,265 字符** prompt。`caret_in_composer: true`（T11.7 的光标修复确实生效了），却依旧每轮报 `已写入 0/36265 字符`；**同一请求内**另一次诊断却显示 `size=391x168, child_nodes=616`——那是整条 36K prompt 的渲染结果。`_clear_composer` 与 616→1 的 `child_nodes` 塌缩这才是关键证据。
+  - **根因**：富文本编辑器把每条换行渲染成**独立块级节点**，读回的 `textContent` **不含换行**。于是 `prompt.startswith(current)` 对任何多行 prompt 都判 False，而 False 会触发 `_clear_composer`——**把刚写好的整条 prompt 清掉再重写**；下一轮再清、再写，循环到报错。`child_nodes` 616→1、每轮「已写入 0」正是这个自我毁灭循环的指纹。
+  - 次要纠正：`fill()` 提到首位。它是 Playwright 内部「`selectText`（建立选区）→ `Input.insertText`」的那条路，本机实测能写进 100K（`probe_prompt_limit.py`）；且 **fill 报超时≠没写进去**（真机见过报超时、输入框已长出 616 个子节点），故失败后先**读回确认**。
+  - 修法：新增 `_normalize_for_compare`（空白/换行折成空格）与容错版 `_prompt_present`（开头 120 字符 + 长度）；`_write_prompt`（新）→ 「写前先读回（已在框里就跳过）→ `fill()` → 读回确认（报错但已落地也算成功）→ 确实没落地才分块」；`_insert_prompt_in_chunks` 在进入清空分支**之前**先做一次容错判断，绝不清掉已写好的内容。
+  - 验收：`pytest -q` → **339 passed, 18 skipped, 31 subtests**（新增 4 例，并删掉 1 例已不适用的回退守护）。
+  - **区分力实验**：把 `_normalize_for_compare` 退回逐字节比较 → `test_editor_normalized_readback_is_not_treated_as_residue` failed，且日志**复现真机原签名**：`[输入] 分块插入完全无效（已写入 0/4689 字符，最后原语=execCommand）`；恢复后 32 passed。
+  - **未验证**：真机（需重启服务）。详见 `doc/update.md` §21。
+
+- [x] **T11.9 修正 T11.8 引入的回归：`fill()` 成功就必须信任它**（2026-10-07）
+  - **真机现象**（重启后第一轮，prompt 9967 字符）：`[输入] fill 返回成功但读回只有 9834 字符（期望 9967）：改用分块插入`，随后分块报「已写入 0/9967」，三次尝试后失败。
+  - **根因**：T11.8 加的“读回校验”把判据放在了**成功路径**上，而读回是**有损**的（换行渲染成块级节点、markdown 标记变成格式）——真机上 9967 字符读回 9834，133 字符差属正常。用有损读回否决一次成功的 `fill`，等于把已经写好的 prompt 判死，再去分块、再清空重写，反而把它弄坏。
+  - 修法：校验只用于**错误路径**——`fill()` 没报错就信任它（恢复其一直以来的行为），读回差异仅记 INFO；只有 `fill()` **报错**时才读回救援（真机见过报超时但文本已落地）。另外 `_insert_prompt_in_chunks` 增加 `cleared` 一次性清空 + `blind` 模式：已清过一次仍对不上读回时不再清空，改为按本轮自己插入的字符数推进，并用「读回长度是否增长」判进度。
+  - 验收：`pytest -q` → **340 passed, 18 skipped, 31 subtests**。
+  - **区分力实验**：把成功路径改回“读回不符即判失败” → `test_lossy_readback_after_successful_fill_is_trusted` failed（日志与真机同形：两次 `写入输入框失败（第 N/M 次…）`）；恢复后 33 passed。
+  - **未验证**：真机（需重启服务）。详见 `doc/update.md` §22。
 
 ---
 
