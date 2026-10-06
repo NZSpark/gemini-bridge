@@ -536,9 +536,42 @@ class ChatIOMixin:
         return None
 
     async def _composer_diag(self, handle) -> str:
-        """收集输入框状态（best-effort：诊断本身绝不抛错）。"""
+        """收集输入框状态及 DOM 层次结构（best-effort：诊断本身绝不抛错）。"""
         try:
-            return str(await handle.evaluate(self._COMPOSER_DIAG_JS))
+            if handle is None:
+                return "（句柄为空）"
+            res = await handle.evaluate("""
+            (el) => {
+                const style = getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                const active = document.activeElement;
+                let caret_in_composer = false;
+                try {
+                    const sel = window.getSelection();
+                    if (sel && sel.rangeCount) {
+                        const node = sel.getRangeAt(0).startContainer;
+                        caret_in_composer = (node === el || el.contains(node));
+                    }
+                } catch (e) { caret_in_composer = false; }
+                return JSON.stringify({
+                    tag: el.tagName,
+                    id: el.id,
+                    className: el.className,
+                    ce: el.getAttribute('contenteditable'),
+                    aria_disabled: el.getAttribute('aria-disabled'),
+                    disabled: el.hasAttribute('disabled'),
+                    connected: el.isConnected,
+                    display: style.display,
+                    visibility: style.visibility,
+                    size: Math.round(rect.width) + 'x' + Math.round(rect.height),
+                    active: active ? active.tagName + (active.id ? '#' + active.id : '') + (active === el ? '(self)' : '') : null,
+                    caret_in_composer: caret_in_composer,
+                    child_nodes: el.childNodes.length,
+                    parent_tag: el.parentElement ? el.parentElement.tagName : null,
+                });
+            }
+            """)
+            return str(res)
         except Exception as exc:  # noqa: BLE001  拿到不到就退化成一句话
             return f"（诊断不可用：{exc}）"
 
