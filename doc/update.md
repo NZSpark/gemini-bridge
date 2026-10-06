@@ -801,3 +801,49 @@ elif fill_error is None:
 - **区分力实验**：把成功路径改回“读回不符即判失败”→ `test_lossy_readback_after_successful_fill_is_trusted`
   **failed**，日志与真机同形（`写入输入框失败（第 N/M 次…）` 两次后失败）；恢复后 33 passed。
 - **未验证**：真实网页端（需重启运行中的服务）。
+
+## 23. `[发送]` 行标注「播种 / 增量」：构建 ≠ 发送（2026-10-07）
+
+### 23.1 误读的来源
+
+用户看到这一行就以为本轮发了播种 prompt：
+
+```
+[长度] 播种内容超出 SEED_MAX_CHARS=6000：已从最旧的开始丢弃历史（保留 system=1 条 / 其余=1 条）
+```
+
+实际上它位于 `prompting.build_prompt(seed=True)` 的 `_seed_messages` 截断分支里，而
+`server.py:395` / `responses.py:294` **每轮都无条件构建两份 prompt**：
+
+```python
+delta_prompt  = build_prompt(request.messages, ...)                    # 增量
+seeded_prompt = build_prompt(..., seed=True, seed_max_chars=..., ...)  # 播种 ← 警告在这里
+prompt = seeded_prompt if driver.needs_seed(session_key) else delta_prompt
+```
+
+真正的开关是 `session_store.needs_seed(key) = not state.has_history`，而 `chat_io.send_chat`
+内部还会**再判一次**（`use_seed = not self._state(bucket).has_history`）决定 `active_prompt`。
+所以：**那一行只说明“播种 prompt 被构建了”，不说明它被发出了。**
+
+唯一会被这一行误导的真实场景是：网页页面没换（同一会话），但桥自己的 `has_history` 是 `False`
+——比如服务重启后首次请求、或桶状态被重置、或页面被回收后重开。此时确实会播种，把历史重放进
+一个**本来就还有上下文**的网页会话里（`doc/update.md` §... 会话生命周期那节的设计取舍）。
+
+### 23.2 修法
+
+`_send_chat_locked` 增加 `seeded: bool = False` 参数，日志改为：
+
+```
+[发送] bucket=default 用播种 prompt=8828 字符
+[发送] bucket=default 用增量 prompt=5407 字符
+```
+
+`send_chat` 把**与实际选择同一个变量** `use_seed` 传下去，保证标注不会与真实行为不一致。
+
+### 23.3 验收
+
+- `pytest -q` → **341 passed, 18 skipped, 31 subtests passed**。
+- 新增 `test_send_log_distinguishes_seed_from_delta`：同一个 driver 连发两次
+  （`seeded_prompt="SEED-BODY-XY"` 12 字符、增量 `delta-one`/`delta-two` 9 字符），
+  断言第一行是「用播种 prompt=12 字符」、第二行是「用增量 prompt=9 字符」——
+  **长度不同**，证明标注指向的确实是本轮真正发出的那份文本。

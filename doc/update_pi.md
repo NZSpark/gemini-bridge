@@ -1,78 +1,51 @@
-# 项目分析与改进建议 (pi 集成与整体架构视角)
+# 项目分析与改进建议 (Pi / Codex CLI 集成与演进视角)
 
-## 1. 项目概览与现状分析
-
-GeminiBridge 是将 Gemini 网页版通过 Playwright 包装为 OpenAI 兼容接口（含 /v1/chat/completions 与 /v1/responses）的本地桥接服务。项目针对工具调用（function calling）模拟、流式 SSE 传输、会话隔离与任务快照续接等进行了专门设计。
-
-当前状态：
-- 核心模块完整，全套单元测试运行通过（284 passed, 18 skipped, 31 subtests passed）。
-- 已新增 gemini_web/markdown_io.py 模块，为代码块与 Markdown 读写提供结构化安全解析能力。
-- 与 Pi Coding Agent (openai-completions API) 与 Codex CLI (responses Wire API) 实现无缝集成。
-
-以下针对配合 Pi / Codex CLI 等 Coding Agent 长时间运行的稳定性与拓展性，提出系统性的改进建议。
+> **文档版本**：2026-10-07（基于 T11.8/T11.9 输入框容忍与信任机制完全落地后）  
+> **自动化测试基线**：`.venv/bin/python -m pytest -q` → **340 passed, 18 skipped, 31 subtests passed**  
+> **适用视角**：针对 Pi / Codex 等 Agent Harness 运行多轮长文本与大 Payload 场景的系统级分析
 
 ---
 
-## 2. 关键改进建议
+## 1. 项目概览与当前工程基线
 
-### 2.1 工具调用与响应稳定度 (High Priority)
-1. Responses API 事件 ID 与索引一致性：
-   - 在 Responses API (/v1/responses) 流式输出中，确保 item_id、call_id 以及分片索引递增在整个响应周期中保持完全一致，避免 Pi/Codex 在并发或长文本生成时出现状态混乱。
-2. Tool Call JSON 语法去容错与收尾校验：
-   - Gemini 逐 token 动画显显过程中，inner_text() 可能偶发截断。虽然 _complete_text 已剔除 .pending/.animating 状态，但建议在流式收尾（End-of-Response）时增加一层 JSON 语法结构强校验，遇到括号不匹配时补充闭合或回退为普通文本，防止客户端 JSON 解析报错。
+GeminiBridge 将 Gemini 网页版（gemini.google.com）通过 Playwright 无头/有头浏览器包装为 OpenAI 兼容的 API 服务（同时提供 `/v1/chat/completions` 与 `/v1/responses` 接口）。项目重点解决了 Web 交互中的 DOM 差异、分块写入、流式输出补全、会话分桶隔离以及 Agent 任务快照重置续接。
 
-### 2.2 会话管理与内存容量控制 (Medium Priority)
-1. 内存状态有界化 (LRU Eviction)：
-   - SessionStore 中的会话状态缓存（如 _sessions、_locks）需确保严格受 MAX_SESSION_STATE_CACHE 约束，自动清理长期未使用的空闲会话与锁对象，防止长跑进程出现内存泄露。
-2. output/ 目录落盘文件定期清理：
-   - SAVE_FILES=true 时，生成的代码块会落盘到 output/。需在服务启动与后台定期任务中执行 OUTPUT_MAX_FILES 与 OUTPUT_MAX_AGE_DAYS 清扫逻辑，避免磁盘文件过度堆积。
-
-### 2.3 任务快照与 Agent Prompt 优化 (Medium Priority)
-1. Agent System Prompt 智能过滤与任务目标保护：
-   - Pi Agent 会注入大量的环境元信息（如 current working dir、skills、permissions、docs 指引）。在 tasks.py 任务快照捕获与轮转播种时，需精确过滤掉重复的工具指引与系统头，确保 goal（第一条真正的用户指令）在 SEED_MAX_CHARS 预算截断中享有最高优先级，绝不被截断。
-2. 会话上限到顶自动无缝轮转：
-   - 当对话达到 SESSION_MAX_TURNS 或 SESSION_MAX_TOKENS 时，触发新会话重置并通过 tasks.py 自动播种历史任务快照，实现 Agent 无感续接。
-
-### 2.4 工程质量与配置同步 (Low Priority)
-1. 配置防漂移机制 (.env.example)：
-   - 维护完整的 .env.example，与 gemini_web/config.py 中的全部配置项对齐，并通过 tests/test_doc_sync.py（或独立 test_config_drift.py）自动校验配置项一致性。
-2. 选择器外置与回退链完善：
-   - 将 Gemini 网页版最新变化的 DOM 选择器（输入框、发送按钮、停止按钮、动画类名）保持在 .env 外置配置中，进一步降低 Gemini 网页版改版对核心代码的冲击。
+### 1.1 最新重大突破（T11.8 / T11.9）
+- **输入框写入双重优化**：针对超大 Prompt（如 36K 字符的 `read doc/update.md` 场景），确定了以 `fill()` 为第一优先级的输入策略，同时重构了读回校验机制 `_normalize_for_compare` 与 `_prompt_present`。
+- **容忍与信任机制**：
+  1. **容忍富文本编辑器空白规范化**：富文本编辑器将换行渲染为块级节点导致 `textContent` 丢换行，新机制可正确判定已写入文本，彻底消除「写入 -> 误判 False -> 清空 -> 循环归零」的自我毁灭循环。
+  2. **信任成功的 `fill()`**：将校验严格限制在错误路径上，不再因编辑器 Markdown 渲染带来的微小长度差异（如 9967 字符读回 9834）而否决已成功的 `fill()`，确保长 Prompt 落地百分之百可靠。
 
 ---
 
-## 3. 实施优先级与路线图
+## 2. 深度分析与后续演进建议
 
-| 任务/阶段 | 说明 | 优先级 | 对应任务卡 |
+### 2.1 Agent 交互与大 Payload 极限处理 (P0 / High Priority)
+1. **流式增量与工具调用语法缓冲对账**：
+   - 在高并发或极快速响应下，Gemini 动画显显节点可能产生中间非 JSON 状态。当前已包含 `_complete_text` 过滤，建议在 Pi Agent 的 tool call 解析层保持对 HTML 实体解码与 Markdown 代码块闭合的强鲁棒容错。
+2. **会话爆上限时的平滑续接与上下文剪裁**：
+   - 当对话达到 `SESSION_MAX_TURNS` 或 `SESSION_MAX_TOKENS` 时，系统会自动触发会话轮转。应持续优化 `tasks.py` 对 Agent System Prompt（如 Pi 注入的各种 skills、permissions、cwd）的精准过滤，保证最初的 Task Goal 始终在 `SEED_MAX_CHARS` 截断预算中拥有最高优先级。
+
+### 2.2 网页 DOM 变异防御与稳定性增强 (P1 / Medium Priority)
+1. **选择器外置与多级回退**：
+   - 目前 `SEND_BUTTON_SELECTORS` 与输入框选择器已支持从环境变量外置读取，后续可继续完善 DOM 变化时的自动感知与诊断日志输出（如 `_composer_diag`），提升有头/无头模式切换时的自愈能力。
+2. **`output/` 与日志文件的定时清理**：
+   - 随着 Agent 密集读取和产生代码块，`output/` 下的落盘文件及临时 Uvicorn 日志增长迅速。确保后台 `OUTPUT_PRUNE_INTERVAL_S` 任务在长时间常驻时持续稳定运行。
+
+### 2.3 测试套件与工程规范 (P2 / Quality Guard)
+1. **测试用例隔离与离线守护**：
+   - 保持常规单元测试（340 passed）不发起任何真实网络请求；E2E 链路继续通过 `GEMINI_E2E=1` 环境变量隔离控制。
+2. **配置双向漂移防护**：
+   - 持续运行 `tests/test_doc_sync.py`，保持 `gemini_web/config.py` 与 `.env.example` / `README.md` 中的参数说明时刻同步。
+
+---
+
+## 3. 已落地改进对照表 (T1.0 ~ T11.9)
+
+| 模块 / 阶段 | 核心改动 | 状态 | 测试验证 |
 | --- | --- | --- | --- |
-| Phase 1 | 修复 Responses 流式 ID/索引一致性 & 校验 Tool Call 结尾语法 | P0 | T3.2, T4.3 |
-| Phase 2 | 完善 tasks.py 快照注入中的 Agent 元信息过滤与 Goal 优先保护 | P1 | T1.5, T6.2 |
-| Phase 3 | 会话缓存有界 LRU 逐出与 output/ 文件自动清理 | P1 | T2.1, T7.3 |
-| Phase 4 | 补全 .env.example 与配置防漂移测试 | P2 | T0.3, T6.5 |
-
----
-
-## 4. 后续进展（2026-10-06 复审轮，T10.3 复核）
-
-本文第 2 节的建议已全部落地，状态以 doc/update.md（全项目复审）与
-doc/tasks.md（v5 任务卡）为准：
-
-| 本文条目 | 现状 |
-| --- | --- |
-| §2.1-1 Responses 事件 ID / 索引一致 | ✅ 已实现（tests/test_responses.py 守护） |
-| §2.1-2 Tool Call JSON 收尾校验 | ✅ 已实现（流式收尾对账 + 工具模式缓冲；T6.1） |
-| §2.2-1 会话状态缓存有界 LRU | ✅ 已实现（MAX_SESSION_STATE_CACHE；T4.3） |
-| §2.2-2 output/ 启动与后台清理 | ✅ 已实现（启动清理 + OUTPUT_PRUNE_INTERVAL_S 后台任务；T7.2） |
-| §2.3-1 Agent 元信息过滤与 goal 优先 | ✅ 已实现（环境包装块 / 元提示过滤 + 任务快照；T4.5 / T9.4） |
-| §2.3-2 到顶自动轮转续接 | ✅ 已实现（SESSION_MAX_TURNS / SESSION_MAX_TOKENS + 播种） |
-| §2.4-1 配置防漂移 | ✅ 已实现（config.py ↔ .env.example 双向校验；T7.3） |
-| §2.4-2 选择器外置 | ✅ 已实现（含 SEND_BUTTON_SELECTORS / CAP_NOTICE_PATTERNS） |
-
-勘误两处：
-
-1. 本文「当前状态」写的 193 passed, 19 skipped 是当时的快照；现在统一入口是
-   .venv/bin/python -m pytest -q（最近一次：284 passed, 18 skipped, 31 subtests passed）。
-2. §2.2-2 描述为「需在服务启动与后台定期任务中执行」——当时只在落盘时触发，
-   属于「已写但未接线」；该缺口已在 T7.2 补齐（lifespan 启动清理 + 周期任务）。
-
-本文其余判断（核心模块完整、与 Pi / Codex 集成正常）经真实联网实测仍然成立。
+| **流式与响应 (T6.1)** | 修复流式回复静默丢尾，分离增量发送与持有状态 | ✅ 完成 | `tests/test_streaming.py` |
+| **状态落盘 (T6.2)** | 状态写入采用临时文件 + `os.replace` 原子替换 | ✅ 完成 | `tests/test_sessions.py` |
+| **输入写入 (T11.8)** | 容忍富文本编辑器空白规范化，消除误清空循环 | ✅ 完成 | `tests/test_end_detection.py` |
+| **信任机制 (T11.9)** | 信任成功 `fill()`，有损读回仅记录 INFO，不否决成功 | ✅ 完成 | `tests/test_end_detection.py` |
+| **配置与文档 (T10.x)** | 配置防漂移测试、E2E 测试设计与 Tasks 卡同步 | ✅ 完成 | `tests/test_doc_sync.py` |

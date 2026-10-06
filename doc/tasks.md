@@ -4,7 +4,7 @@
 
 状态标记：`[ ]` 未开始、`[~]` 进行中、`[x]` 完成（实现 + 验收测试齐备）。
 
-核对时间：2026-10-07（实施轮 + 随行轮 + 载体改造轮，阶段 6–11 已全部落地）；基线：`.venv/bin/python -m pytest -q` → **340 passed, 18 skipped, 31 subtests passed**（随行轮 238 → 279；E2E 重组轮 284；载体改造轮 +19 → 303；fill 重试轮 +5 → 308；长度控制核查轮 +10 → 318；长度控制修复轮 +7 → 325；分块写入轮 +4 → 329；ChatGPTBridge 方案合并轮 +4 → 333；光标与整段 fill 回退轮 +2 → 335；读回规范化容忍轮 +4 → 339；信任 fill 成功返回轮 +1 → 340）。
+核对时间：2026-10-07（实施轮 + 随行轮 + 载体改造轮，阶段 6–11 已全部落地）；基线：`.venv/bin/python -m pytest -q` → **341 passed, 18 skipped, 31 subtests passed**（随行轮 238 → 279；E2E 重组轮 284；载体改造轮 +19 → 303；fill 重试轮 +5 → 308；长度控制核查轮 +10 → 318；长度控制修复轮 +7 → 325；分块写入轮 +4 → 329；ChatGPTBridge 方案合并轮 +4 → 333；光标与整段 fill 回退轮 +2 → 335；读回规范化容忍轮 +4 → 339；信任 fill 成功返回轮 +1 → 340；发送标记播种/增量轮 +1 → 341）。
 
 **联网实测状态（见 `doc/update.md` 第 10 节，真实 Gemini 登录）**：chat（流式/非流式）、tools（流式/非流式）、Responses（流式/非流式）、长文本结束判定、多轮增量、session 分桶**均已实测通过**。两点关于 P0 的结论要分开看：
 
@@ -199,6 +199,11 @@
   - 验收：`pytest -q` → **340 passed, 18 skipped, 31 subtests**。
   - **区分力实验**：把成功路径改回“读回不符即判失败” → `test_lossy_readback_after_successful_fill_is_trusted` failed（日志与真机同形：两次 `写入输入框失败（第 N/M 次…）`）；恢复后 33 passed。
   - **未验证**：真机（需重启服务）。详见 `doc/update.md` §22。
+
+- [x] **T11.10 `[发送]` 行标注「播种 / 增量」，消除构建期日志的误读**（2026-10-07）
+  - **动因**：用户看到 `[长度] 播种内容超出 SEED_MAX_CHARS=6000` 就以为本轮发了播种 prompt，但该行位于 `prompting.build_prompt(seed=True)` 的 `_seed_messages` 截断分支里，而 `server.py` / `responses.py` **每轮都无条件构建两份 prompt**（增量 + 播种），再由 `needs_seed()` 决定发哪份。构建 ≠ 发送。
+  - 修法：`_send_chat_locked` 增加 `seeded` 参数，`[发送] bucket=X 用{播种|增量} prompt=N 字符`；`send_chat` 把 `use_seed = not has_history` 一并传下去（与实际选择同一变量，不会说一套做一套）。
+  - 验收：`pytest -q` → **341 passed**；新增 `test_send_log_distinguishes_seed_from_delta`（同一 driver 连发两次，断言第一行是「用播种 prompt=12 字符」、第二行是「用增量 prompt=9 字符」——长度不同，证明标注与实际发出的是同一份）。
 
 ---
 
