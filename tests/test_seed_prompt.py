@@ -8,6 +8,7 @@
 
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -70,12 +71,60 @@ class SeedPromptInflationTests(unittest.TestCase):
         self.assertLess(len(prompt), len(BIG_SYSTEM))
         self.assertLessEqual(limit, 12000)
 
+    def test_giant_system_message_is_clamped_even_when_per_message_limit_is_off(self):
+        """SEED_SYSTEM_MAX_CHARS=0（“不限制”）也不能让第一条巨型 system 原样进 prompt。
+
+        参照姊妹项目 ChatGPTBridge 的 `_seed_messages`：单条上限与剩余总预算取小，
+        否则一条 10 万字的系统提示会把播种变成“巨型 fill”，直接撞输入框上限。
+        """
+        with unittest.mock.patch.object(config, "SEED_SYSTEM_MAX_CHARS", 0):
+            prompt = prompting.build_prompt(
+                _codex_like_messages(), seed=True, seed_max_chars=12000
+            )
+        # 系统部分最多占一半预算（6000），再留出用户请求的位置
+        self.assertIn("系统提示已截断", prompt)
+        self.assertLess(len(prompt), 12000)
+        self.assertIn(USER_ASK, prompt)
+
     def test_delta_prompt_only_sends_new_user_message(self):
         # 非播种（已有会话）时只发增量：不应包含任何系统提示
         prompt = prompting.build_prompt(_codex_like_messages(), seed=False)
         self.assertIn(USER_ASK, prompt)
         self.assertNotIn("Codex CLI", prompt)
         self.assertNotIn("single-line task title", prompt)
+
+
+class SeedBudgetAccountingTests(unittest.TestCase):
+    """`SEED_MAX_CHARS` 的计量口径：预算只算原始文本，成品会超出（且现在有日志）。
+
+    排查结论（对应「prompt 长度控制没生效」）：播种预算在*拼装前*对原始文本计算，
+    而真正填进输入框的是**渲染后**的成品——单条最新消息就算超出预算也会被无条件保留、
+    工具结果另受 `TOOL_RESULT_MAX_CHARS` 截断、任务块与工具说明都在预算之后追加。
+    实测：`SEED_MAX_CHARS=6000` 时成品可达 27726 字符（含任务块）/ 29112（含工具声明）。
+    """
+
+    def _messages(self):
+        return [
+            ChatMessage(role="system", content="S" * 30000),
+            ChatMessage(role="user", content="请读这些文件并修 bug"),
+            ChatMessage(role="assistant", content="tool ran"),
+            ChatMessage(role="tool", content="file body line\n" * 2500, tool_call_id="c1"),
+        ]
+
+    def test_seed_truncation_is_logged_with_the_budget(self):
+        with self.assertLogs("gemini_web.prompting", level="INFO") as ctx:
+            prompting.build_prompt(self._messages(), seed=True, seed_max_chars=6000)
+        joined = "\n".join(ctx.output)
+        self.assertIn("SEED_MAX_CHARS=6000", joined)
+        self.assertIn("丢弃历史", joined)
+
+    def test_seed_budget_is_measured_before_rendering(self):
+        prompt = prompting.build_prompt(self._messages(), seed=True, seed_max_chars=6000)
+        # 口径差异：成品 > 预算（预算算的是原始文本，渲染标签/任务块/工具说明都在之后叠加）。
+        # 若将来把预算改成按成品计量，这里应改为 assertLessEqual(len(prompt), 6000)。
+        self.assertGreater(len(prompt), 6000)
+        # 但也不会无限膨胀：单条上限依然兜住了巨型内容
+        self.assertLess(len(prompt), 60000)
 
 
 class MetaPromptDetectionTests(unittest.TestCase):

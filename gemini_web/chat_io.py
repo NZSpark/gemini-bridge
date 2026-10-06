@@ -307,38 +307,266 @@ class ChatIOMixin:
         except Exception:
             return False
 
-    async def _click_send_button(self, page) -> bool:
-        """兜底：对发送按钮派发 DOM click（同样不碰 OS 焦点）。"""
+    async def _send_button(self, page):
+        """定位发送按钮（多个候选选择器依次尝试），找不到返回 None。"""
         if page is None:
-            return False
+            return None
         for selector in config.SEND_BUTTON_SELECTORS:
             try:
                 button = await page.query_selector(selector)
-                if not button:
-                    continue
-                await button.dispatch_event("click")
-                return True
+                if button:
+                    return button
             except Exception:
                 continue
+        return None
+
+    async def _click_send_button(self, page) -> bool:
+        """点发送按钮：先 Playwright 原生 `click()`（真实鼠标事件，React 才认），
+        失败再退化为 DOM `dispatch_event("click")`（同样不碰 OS 焦点）。
+
+        真实故障（用户侧观察）：输入框里已有文字，但发送按钮没被点，网页不再产生回复。
+        原因就是旧实现里 `_dispatch_enter` 无论网页有没有接受按键都返回 true，
+        函数直接 return，**从不**走到这里。
+
+        ``click()`` 需要按钮处于 enabled 状态；按钮被禁用时它会超时——那正是
+        「编辑器还在处理长文本」的信号，在这里会被记成失败并进入下一次尝试。
+        """
+        button = await self._send_button(page)
+        if button is None:
+            return False
+        timeout = config.FILL_TIMEOUT_MS or 5000
+        try:
+            await button.click(timeout=timeout)
+            return True
+        except Exception as exc:  # noqa: BLE001  含禁用/不可见导致的超时
+            logger.debug("发送按钮原生 click 失败（%s），改用 DOM 事件", exc)
+        try:
+            await button.dispatch_event("click")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("发送按钮 DOM click 也失败：%s", exc)
+            return False
+
+    async def _send_button_state(self, page) -> str:
+        """发送按钮的可用性（best-effort 诊断）。"""
+        button = await self._send_button(page)
+        if button is None:
+            return "未找到发送按钮"
+        try:
+            return str(await button.evaluate(self._BUTTON_STATE_JS))
+        except Exception as exc:  # noqa: BLE001
+            return f"（按钮状态不可读：{exc}）"
+
+    async def _composer_text(self, chat_input) -> Optional[str]:
+        """读取输入框当前文本（best-effort；读不到返回 None，表示“无法判断”）。"""
+        if chat_input is None:
+            return None
+        try:
+            text = await chat_input.evaluate(self._COMPOSER_TEXT_JS)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("读取输入框文本失败：%s", exc)
+            return None
+        return text if isinstance(text, str) else None
+
+    async def _prompt_submitted(self, page, chat_input, bucket: Optional[str] = None) -> Optional[bool]:
+        """刚才那次提交是否真的生效？None = 无法判断（不据此报错）。
+
+        判据（满足其一即为已提交）：
+
+        * **输入框已清空**——网页接受了这条消息，最直接的证据；
+        * 页面进入「生成中」（停止按钮出现）。
+
+        读不到输入框内容（页面差异 / 元素不可读）时返回 None，调用方按“无法验证”
+        处理，不把页面差异当成提交失败。
+        """
+        text = await self._composer_text(chat_input)
+        if text is None:
+            return None
+        if not text.strip():
+            return True
+        if await self._page_is_generating(bucket or DEFAULT_SESSION_KEY):
+            return True
         return False
 
-    async def _submit_prompt(self, page, chat_input) -> None:
-        """提交 prompt：先派发 Enter，无效再点发送按钮。全程无窗口焦点依赖。"""
-        if await self._dispatch_enter(chat_input):
-            return
-        if not await self._click_send_button(page):
-            raise RuntimeError(
-                "无法提交 prompt：输入框 Enter 事件无效，且未找到发送按钮。"
+    async def _wait_submitted(self, page, chat_input, bucket: Optional[str] = None) -> Optional[bool]:
+        """等待「已提交」的迹象，最长 ``SUBMIT_VERIFY_MS``。
+
+        为什么不能只读一次：Enter 派发后，网页要先更新内部状态、清空输入框、
+        再开始生成，都有延迟；立即读会看到「输入框里还有字」而误判成没提交。
+        若**根本读不到**输入框内容（None），立即返回 None：无法验证就不该空等。
+        """
+        deadline = asyncio.get_event_loop().time() + max(0.0, config.SUBMIT_VERIFY_MS / 1000.0)
+        while True:
+            submitted = await self._prompt_submitted(page, chat_input, bucket)
+            if submitted is None:
+                return None
+            if submitted or asyncio.get_event_loop().time() >= deadline:
+                return submitted
+            await asyncio.sleep(0.1)
+
+    # 读取输入框当前文本：textarea 用 value，contenteditable 用 textContent
+    # （不用 innerText：它遵循“渲染后可见性”，窗口不可见时会读到空串，
+    #  会让「输入框已清空」的判定变成假阳性）。
+    _COMPOSER_TEXT_JS = """
+    (el) => {
+      if (typeof el.value === 'string') return el.value;
+      return el.textContent || el.innerText || '';
+    }
+    """
+
+    # 发送按钮的可用性（诊断用）
+    _BUTTON_STATE_JS = """
+    (el) => JSON.stringify({
+      aria_label: el.getAttribute('aria-label'),
+      disabled: el.disabled === true || el.getAttribute('aria-disabled') === 'true',
+      connected: el.isConnected,
+      size: (() => { const r = el.getBoundingClientRect();
+                     return Math.round(r.width) + 'x' + Math.round(r.height); })(),
+    })
+    """
+
+    # 输入框写入失败时的诊断脚本：把“为什么不可编辑”留下来，而不是只丢一个
+    # Playwright 超时。字段都是 DOM 事实，不依赖具体选择器。
+    _COMPOSER_DIAG_JS = """
+    (el) => {
+      const style = getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      const active = document.activeElement;
+      return JSON.stringify({
+        tag: el.tagName,
+        ce: el.getAttribute('contenteditable'),
+        aria_disabled: el.getAttribute('aria-disabled'),
+        disabled: el.hasAttribute('disabled'),
+        connected: el.isConnected,
+        display: style.display,
+        visibility: style.visibility,
+        size: Math.round(rect.width) + 'x' + Math.round(rect.height),
+        active: active ? active.tagName + (active === el ? '(self)' : '') : null,
+      });
+    }
+    """
+
+    async def _locate_input(self, page):
+        """定位对话输入框：最多 3 轮 × 逐个候选选择器。
+
+        只做 DOM 查询与重试，绝不 bring_to_front / focus：那会抢 OS 前台、
+        干扰用户正在使用的其它窗口；而提交走页面内事件派发（见 _submit_prompt），
+        本就不依赖窗口是否在前台。
+        """
+        for _round in range(3):
+            for selector in config.INPUT_SELECTORS:
+                try:
+                    node = await page.wait_for_selector(selector, timeout=2000)
+                    if node:
+                        return node
+                except Exception:
+                    continue
+        return None
+
+    async def _composer_diag(self, handle) -> str:
+        """收集输入框状态（best-effort：诊断本身绝不抛错）。"""
+        try:
+            return str(await handle.evaluate(self._COMPOSER_DIAG_JS))
+        except Exception as exc:  # noqa: BLE001  拿到不到就退化成一句话
+            return f"（诊断不可用：{exc}）"
+
+    async def _fill_prompt(self, page, prompt: str):
+        """把 prompt 写进输入框，返回可提交的句柄；每次尝试都**重新定位**。
+
+        为什么不是“定位一次 + 一次 fill”（参照姊妹项目 ChatGPTBridge 的
+        FILL_TIMEOUT_MS / FILL_RETRIES）：
+
+        * ``fill`` 默认超时 30s。网页版重挂载 composer 后，我们手里的旧句柄会
+          一直卡在“等它变得可见/可编辑”上直到超时——整轮请求直接失败，而客户端
+          重试又拿到同样的失效句柄，把窗口期全部耗光（真实故障已复现）；
+        * 所以每次尝试都重新定位（拿到重挂载后的新节点），单次超时收紧到
+          ``FILL_TIMEOUT_MS``，失败后按 ``RETRY_BACKOFF_S`` 退避再试，
+          最多 ``FILL_RETRIES`` 次；仍不行才报错，并附上输入框诊断。
+        """
+        attempts = max(1, config.FILL_RETRIES)
+        timeout = config.FILL_TIMEOUT_MS or None
+        last_error: Optional[Exception] = None
+        for attempt in range(1, attempts + 1):
+            chat_input = await self._locate_input(page)
+            if chat_input is None:
+                last_error = RuntimeError("选择器均未命中输入框")
+                logger.warning("写入输入框失败（第 %s/%s 次）：找不到输入框", attempt, attempts)
+            else:
+                try:
+                    await chat_input.fill(prompt, timeout=timeout)
+                    return chat_input
+                except Exception as exc:  # noqa: BLE001  Playwright TimeoutError 等
+                    last_error = exc
+                    logger.warning(
+                        "写入输入框失败（第 %s/%s 次，prompt %s 字符）：%s；输入框状态=%s",
+                        attempt, attempts, len(prompt), exc,
+                        await self._composer_diag(chat_input),
+                    )
+            if attempt < attempts:
+                await asyncio.sleep(max(0.0, config.RETRY_BACKOFF_S))
+        raise RuntimeError(
+            f"写入输入框连续失败 {attempts} 次（单次超时 {config.FILL_TIMEOUT_MS}ms）："
+            "命中的元素始终不处于「可见 / 可编辑」状态。常见原因：登录态失效或被风控"
+            "拦住、页面停在非对话视图、有头模式下窗口失焦后输入框被懒卸载"
+            "（可试 HEADLESS=1），或单个 prompt 超出输入框字符上限"
+            "（可调小 PROMPT_MAX_CHARS / TOOL_RESULT_MAX_CHARS）。"
+        ) from last_error
+
+    async def _submit_prompt(self, page, chat_input, bucket: Optional[str] = None) -> None:
+        """提交 prompt，并**确认它真的发出去了**（全程无窗口焦点依赖）。
+
+        为什么必须确认（用户报告的真实故障）：`_dispatch_enter` 内嵌的 JS 只要把事件
+        派发出去就 `return true`，而旧实现据此直接 `return`——**永远走不到点击发送按钮的
+        兑底路径**。当网页没接住这个合成按键时（长文本刚 `fill` 进去、编辑器还没接管，
+        或发送按钮处于 disabled），输入框里就是“文字在、消息没发”，网页不产生任何回复，
+        客户端只能干等到超时（用户侧看到的就是“prompt 在输入框里但没发送”）。
+
+        阶梯（每次尝试后都用 `_wait_submitted` 验证）：
+          1. 派发 Enter；
+          2. 点真正的发送按钮（先原生 click，再 DOM click）；
+          3. 再派发一次 Enter（给编辑器消化大文本留出时间）。
+        三次都验证不到提交 -> 抛可行动错误（附按钮状态），不再静默等待。
+        """
+        plan = ("Enter", "发送按钮", "Enter")
+        last_detail = "（未知）"
+        for index, action in enumerate(plan, start=1):
+            if action == "Enter":
+                await self._dispatch_enter(chat_input)
+            else:
+                await self._click_send_button(page)
+            submitted = await self._wait_submitted(page, chat_input, bucket)
+            if submitted is not False:
+                if index > 1:
+                    logger.info("[提交] 第 %s 次尝试（%s）成功。", index, action)
+                return
+            remaining = await self._composer_text(chat_input)
+            last_detail = (
+                f"输入框仍有 {len(remaining)} 字符" if remaining is not None else "无法读取输入框"
             )
+            logger.warning(
+                "[提交] 第 %s/%s 次尝试（%s）无效：%s；发送按钮=%s",
+                index, len(plan), action, last_detail, await self._send_button_state(page),
+            )
+        raise RuntimeError(
+            f"prompt 已写入输入框但未能提交（尝试 {len(plan)} 次：Enter → 发送按钮 → Enter）；"
+            f"{last_detail}。常见原因：发送按钮处于 disabled（编辑器还在消化长文本/粘贴）、"
+            "页面停在非对话视图，或按键被网页忽略。可调大 SUBMIT_VERIFY_MS；"
+            "若与长 prompt 相关，可调小 PROMPT_MAX_CHARS / TOOL_RESULT_MAX_CHARS。"
+        )
 
     @staticmethod
     def _clamp_prompt(prompt: str) -> str:
         """发送侧最后一道护栏：把整段 prompt 压到输入框能承受的字符上限内。
 
-        Gemini 网页版 composer 有字符上限，超出后 Playwright ``fill`` 会超时
-        （ElementHandle.fill: Timeout 30000ms exceeded）。这里保留**头部**
-        （系统/工具说明、任务目标通常在前）与**尾部**（最新用户指令）各一半，
-        中间截断并标注，保证最新指令一定送达。
+        诚实标注：这里的阈值**是实测过的**了（T11.3 真机探测，见
+        ``tests/e2e/probe_prompt_limit.py`` 与 doc/update.md §16）：composer 能吃下
+        20K / 60K / 100K 字符的单条 prompt（含 5×20KB 工具结果的 100KB prompt），
+        因此 ``PROMPT_MAX_CHARS`` 不是「输入框物理上限」，而是**我们主动设的预算**；
+        真正让它生效的地方在 ``prompting.build_prompt``（拼装即按预算告警），
+        这里只是最后兜底。
+
+        触发时**必定留一条 warning**（此前静默）：它意味着中间有一段内容真的被切掉了，
+        工具结果可能被拦腰截断，模型可能因此答非所问——不看日志就无从察觉。
         """
         limit = config.PROMPT_MAX_CHARS
         if not limit or len(prompt) <= limit:
@@ -346,6 +574,11 @@ class ChatIOMixin:
         head = limit // 2
         tail = limit - head
         dropped = len(prompt) - limit
+        logger.warning(
+            "[截断] prompt %s 字符超出 PROMPT_MAX_CHARS=%s：已省略中间 %s 字符"
+            "（保留头部 %s + 尾部 %s）。工具结果可能被拦腰截断，模型可能答非所问。",
+            len(prompt), limit, dropped, head, tail,
+        )
         return (
             prompt[:head]
             + f"\n\n…（prompt 过长，已省略中间 {dropped} 字符）\n\n"
@@ -368,22 +601,9 @@ class ChatIOMixin:
                 raise RuntimeError("浏览器尚未初始化：找不到可用于发送的会话页面。")
             self._touch_page(bucket)  # 正在用的页面不会被空闲回收 / LRU 淘汰
 
-            # 1. 定位输入框。只做 DOM 查询与重试，绝不 bring_to_front / focus：
-            #    那会抢 OS 前台、干扰用户正在使用的其它窗口；而提交走页面内
-            #    事件派发（见 _submit_prompt），本就不依赖窗口是否在前台。
-            chat_input = None
-            for attempt in range(3):
-                for selector in config.INPUT_SELECTORS:
-                    try:
-                        chat_input = await page.wait_for_selector(selector, timeout=2000)
-                        if chat_input:
-                            break
-                    except Exception:
-                        continue
-                if chat_input:
-                    break
-
-            if not chat_input:
+            # 1. 先确认输入框存在（快速失败，给出明确的“没登录/没打开”提示）；
+            #    真正写入时还会在 _fill_prompt 里**每次尝试重新定位一次**。
+            if not await self._locate_input(page):
                 raise RuntimeError("无法找到对话输入框，请检查 Gemini 网页是否打开或处于登录状态。")
 
             # 记录发送前最后一条回复的文本，用来判断“新回复是否已经出现”。
@@ -402,8 +622,11 @@ class ChatIOMixin:
                 before_text = ""
 
             prompt = self._clamp_prompt(prompt)
-            await chat_input.fill(prompt)
-            await self._submit_prompt(page, chat_input)
+            # 每次发送都留一行长度：这是回答「长 prompt 是否导致上游不响应」的现场证据
+            # （此前只有失败时才打印长度，成功发出的那条到底多长无从得知）。
+            logger.info("[发送] bucket=%s prompt=%s 字符", bucket, len(prompt))
+            chat_input = await self._fill_prompt(page, prompt)
+            await self._submit_prompt(page, chat_input, bucket)
 
             # 2. 轮询等待回复完成
             await asyncio.sleep(config.POLL_INTERVAL_S)
@@ -537,7 +760,8 @@ class ChatIOMixin:
                         raise self._context_limit_error()
                     raise GeminiTimeoutError(
                         f"页面连续 {stalled} 次未产生任何回复内容（疑似未登录或会话失效），"
-                        "已提前中止。请检查 Gemini 登录状态或 RESPONSE_SELECTORS 配置。"
+                        f"已提前中止。本轮 prompt {len(prompt)} 字符。"
+                        "请检查 Gemini 登录状态或 RESPONSE_SELECTORS 配置。"
                     )
 
                 if config.DEBUG:
@@ -560,6 +784,7 @@ class ChatIOMixin:
                         raise self._context_limit_error()
                     raise GeminiTimeoutError(
                         f"等待 Gemini 响应超时（{int(config.RESPONSE_TIMEOUT_S)}s）。"
+                        f"本轮 prompt {len(prompt)} 字符。"
                     )
 
                 await asyncio.sleep(config.POLL_INTERVAL_S)

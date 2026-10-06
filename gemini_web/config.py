@@ -190,12 +190,29 @@ SEED_MAX_CHARS = env_int("SEED_MAX_CHARS", 12000)
 # 会把简单请求灌成一大段系统提示。超出即截断。0 = 不限制（不推荐）。
 SEED_SYSTEM_MAX_CHARS = env_int("SEED_SYSTEM_MAX_CHARS", 2000)
 # 单条 tool 结果（role=="tool"）注入 prompt 时的最大字符数。
-# Codex/Pi 的 read 结果动辄几十万字符，直接 fill 会撑爆 Gemini 网页版输入框
-# （Playwright fill 超时）。超出即截断并标注。0 = 不限制（不推荐）。
-TOOL_RESULT_MAX_CHARS = env_int("TOOL_RESULT_MAX_CHARS", 20000)
+# Codex/Pi 的 read 结果动辄几十万字符，直接 fill 会撑爆网页版输入框。
+# 超出即**只保留开头一段**并标注“已截断 N 字符”（模型据此知道自己看到的是片段）。
+# 50K：用户定的上限（够放下一份完整的大文件/日志开头，又不至于单条就吃掉整段预算）。
+# 多条结果合计另有成品预算：拼装后超过 PROMPT_MAX_CHARS 时按 `prompting._fit_segments_to_budget`
+# 继续压缩（同样只留开头 + 标注）。0 = 不限制（不推荐）。
+TOOL_RESULT_MAX_CHARS = env_int("TOOL_RESULT_MAX_CHARS", 50000)
 # 单次 fill() 入参（整段 prompt）的最大字符数硬上限，兜底防止输入框溢出。
 # 这是发送侧最后一道护栏：无论上游怎么拼 prompt，都不超过它。0 = 不限制。
 PROMPT_MAX_CHARS = env_int("PROMPT_MAX_CHARS", 100000)
+# 单次 ``fill()`` 的超时（毫秒）。Playwright 默认 30s：网页版每次重挂载 composer
+# 都会换掉节点，而我们手里的旧句柄会一直停在“等它变得可见/可编辑”上直到 30s 超时
+# （真实故障：ElementHandle.fill: Timeout 30000ms exceeded，客户端连试 4 次、
+# 每次白等 30s，整个窗口期全丢）。收紧到秒级，失败就重新定位再试。
+FILL_TIMEOUT_MS = env_int("FILL_TIMEOUT_MS", 10000)
+# ``fill`` 的重试次数；**每次尝试都重新定位输入框**，专门针对 React 重挂载导致的
+# 失效句柄。参照姊妹项目 ChatGPTBridge 的同名开关（chatgpt_web/chat_io.py 的
+# FILL_TIMEOUT_MS / FILL_RETRIES）。退避复用 RETRY_BACKOFF_S。
+FILL_RETRIES = env_int("FILL_RETRIES", 3)
+# 提交（Enter / 点发送按钮）后：等待「输入框已清空 / 页面已开始生成」的最长时间（毫秒）。
+# 真实故障：文字已经在输入框里，但消息**没被提交**（旧实现里 Enter 派发后无条件认为成功，
+# 从不点发送按钮），网页不产生任何回复，客户端干等到超时。现在每次尝试后都要验证，
+# 最长等这么久；读不到输入框内容时不做判断（不空等）。
+SUBMIT_VERIFY_MS = env_int("SUBMIT_VERIFY_MS", 3000)
 # 网页会话超过以下任一阈值后，下一轮自动轮转到新会话（0 表示禁用该维度）
 SESSION_MAX_TURNS = env_int("SESSION_MAX_TURNS", 60)
 SESSION_MAX_TOKENS = env_int("SESSION_MAX_TOKENS", 60000)

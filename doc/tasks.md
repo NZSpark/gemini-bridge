@@ -4,7 +4,7 @@
 
 状态标记：`[ ]` 未开始、`[~]` 进行中、`[x]` 完成（实现 + 验收测试齐备）。
 
-核对时间：2026-10-07（实施轮 + 随行轮 + 载体改造轮，阶段 6–11 已全部落地）；基线：`.venv/bin/python -m pytest -q` → **303 passed, 18 skipped, 31 subtests passed**（随行轮 238 → 279；E2E 重组轮 284；载体改造轮 +19 用例 → 303）。
+核对时间：2026-10-07（实施轮 + 随行轮 + 载体改造轮，阶段 6–11 已全部落地）；基线：`.venv/bin/python -m pytest -q` → **325 passed, 18 skipped, 31 subtests passed**（随行轮 238 → 279；E2E 重组轮 284；载体改造轮 +19 → 303；fill 重试轮 +5 → 308；长度控制核查轮 +10 → 318；长度控制修复轮 +7 → 325）。
 
 **联网实测状态（见 `doc/update.md` 第 10 节，真实 Gemini 登录）**：chat（流式/非流式）、tools（流式/非流式）、Responses（流式/非流式）、长文本结束判定、多轮增量、session 分桶**均已实测通过**。两点关于 P0 的结论要分开看：
 
@@ -135,6 +135,32 @@
   - 交付物：`doc/code_block_fence.md`（机制、真假附件对照、兼容矩阵、残留与后续方向）+ 固化样本用例 + 探测脚本。
   - 未联网验证（按定向口径）：A4 / B1 / B4 / B6 / D1–D3 / B8 / `test_markdown_io_e2e` 本轮未跑（代码未改动）。
 
+- [x] **T11.2 修复「写入输入框超时」导致整轮请求失败**（2026-10-07，真实故障）—— **已实施**
+  - 现象（用户侧真实报错）：`ElementHandle.fill: Timeout 30000ms exceeded`，连续 4 次（04:35:06 / 04:35:54 / 04:36:39 / 04:37:27），每次白等 30s；客户端那段窗口期的工具结果请求全丢。
+  - 诊断：Playwright `fill` 默认超时 30s，而旧实现「只定位一次句柄 + 一次 fill、失败就整轮报错」；网页版重挂载 composer 后旧句柄会一直卡在“等它可见/可编辑”上。已排除的假设：**不是** prompt 过长——本次失败 prompt 仅 21.9KB，而 `PROMPT_MAX_CHARS=100000` 根本没有触发截断。
+  - 方案（参照姊妹项目 ChatGPTBridge 的 `FILL_TIMEOUT_MS` / `FILL_RETRIES`）：新增 `FILL_TIMEOUT_MS`（默认 10000）与 `FILL_RETRIES`（默认 3）；`_fill_prompt` **每次尝试都重新定位输入框**（拿到重挂载后的新节点），失败按 `RETRY_BACKOFF_S` 退避再试；仍失败则报可行动的错误（不再只丢 Playwright 原文），并附**输入框状态诊断**（tag / contenteditable / aria-disabled / isConnected / display / 尺寸 / activeElement）。
+  - 顺带夹带：参照同一份 `prompting.py` 的 `_seed_messages`，给 `SEED_SYSTEM_MAX_CHARS=0`（“不限制”）补上“单条上限与剩余总预算取小”——否则一条 10 万字系统提示会原样进 prompt。
+  - 验收：`pytest -q` → **308 passed, 18 skipped, 31 subtests**；新增 `FillRetryTests`（4 例：重定位后成功 / 每次都用配置的超时 / 连续失败后报错且只试 FILL_RETRIES 次 / 失败日志含诊断）与 `test_giant_system_message_is_clamped_even_when_per_message_limit_is_off`；**区分力实验**：换回改动前的 `chat_io.py` → 4 failed。
+
+- [x] **T11.3 核查「prompt 长度控制没生效」：把长度链改成可观测（2026-10-07，用户报告）** —— **已实施**
+  - 报告：prompt 长度控制没生效，太长的 prompt 让 Gemini 失去响应；要求检查为什么改动无效。
+  - **先证伪**：控制没有被绕过（全仓唯一 `fill` 点在 `chat_io._send_chat_locked`，`_clamp_prompt` 必定执行；四个旋钮都真的被读到）。失效的是**计量口径 + 可观测性**：单条预算/原始文本预算管不到拼装后的成品、多条工具结果无总量预算、`role="user"` 无上限、而唯一的兜底（`PROMPT_MAX_CHARS` 头尾截断）**一行日志都不留**。
+  - **真机实测（新增 `tests/e2e/probe_prompt_limit.py`）**：20K / 60K / 100K 字符单条 prompt、5×20KB 工具结果（100,080 字符，被兜底截到 100,030）、同一会话连发 3 轮 ×60KB —— 全部 200 OK 且答对（17.6–24.9s）。即**在桥能发出的范围内没能复现「长 prompt → 失去响应」**；`PROMPT_MAX_CHARS` 是主动预算，不是 composer 物理上限（旧 docstring 的“输入框字符上限”说法无依据，已改）。
+  - 实现（纯可观测性，不改裁剪行为）：`_clamp_prompt` 截断记 WARNING；每次发送记 `[发送] … prompt=N 字符`；两条超时错误带 prompt 长度；`build_prompt` 拼装即超预算时记 WARNING（点名历史/工具结果/工具说明各占多少）；播种截断记 INFO。
+  - 验收：`pytest -q` → **318 passed, 18 skipped, 31 subtests**（新增 10 例：`PromptBudgetObservationTests` 4 / `SeedBudgetAccountingTests` 2 / `PromptLengthGuardTests` 3 / 发送长度 1）。真机结果落 `output/prompt_limit_probe.txt`。
+  - 已由 T11.4 落地：预算改为「只留开头 + 标注截短」（不整块丢掉），`TOOL_RESULT_MAX_CHARS` 20000 → 50000。仍未动：`SESSION_MAX_TOKENS=1000000` 是按模型容量而非网页版响应性测出来的。详见 `doc/update.md` §16 / §17。
+  - 真机冒烟：重启服务后一发短 prompt → HTTP 200 / 17.8s / `bridge fill ok`（快乐路径未触发重试，符合预期）。
+  - **未能复现验证**：原故障依赖“composer 正好处于失效句柄状态”，本轮无稳定复现手法；重试路径由假 page 单测覆盖，真机上只验证了不影响正常发送。
+
+- [x] **T11.4 修复「文字进了输入框但消息没被提交」+ 成品预算真正落地**（2026-10-07，用户报告）—— **已实施**
+  - 现象（用户侧观察）：prompt 已经在网页输入框里，但**发送按钮没有被点击**（或点了无响应），客户端收不到任何回应。
+  - 真因：`chat_io._dispatch_enter` 的 JS 只要把 `KeyboardEvent` 派发出去就 `return true`，而旧 `_submit_prompt` 据此**直接 return**——`_click_send_button` 的兜底路径**从未被执行过**；网页没接住合成按键时就是「文字在、消息没发、页面不产生回复」，客户端干等到超时。
+  - 修法：`_submit_prompt` 阶梯改为 **Enter → 发送按钮 → Enter**，每次尝试后用 `_prompt_submitted` 验证（**输入框已清空**或页面进入「生成中」；读不到则 `None` = 无法判断、不据此报错，也不空等）；`_click_send_button` 先原生 `click()`（真实鼠标事件）再退化为 DOM click；三次都失败抛可行动 `RuntimeError`（含输入框剩余字符数与按钮状态）；新增配置 `SUBMIT_VERIFY_MS`（默认 3000）。
+  - 预算落地（用户定策略：超长结果**不是整块丢掉**，而是只留前边一段 + 在 prompt 里说明已截短）：`TOOL_RESULT_MAX_CHARS` **20000 → 50000**；新增 `prompting._fit_segments_to_budget`——成品超过 `PROMPT_MAX_CHARS` 时，每轮挑**当前最长**的工具结果砍半（同长时先压最旧的），直到进预算或到 `MIN_TOOL_RESULT_KEEP_CHARS=2000` 下限，每段都带「结果太长已被截短」标注。
+  - 实测（离线，50K/100K）：1 条 50KB → 50,032 字符；2 条 50KB（100,066）→ 75,069；3 条 50KB（150,100）→ 75,109；6 条 50KB（300,202）→ 87,720；1 条 80KB → 50,035；每段开头都保住且都带截断标注。
+  - 验收：`pytest -q` → **325 passed, 18 skipped, 31 subtests**（新增 `SubmitVerificationTests` 4 例 + 预算落地用例）；**区分力实验**：换回旧 `chat_io.py` → `SubmitVerificationTests` + `PromptLengthGuardTests` **4 failed**，恢复后 18 passed。
+  - **未真机验证**：曾以隔离 profile 副本 + 独立端口 8011 起第二实例做端到端验证，被用户中止（已清理，未触碰 8001 实例）。提交阶梯与压缩的真实网页行为目前只有假 page 单测 + 离线实测覆盖；运行中的实例需**重启**才会带上本轮修复与新日志。
+
 ---
 
 ## 推荐执行顺序
@@ -148,7 +174,7 @@
 | Phase 5 | T8.1 / T8.4 / T8.5 / T8.6 / T8.7 / T8.8 | ✅ 已完成（日志改造 / 依赖固定 / CI / 框架统一 / context_window / 注释） |
 | Phase 6 | T8.9 / T8.10 | ✅ 已完成（安全加固：edit_markdown 路径约束、可选 BRIDGE_TOKEN） |
 | 随行 | T9.3 / T9.4 / T9.5 / T10.3 | ✅ 已完成（responses 路由级测试 / tasks 表驱动单测 / 鉴权分支测试 / 历史文档复核） |
-| Phase 7 | T11.1 | ✅ 已完成（工具调用载体改造：标记行 + 代码围栏；真机证伪了“纯围栏”方案） |
+| Phase 7 | T11.1 / T11.2 / T11.3 / T11.4 | ✅ 已完成（工具调用载体改造：标记行 + 代码围栏；fill 超时/重试修复；长度链可观测性；提交链修复 + 成品预算落地） |
 
 > 阶段 6–11 至此全部完成。后续若要继续推进，建议方向见 `doc/update.md` 的“仍未做”与 §8.1 / §4
 > 对照表中明确标注的「仍未做」两项（`ReplyWatcher` 重构、真实环境专属交付物）。

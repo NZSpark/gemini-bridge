@@ -189,8 +189,10 @@ codex --profile gemini
 | `SESSION_KEY_MAX_LEN` | `64` | 分桶键长度上限 |
 | `SEED_MAX_CHARS` | `12000` | 轮转播种字符预算 |
 | `SEED_SYSTEM_MAX_CHARS` | `2000` | 播种时单条 system 消息的字符上限（harness 每轮注入的系统提示会被截断） |
-| `TOOL_RESULT_MAX_CHARS` | `20000` | 单条 tool 结果注入 prompt 的最大字符数（0 不限） |
-| `PROMPT_MAX_CHARS` | `100000` | 单次 fill() 入参硬上限，兜底防输入框溢出（0 不限） |
+| `TOOL_RESULT_MAX_CHARS` | `50000` | **单条** tool 结果注入 prompt 的最大字符数：超出只保留开头一段并标注“已截断 N 字符”（0 不限）。多条合计另有成品预算：超过 `PROMPT_MAX_CHARS` 时按同样的“留开头 + 标注”策略继续压缩 |
+| `PROMPT_MAX_CHARS` | `100000` | 单次 fill() 入参上限（我们设的预算，不是输入框物理上限：实测 20K/60K/100K 都能正常收发，见 `tests/e2e/probe_prompt_limit.py`）；超出时头尾各半、中间截断并记 WARNING（0 不限） |
+| `FILL_TIMEOUT_MS` | `10000` | 单次 `fill()` 超时（毫秒）；失败会重新定位输入框并重试 |
+| `FILL_RETRIES` | `3` | `fill` 重试次数（每次重新定位，规避重挂载导致的失效句柄） |
 | `SESSION_MAX_TURNS` | `60` | 轮数到顶阈值（0 禁用） |
 | `SESSION_MAX_TOKENS` | `60000` | 估算 token 到顶阈值（0 禁用） |
 

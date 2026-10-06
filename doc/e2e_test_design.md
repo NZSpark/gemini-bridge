@@ -158,7 +158,7 @@ E2E_PORT=8001    # bridge 端口（默认取 .env 的 PORT）
 E2E_FULL=1       # 额外启用 B8（openai SDK 联调）
 ```
 
-- 未设置 `GEMINI_E2E=1` 时全部 **skip**，常规套件（`pytest -q`，303 passed / 18 skipped）不受影响、不发起任何网络请求。
+- 未设置 `GEMINI_E2E=1` 时全部 **skip**，常规套件（`pytest -q`，325 passed / 18 skipped）不受影响、不发起任何网络请求。
 - bridge 子进程日志：临时目录 `gemini_e2e_uvicorn.log`（失败时查看）。
 
 ### 4.1 定向运行：只跑改动过的用例
@@ -194,6 +194,22 @@ PROBE_ARMS=hybrid,fence   # 只跑部分臂
 
 **关键约束**：探测**不带 `tools`**（桥就不会注入自己的格式指令），否则脚本指令与桥注入互相抢方向盘，
 会得到与前次相反的假结果（姊妹项目 ChatGPTBridge 复现过这种污染）。机制与真机数据见 `doc/code_block_fence.md`。
+
+### 4.3 prompt 长度探测（手工脚本，不进 pytest 收集）
+
+回答「多长的 prompt 会让网页版失去响应」以及「长度控制到底生效在哪里」。
+脚本只发 HTTP，**不自己拉起服务**（避免抢同一个浏览器 profile），每个用例独占一个会话桶。
+
+```bash
+# 针对正在运行的服务（默认 127.0.0.1:8001）：5 个用例，每个用例 1–3 条真实网页请求
+.venv/bin/python -m tests.e2e.probe_prompt_limit
+PROBE_CASES=filler-100k,tools-5x20k .venv/bin/python -m tests.e2e.probe_prompt_limit   # 只跑部分
+# → output/prompt_limit_probe.txt
+```
+
+用例：`filler-20k` / `filler-60k` / `filler-100k`（单条长 prompt）、`tools-5x20k`（5×20KB 工具结果，
+真实流量形状）、`repeat-60k-x3`（同一会话连发 3 轮，验证累积效应）。实测结果与结论见 `doc/update.md` §16；
+**已知限制**：服务端日志需由被探测的实例自己打印，探测脚本只能看到 HTTP 侧（状态/耗时/内容）。
 
 ---
 
