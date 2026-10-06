@@ -656,6 +656,12 @@ class _ChunkyInput:
         if "el.value" in script:  # _COMPOSER_TEXT_JS
             if self.page.unreadable:
                 return True
+            if self.page.normalize_on_read:
+                # 编辑器把换行渲染成块级节点：读回时换行消失
+                return self.store["text"].replace("\n", " ")
+            if self.page.lossy_readback:
+                # 更接近真机：换行被渲染掉 + markdown 标记被拿掉 → 读回明显变短
+                return self.store["text"].replace("\n", "").replace("**", "")
             return self.store["text"]
         if "activeElement" in script:  # _IS_ACTIVE_JS
             return True
@@ -668,11 +674,14 @@ class _ChunkyInput:
         return True
 
     async def fill(self, text, timeout=None):
-        # 旧的“整段一次写入”：在长文本下一律报超时（正是真机故障）
+        # 整段一次写入。fill_writes_then_raises 模拟**真机签名**：文本其实已经写进去了
+        # （真机上输入框长出了 child_nodes: 616），fill 却报超时。
         self.page.whole_fills += 1
-        if len(text) > self.page.max_chunk:
+        if len(text) > self.page.max_chunk and not self.page.fill_writes_then_raises:
             raise TimeoutError("waiting for element to be visible, enabled and editable")
         self.store["text"] = text
+        if self.page.fill_writes_then_raises:
+            raise TimeoutError("waiting for element to be visible, enabled and editable")
         return None
 
     async def dispatch_event(self, name):
@@ -684,7 +693,8 @@ class _ChunkyPage(FakePage):
 
     def __init__(
         self, *, max_chunk=4000, fail_at=None, unreadable=False, enter_works=True,
-        require_caret=True, ignore_inserts=False,
+        require_caret=True, ignore_inserts=False, fill_writes_then_raises=False,
+        normalize_on_read=False, lossy_readback=False,
     ):
         super().__init__(
             baseline=["旧"], script=[["新答案"], ["新答案"]],
@@ -715,6 +725,12 @@ class _ChunkyPage(FakePage):
         self.silent_noops = 0
         # 真机故障模型：两种原语都静默失效（连光标也救不了），用于验证整段 fill 回退。
         self.ignore_inserts = ignore_inserts
+        self.fill_writes_then_raises = fill_writes_then_raises
+        # 真机现象：富文本编辑器把换行渲染成块级节点，读回的 textContent 不含换行。
+        self.normalize_on_read = normalize_on_read
+        # 真机现象：编辑器把换行渲染成块级节点、把 markdown 标记变成格式 —— 读回**变短**，
+        # 真机上 9967 字符的 prompt 读回来只有 9834。
+        self.lossy_readback = lossy_readback
         self.keyboard = _ChunkyKeyboard(self)
 
     def record_insert(self, text: str, *, source: str) -> None:
@@ -795,8 +811,8 @@ class ChunkedInsertTests(unittest.TestCase):
         prompt = "A" * 12000
         text, _ = self._run(page, prompt)
         self.assertEqual(text, "新答案")
-        # 每块都不超过 FILL_CHUNK_CHARS，且没有用旧的整体 fill
-        self.assertEqual(page.whole_fills, 0)
+        # 先试整段 fill（本机实测可用的原语），它没写进去才分块；每块都不超过 FILL_CHUNK_CHARS
+        self.assertEqual(page.whole_fills, 1)
         self.assertEqual(page.oversized, 0)
         self.assertEqual(page.pieces, [4000, 4000, 4000])
         # 原语：真实键盘 insert_text 优先（参照姊妹项目 ChatGPTBridge）
@@ -825,8 +841,8 @@ class ChunkedInsertTests(unittest.TestCase):
         self.assertEqual(page.submitted_text, prompt)
         self.assertEqual(len(page.pieces), 1)  # 只补了剩下 3000
 
-    def test_unreadable_composer_falls_back_to_whole_fill(self):
-        # 读不到输入框文本（页面差异）时不能用分块，退回整段 fill（且短文本能成功）
+    def test_unreadable_composer_still_trusts_fill(self):
+        # 读不到输入框文本（页面差异）时无法读回校验，只能信任 fill 的返回（旧行为）
         page = _ChunkyPage(unreadable=True)
         text, _ = self._run(page, "go")
         self.assertEqual(text, "新答案")
@@ -852,15 +868,69 @@ class ChunkedInsertTests(unittest.TestCase):
         self.assertEqual(page.silent_noops, 0)
         self.assertEqual(page.submitted_text, prompt)
 
-    def test_silent_noop_inserts_fall_back_to_whole_fill(self):
-        # 两种原语都静默失效时，不能直接报错：必须退回整段 fill（本页面上可用的原语）
-        page = _ChunkyPage(ignore_inserts=True)
+    def test_whole_fill_is_tried_first(self):
+        # 顺序校正（真机数据）：fill() 是本机实测可用的原语（probe_prompt_limit 用它写进过
+        # 100K），必须优先；分块只在 fill 确实没写进去时才用。
+        page = _ChunkyPage()
         prompt = "G" * 3000
         text, _ = self._run(page, prompt)
         self.assertEqual(text, "新答案")
-        self.assertGreaterEqual(page.silent_noops, 1)
         self.assertEqual(page.whole_fills, 1)
+        self.assertEqual(page.pieces, [])  # 没有走分块
         self.assertEqual(page.submitted_text, prompt)
+
+    def test_fill_timeout_with_text_landed_is_treated_as_success(self):
+        # 真机签名：fill(36265) 报超时，而输入框同时长出 child_nodes: 616——文本其实进去了。
+        # 必须读回确认并按成功继续提交，而不是重写一遍或直接放弃。
+        page = _ChunkyPage(fill_writes_then_raises=True)
+        prompt = "H" * 9000
+        text, _ = self._run(page, prompt)
+        self.assertEqual(text, "新答案")
+        self.assertEqual(page.whole_fills, 1)  # 只试了一次 fill
+        self.assertEqual(page.pieces, [])  # 也没有回头去分块
+        self.assertEqual(page.submitted_text, prompt)
+
+    def test_failed_fill_falls_back_to_chunked_insert(self):
+        # fill 确实没写进去（长文本超时、输入框仍为空）时才走分块
+        page = _ChunkyPage()
+        prompt = "I" * 9000
+        text, _ = self._run(page, prompt)
+        self.assertEqual(text, "新答案")
+        self.assertEqual(page.whole_fills, 1)
+        self.assertEqual(page.pieces, [4000, 4000, 1000])
+        self.assertEqual(page.submitted_text, prompt)
+
+    def test_editor_normalized_readback_is_not_treated_as_residue(self):
+        # 真机根因守护：读回不含换行（编辑器会这样）时，`prompt.startswith(current)` 判 False，
+        # 旧逻辑于是把**刚写好的整条 prompt 清掉重写**——真机里 child_nodes 从 616 掉到 1、
+        # 每轮都报「已写入 0/36265 字符」。必须容忍空白规范化，绝不能清掉已有内容。
+        page = _ChunkyPage(fill_writes_then_raises=True, normalize_on_read=True)
+        prompt = "\n".join(f"line{i}" for i in range(600))
+        text, _ = self._run(page, prompt)
+        self.assertEqual(text, "新答案")
+        self.assertEqual(page.submitted_text, prompt)  # 原文完整发出（没有被清空重写）
+        self.assertEqual(page.pieces, [])  # 读回确认后直接提交，没有回头去分块
+        self.assertNotIn("Backspace", page.presses)  # 没有触发清空
+
+    def test_lossy_readback_after_successful_fill_is_trusted(self):
+        # 真机回归守护：fill() 成功、读回 9834 / prompt 9967（编辑器有损渲染的正常损耗）。
+        # 绝不能据此判失败去分块——那会清空重写，把本来已经写好的 prompt 弄坏，
+        # 最终报出「写入输入框连续失败」（真机 11:23 那一轮就是如此）。
+        page = _ChunkyPage(max_chunk=20000, lossy_readback=True)
+        prompt = "\n".join(f"**line{i}**" for i in range(600))
+        text, _ = self._run(page, prompt)
+        self.assertEqual(text, "新答案")
+        self.assertEqual(page.whole_fills, 1)  # 只写了一次
+        self.assertEqual(page.pieces, [])  # 没有回头去分块
+        self.assertNotIn("Backspace", page.presses)  # 没有清空重写
+        self.assertEqual(page.submitted_text, prompt)  # 原文完整发出
+
+    def test_unwritable_composer_raises_instead_of_hanging(self):
+        # 两种插入原语都静默失效、fill 也写不进去：必须抛出可行动错误，而不是空等到客户端超时
+        page = _ChunkyPage(ignore_inserts=True)
+        with self.assertRaises(RuntimeError):
+            self._run(page, "J" * 5000)
+        self.assertGreaterEqual(page.silent_noops, 1)
 
     def test_residue_is_cleared_before_writing(self):
         # 输入框里有上一次没发出去的草稿：必须先清干净，否则新 prompt 会被拼接

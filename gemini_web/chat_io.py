@@ -711,8 +711,11 @@ class ChatIOMixin:
         :param handle: 已经定位好的输入框句柄（复用，避免重复定位）；None 表示自己定位。
         """
         chunk = max(200, config.FILL_CHUNK_CHARS or 4000)
+        cleared = False          # 残留只清一次：读回是有损的，反复清会删掉自己写进去的内容
+        blind = False            # 读回对不上且已清过一次 → 改用“本轮自己插入了多少”推进
+        written = 0
         stalls = 0
-        last_written = -1
+        last_len = -1
         last_source: Optional[str] = None
         focused = False
         while True:
@@ -721,27 +724,43 @@ class ChatIOMixin:
                 if handle is None:
                     raise RuntimeError("分块写入时找不到输入框")
                 focused = False  # 重挂载后的新节点要重新聚焦
-            current = await self._composer_text(handle)
-            if current is None:
-                return None  # 读不到文本的页面：改用整段 fill 兜底
-            if not prompt.startswith(current):
-                # 输入框里有残留/被改写的内容：先清空（循环校验）再从 0 写
-                await self._clear_composer(page, handle)
+            if not blind:
                 current = await self._composer_text(handle)
                 if current is None:
-                    return None
-                if not prompt.startswith(current):
-                    current = ""
-            written = len(current)
+                    return None  # 读不到文本的页面：改用整段 fill 兜底
+                if self._prompt_present(prompt, current):
+                    # 已经是我们这条 prompt（可能被编辑器规范化过空白/换行）：直接成功
+                    return len(prompt)
+                if prompt.startswith(current):
+                    written = len(current)          # 精确前缀：断点续写
+                elif cleared:
+                    # 已清过一次还是对不上：说明读回**有损**（换行被渲染成块级节点、
+                    # markdown 标记变成格式）。**再去清就会把刚写进去的内容删掉**——
+                    # 真机日志里 child_nodes 616 → 1、每轮「已写入 0」就是这个自我毁灭循环。
+                    logger.warning(
+                        "[输入] 读回与 prompt 对不上（%s 字符）：不再清空，改为按已插入字符数推进",
+                        len(current),
+                    )
+                    blind = True
+                    written = 0
+                else:
+                    # 首次遇到残留草稿：清一次，之后绝不再清
+                    await self._clear_composer(page, handle)
+                    cleared = True
+                    after = await self._composer_text(handle)
+                    if after is None:
+                        return None
+                    written = len(after) if prompt.startswith(after) else 0
             if written >= len(prompt):
                 return written
-            if written == last_written:
+            # 进度判据：读回长度必须增长。有损读回只改变绝对值，不改变增减。
+            cur_len = len(await self._composer_text(handle) or "")
+            if 0 <= last_len and cur_len <= last_len:
                 stalls += 1
                 if stalls > max(1, config.FILL_RETRIES):
                     detail = await self._composer_diag(handle)
                     if written == 0:
                         # 一个字都写不进去：分块插入在本页面根本不生效。
-                        # 交给调用方退回整段 fill（本页面上被证实的可用原语）。
                         logger.warning(
                             "[输入] 分块插入完全无效（已写入 0/%s 字符，最后原语=%s）：%s",
                             len(prompt), last_source or "无", detail,
@@ -750,25 +769,25 @@ class ChatIOMixin:
                             "分块插入在本页面写不进去（已写入 0 字符）"
                         )
                     logger.warning(
-                        "[输入] 分块写入无进展：已写入 %s/%s 字符（最后原语=%s）：%s",
-                        written, len(prompt), last_source or "无", detail,
+                        "[输入] 分块写入无进展：读回 %s 字符（已写入 %s/%s，最后原语=%s）：%s",
+                        cur_len, written, len(prompt), last_source or "无", detail,
                     )
                     raise RuntimeError(
                         f"分块写入无进展：已写入 {written}/{len(prompt)} 字符"
                     )
             else:
                 stalls = 0
-            last_written = written
+            last_len = cur_len
             if not focused:
                 # 真实 click 聚焦（优先）：`page.keyboard.insert_text` 走页面内焦点，
                 # 不聚焦就会把文本送到别处；受控编辑器也只认“真实交互”后的焦点。
                 await self._focus_composer(page, handle)
                 focused = True
+            piece = prompt[written:written + chunk]
             try:
                 # 上一次“没进展”说明这个原语可能被编辑器忽略：换另一个原语再试
                 last_source = await self._insert_chunk(
-                    page, handle, prompt[written:written + chunk],
-                    prefer_keyboard=(stalls == 0),
+                    page, handle, piece, prefer_keyboard=(stalls == 0)
                 )
                 if last_source is None:
                     logger.debug(
@@ -783,17 +802,26 @@ class ChatIOMixin:
                 stalls += 1
                 if stalls > max(1, config.FILL_RETRIES) * 2:
                     raise
+                await asyncio.sleep(0)
+                continue
+            written += len(piece)
             await asyncio.sleep(0)
 
     async def _fill_prompt(self, page, prompt: str):
         """把 prompt 写进输入框，返回可提交的句柄；每次尝试都**重新定位**。
 
-        两条路径：
+        两条路径，**顺序经过真机数据校正**：
 
-        1. **分块写入**（默认，见 ``_insert_prompt_in_chunks``）：超长 prompt 不再
-           一次性塞入，不会把网页主线程卡死（真机故障根因），且可断点续写；
-        2. **整段 ``fill``**（兜底）：页面读不到输入框文本时无法判断写到哪，
-           退回旧行为（单次超时仍受 ``FILL_TIMEOUT_MS`` 约束）。
+        1. **整段 ``fill()`` 优先**：Playwright 对 contenteditable 的实现是
+           「``selectText``（focus + ``range.selectNodeContents`` + ``addRange``，显式
+           建立选区）→ CDP ``Input.insertText``」——``fill`` **自带选区**，这正是裸
+           ``keyboard.insert_text`` 在同一个输入框上静默失败的原因。这台机器上实测
+           能写进 100K（``tests/e2e/probe_prompt_limit.py``）。
+           **关键：``fill()`` 报超时 ≠ 没写进去。** 真机日志里 ``fill(36265)`` 报了超时，
+           而输入框同时长出了 ``child_nodes: 616``——那正是整条 36K prompt 的渲染结果。
+           所以失败后必须**读回确认**：文本已在框里就直接按成功继续提交，不再无谓重写。
+        2. **分块插入**（``_insert_prompt_in_chunks``）：只在 ``fill()`` 确实没把文本
+           写进去时才用——把长任务切碎、逐块读回校验、可续写。
 
         每次尝试都重新定位（拿到重挂载后的新节点）；失败按 ``RETRY_BACKOFF_S``
         退避再试，最多 ``FILL_RETRIES`` 次；仍不行才报错，并附输入框诊断。
@@ -808,24 +836,7 @@ class ChatIOMixin:
                 logger.warning("写入输入框失败（第 %s/%s 次）：找不到输入框", attempt, attempts)
             else:
                 try:
-                    try:
-                        written = await self._insert_prompt_in_chunks(page, prompt, chat_input)
-                    except ChunkedInsertUnavailable as exc:
-                        # 分块插入在这个页面上一个字都写不进去：退回**整段 fill**。
-                        # `fill()` 内部做的正是「先建立选区、再 Input.insertText」，是本页面上
-                        # 被证实的可用原语；分块只是为了绕开「一次性写入把主线程排成长任务」，
-                        # 宁可慢，也不能一个字都写不进。
-                        logger.warning(
-                            "[输入] %s：退回整段 fill（%s 字符）", exc, len(prompt)
-                        )
-                        written = None
-                    if written is None:
-                        # 整段 fill：句柄就是刚定位的那个，直接用它
-                        await chat_input.fill(prompt, timeout=timeout)
-                        return chat_input
-                    logger.info("写入输入框完成：%s 字符（分块）", written)
-                    # 分块过程中节点可能被重挂载，重新定位一个可用的句柄再提交
-                    return await self._locate_input(page) or chat_input
+                    return await self._write_prompt(page, prompt, chat_input, timeout)
                 except Exception as exc:  # noqa: BLE001  Playwright TimeoutError 等
                     last_error = exc
                     logger.warning(
@@ -837,12 +848,97 @@ class ChatIOMixin:
                 await asyncio.sleep(max(0.0, config.RETRY_BACKOFF_S))
         raise RuntimeError(
             f"写入输入框连续失败 {attempts} 次（单次超时 {config.FILL_TIMEOUT_MS}ms）："
-            "命中的元素始终不处于「可见 / 可编辑」状态。常见原因：登录态失效或被风控"
+            "整段 fill 与分块插入都没能把 prompt 写进去。常见原因：登录态失效或被风控"
             "拦住、页面停在非对话视图、有头模式下窗口失焦后输入框被懒卸载"
             "（可试 HEADLESS=1），或单个 prompt 超出输入框字符上限"
             "（可调小 PROMPT_MAX_CHARS / TOOL_RESULT_MAX_CHARS，"
             "或调小 FILL_CHUNK_CHARS 让每块插入更短）。"
         ) from last_error
+
+    @staticmethod
+    def _normalize_for_compare(text: str) -> str:
+        """把文本压成可比较的形态：所有空白序列（含换行）折成单个空格。
+
+        为什么必须这么做（真机根因）：富文本编辑器把每条换行渲染成**独立的块级节点**，
+        读回来的 ``textContent`` **不含换行**。于是 ``prompt.startswith(current)``
+        对任何多行 prompt 都判 False，而 False 会触发 ``_clear_composer``——
+        把**刚写好的整条 prompt 清掉**再从头写。真机日志里 ``child_nodes`` 从 616
+        掉到 1、且每轮都报「已写入 0/36265 字符」，就是这个自我毁灭的循环。
+        """
+        return re.sub(r"\s+", " ", text).strip()
+
+    @classmethod
+    def _prompt_present(cls, prompt: str, current: str) -> bool:
+        """输入框里已经是我们这条 prompt 吗？（**容忍**编辑器对空白/换行的规范化）
+
+        不做逐字节比较：读回的开头一段与长度都按折叠后的形态比。判据取保守的两条：
+        开头 120 字符一致 + 长度不短于 prompt（防被截断后误判）。
+        """
+        if not current:
+            return False
+        want = cls._normalize_for_compare(prompt)
+        have = cls._normalize_for_compare(current)
+        if not want or not have:
+            return False
+        head = want[: min(120, len(want))]
+        return have.startswith(head) and len(have) >= len(want)
+
+    async def _write_prompt(self, page, prompt: str, chat_input, timeout):
+        """把 prompt 真正写进输入框，返回可提交的句柄（整段 fill 优先，分块兜底）。
+
+        顺序与依据见 ``_fill_prompt`` 的 docstring。三条防线：
+
+        * 写之前先读回：**已经在框里**就跳过写入（重试时最常见的浪费与风险）；
+        * ``fill()`` 之后读回：“成功”或“报错但文本已落地”都算成功；
+        * ``fill()`` 确实没落地 → 分块插入；分块也写不进 → 抛回 **fill 的原始错误**
+          （那才是根因，分块失败只是它的衍生现象）。
+        """
+        current = await self._composer_text(chat_input)
+        if current and self._prompt_present(prompt, current):
+            logger.info("[输入] 输入框已有本条 prompt（%s 字符）：跳过写入", len(current))
+            return await self._locate_input(page) or chat_input
+
+        fill_error: Optional[Exception] = None
+        try:
+            await chat_input.fill(prompt, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001  Playwright TimeoutError 等
+            fill_error = exc
+        else:
+            # **fill 没报错就信任它**（这也是它一直以来的行为）。读回差异只记日志，
+            # 绝不据此判失败：富文本编辑器的读回是**有损**的（换行渲染成块级节点、
+            # markdown 标记变成格式），真机上 9967 字符的 prompt 读回来只有 9834——
+            # 拿这个差值当失败判据，会把本来已经写好的请求判死，然后再去分块、
+            # 再清空重写，反而把它弄坏（本轮的教训）。
+            landed = await self._composer_text(chat_input)
+            if landed is not None and len(landed) != len(prompt):
+                logger.info(
+                    "[输入] fill 完成：读回 %s 字符 / prompt %s 字符（编辑器有损渲染，属正常）",
+                    len(landed), len(prompt),
+                )
+            else:
+                logger.info("写入输入框完成：%s 字符（整段 fill）", len(prompt))
+            return chat_input
+
+        # 只有 fill **报错**时才需要读回救援：真机见过 fill 报超时但文本已落地
+        landed = await self._composer_text(chat_input)
+        if landed and self._prompt_present(prompt, landed):
+            logger.warning(
+                "[输入] fill 报错（%s）但 %s 字符已在输入框中：按成功继续提交",
+                fill_error, len(landed),
+            )
+            return await self._locate_input(page) or chat_input
+
+        try:
+            written = await self._insert_prompt_in_chunks(page, prompt, chat_input)
+        except ChunkedInsertUnavailable:
+            raise fill_error
+        if written is None:
+            # 读不到输入框文本、分块无法判断，而 fill 也已经失败：抛 fill 的错误，
+            # 让上层重试（会重新定位句柄），不做无谓的第二次整段 fill。
+            raise fill_error
+        logger.info("写入输入框完成：%s 字符（分块）", written)
+        # 分块过程中节点可能被重挂载，重新定位一个可用的句柄再提交
+        return await self._locate_input(page) or chat_input
 
     async def _submit_prompt(self, page, chat_input, bucket: Optional[str] = None) -> None:
         """提交 prompt，并**确认它真的发出去了**（全程无窗口焦点依赖）。
