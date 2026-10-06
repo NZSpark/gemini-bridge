@@ -130,13 +130,16 @@ class ChatIOMixin:
                 await self._start_new_session(bucket)
 
             # 会话是新开的（或被轮转过）-> 必须播种，否则模型收不到任何上下文
-            active_prompt = seeded if not self._state(bucket).has_history else prompt
+            use_seed = not self._state(bucket).has_history
+            active_prompt = seeded if use_seed else prompt
             # 记录真正要发出的那份 prompt，供上层估算 usage（按桶隔离，避免并发串台）
             self._last_prompts[bucket] = active_prompt
 
             await self._remember_session(bucket)
             try:
-                return await self._send_chat_locked(active_prompt, on_delta, key=bucket)
+                return await self._send_chat_locked(
+                    active_prompt, on_delta, key=bucket, seeded=use_seed
+                )
             except GeminiContextLimitError as exc:
                 # 到顶了：下次不要再恢复同一个会话，直接轮转
                 last_error = exc
@@ -1017,7 +1020,8 @@ class ChatIOMixin:
         )
 
     async def _send_chat_locked(self, prompt: str, on_delta=None,
-                                key: Optional[str] = None) -> tuple[str, List[dict]]:
+                                key: Optional[str] = None,
+                                seeded: bool = False) -> tuple[str, List[dict]]:
         """发送单条消息并获取响应及提取的代码块。
 
         :param on_delta: 可选异步回调，生成过程中实时吐出增量文本（用于 SSE 流式）。
@@ -1055,7 +1059,13 @@ class ChatIOMixin:
             prompt = self._clamp_prompt(prompt)
             # 每次发送都留一行长度：这是回答「长 prompt 是否导致上游不响应」的现场证据
             # （此前只有失败时才打印长度，成功发出的那条到底多长无从得知）。
-            logger.info("[发送] bucket=%s prompt=%s 字符", bucket, len(prompt))
+            # 明确标注发的是哪一份：`[长度] 播种内容超出 SEED_MAX_CHARS` 是**构建期**日志，
+            # 每轮都会打（server.py 无条件 build 两份：增量 + 播种），它不能证明本轮用了
+            # 播种 prompt。真正的判据是 needs_seed()，即下面的 seeded 参数。
+            logger.info(
+                "[发送] bucket=%s 用%s prompt=%s 字符",
+                bucket, "播种" if seeded else "增量", len(prompt),
+            )
             chat_input = await self._fill_prompt(page, prompt)
             await self._submit_prompt(page, chat_input, bucket)
 

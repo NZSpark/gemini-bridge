@@ -912,6 +912,22 @@ class ChunkedInsertTests(unittest.TestCase):
         self.assertEqual(page.pieces, [])  # 读回确认后直接提交，没有回头去分块
         self.assertNotIn("Backspace", page.presses)  # 没有触发清空
 
+    def test_send_log_distinguishes_seed_from_delta(self):
+        # 可观测性守护：`[长度] 播种内容超出 SEED_MAX_CHARS` 是**构建期**日志，每轮都会打
+        # （server.py 无条件 build 两份：增量 + 播种），不能据此判断本轮用了哪一份。
+        # 真正发出去的是哪份、有多长，必须由 `[发送]` 行自己说清楚。
+        page = _ChunkyPage()
+        driver = GeminiWebDriver()
+        driver.page = page
+        with self.assertLogs("gemini_web.chat_io", level="INFO") as logs:
+            asyncio.run(driver.send_chat("delta-one", seeded_prompt="SEED-BODY-XY"))
+            asyncio.run(driver.send_chat("delta-two", seeded_prompt="SEED-BODY-XY"))
+        sent = [r.getMessage() for r in logs.records if r.getMessage().startswith("[发送]")]
+        # 首次：桶里没有历史 -> 发播种（长度是播种那份的）
+        self.assertEqual(sent[0], "[发送] bucket=default 用播种 prompt=12 字符")
+        # 第二次：已有历史 -> 发增量
+        self.assertEqual(sent[1], "[发送] bucket=default 用增量 prompt=9 字符")
+
     def test_lossy_readback_after_successful_fill_is_trusted(self):
         # 真机回归守护：fill() 成功、读回 9834 / prompt 9967（编辑器有损渲染的正常损耗）。
         # 绝不能据此判失败去分块——那会清空重写，把本来已经写好的 prompt 弄坏，
