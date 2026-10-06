@@ -1,6 +1,14 @@
-"""工具调用注入与解析的回归测试。"""
+"""工具调用注入与解析的回归测试。
+
+载体（carrier）已从纯文本 ``TOOL_CALL: {...}`` 行改为 ```tool_call 代码围栏
+（见 ``doc/code_block_fence.md``）。本文件同时守两件事：
+
+* 新载体：注入文案必须给出围栏模板，且该模板能反哺解析器（提示词与解析器同源）；
+* 旧载体：纯文本行仍作为历史数据兼容，相关用例保留不删（它们现在是兼容性护栏）。
+"""
 
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -12,9 +20,12 @@ from unittest import mock  # noqa: E402
 
 from gemini_web import config  # noqa: E402
 from gemini_web.toolcalls import (  # noqa: E402
+    _iter_balanced_objects,
     _normalize_tool_entry,
     _tool_names,
+    edit_markdown_spec,
     execute_edit_markdown,
+    format_tool_call_emphasis,
     format_tools_instruction,
     parse_tool_calls,
     should_register_edit_markdown,
@@ -43,9 +54,17 @@ class FormatInstructionTests(unittest.TestCase):
         self.assertIn("get_weather", text)
         self.assertIn("查询天气", text)
 
-    def test_contains_call_template(self):
+    def test_contains_fenced_call_template(self):
         text = format_tools_instruction(TOOLS)
-        self.assertIn("TOOL_CALL", text.upper())
+        self.assertIn("```tool_call", text)
+        self.assertIn("info string is exactly", text)
+
+    def test_no_longer_asks_for_plain_text_line(self):
+        """载体已换成围栏：不得再残留「写成纯文本行 / 不要代码围栏」的旧措辞。"""
+        text = format_tools_instruction(TOOLS)
+        self.assertNotIn("plain text lines", text)
+        self.assertNotIn("no code fences", text)
+        self.assertNotIn("do not add ```", text)
 
     def test_template_is_stable(self):
         self.assertEqual(
@@ -54,6 +73,206 @@ class FormatInstructionTests(unittest.TestCase):
 
     def test_empty_tools(self):
         self.assertIsInstance(format_tools_instruction([]), str)
+
+
+# 真机抓取样例（2026-10-07，Gemini 网页版 HEADLESS=false，无 tools 的运输层回声；
+# 采集命令见 doc/code_block_fence.md §9）。同一段 92 字节 payload，三种载体从 DOM 取回后的
+# 原文，逐字节照抄。关键差异：
+#   * plain_line：网页版把这一行当 markdown 段落渲染，**反斜杠转义被吃掉**
+#     （`\"` → `"`），JSON 不再合法——只能用修复启发式勉强救回，命令内容已损坏；
+#   * code_only（只给围栏）：JSON 逐字节保留，但围栏与 info string 都**不进
+#     innerText**（DOM 里只剩 UI 标题 ``Code snippet``），回复里没有任何可识别标记；
+#   * hybrid（标记行 + 围栏）：两者兼得——标记行可识别，围栏保真。这是当前注入格式。
+_CAPTURED_COMMAND_ESCAPED = 'printf \\"hi\\"; echo done\\n    x = 1\\n        y = 2'
+_CAPTURED_COMMAND_EATEN = 'printf "hi"; echo done\\n    x = 1\\n        y = 2'
+# json.loads 之后应该拿到的东西（字面量 \\n 变成真换行）
+_CAPTURED_COMMAND_EXPECTED = 'printf "hi"; echo done\n    x = 1\n        y = 2'
+
+DOM_SAMPLE_HYBRID = (
+    "TOOL_CALL:\n\nCode snippet\n"
+    '{"name":"bash","arguments":{"command":"' + _CAPTURED_COMMAND_ESCAPED + '"}}'
+)
+DOM_SAMPLE_CODE_ONLY = (
+    "Code snippet\n"
+    '{"name":"bash","arguments":{"command":"' + _CAPTURED_COMMAND_ESCAPED + '"}}'
+)
+DOM_SAMPLE_PLAIN_LINE = (
+    'TOOL_CALL: {"name":"bash","arguments":{"command":"' + _CAPTURED_COMMAND_EATEN + '"}}'
+)
+
+
+class FencedCarrierTests(unittest.TestCase):
+    """新载体（``TOOL_CALL:`` 标记行 + ```tool_call 围栏）的注入—解析闭环。
+
+    载体为什么是混合形态、以及“只给围栏”为什么在本桥不可用，见 doc/code_block_fence.md。
+    """
+
+    def test_injection_asks_for_both_parts(self):
+        """注入文案必须同时点名标记行与围栏：缺任何一半都会整体失效。"""
+        for text in (format_tools_instruction(TOOLS), format_tool_call_emphasis()):
+            self.assertIn("TOOL_CALL:", text)
+            self.assertIn("```tool_call", text)
+
+    def test_instruction_example_roundtrips_through_parser(self):
+        """注入块里的示例必须是合法 JSON 围栏（提示词与解析器同源，不会各说各话）。"""
+        text = format_tools_instruction(TOOLS)
+        match = re.search(r"```tool_call\n(.*?)\n```", text, re.DOTALL)
+        self.assertIsNotNone(match, "注入块里缺少 ```tool_call 示例")
+        example = json.loads(match.group(1))
+        self.assertIn("name", example)
+        self.assertIn("arguments", example)
+
+        real = "```tool_call\n" + json.dumps(
+            {"name": "get_weather", "arguments": {"city": "SF"}}
+        ) + "\n```"
+        calls = parse_tool_calls(real, {"get_weather"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["arguments"], {"city": "SF"})
+        # 示例本身只用了占位工具名，不应被当成可用调用泄漏出去
+        self.assertEqual(parse_tool_calls(text, {"get_weather"}), [])
+
+    def test_emphasis_block_mandates_fence(self):
+        """新会话的格式强调块必须点名混合载体的两半，且不得再出现旧措辞。"""
+        block = format_tool_call_emphasis()
+        self.assertIn("```tool_call", block)
+        self.assertIn("marker line must be exactly `TOOL_CALL:`", block)
+        self.assertIn("fence label must be exactly `tool_call`", block)
+        self.assertNotIn("plain text lines", block)
+        self.assertNotIn("no code fences", block)
+
+    def test_edit_markdown_spec_uses_fenced_carrier(self):
+        spec = edit_markdown_spec()
+        self.assertIn("TOOL_CALL:\n```tool_call", spec)
+        # 示例里的 <int> 只是占位符，但结构合法；关键是围栏能被解析到 edit_markdown
+        calls = parse_tool_calls(spec, {"edit_markdown"})
+        self.assertEqual([c["name"] for c in calls], ["edit_markdown"])
+
+    def test_raw_fence_still_parses(self):
+        """围栏未被渲染（客户端把回复原样贴回 / 模型输出未渲染）时的主路径。"""
+        text = '```tool_call\n{"name": "get_weather", "arguments": {"city": "SF"}}\n```'
+        calls = parse_tool_calls(text, {"get_weather"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["name"], "get_weather")
+
+    def test_multiple_fences_are_all_consumed(self):
+        """多个围栏＝并行多调用（一个围栏一条）。"""
+        text = (
+            '```tool_call\n{"name": "a", "arguments": {}}\n```\n'
+            '```tool_call\n{"name": "b", "arguments": {}}\n```'
+        )
+        calls = parse_tool_calls(text, {"a", "b"})
+        self.assertEqual([c["name"] for c in calls], ["a", "b"])
+
+    def test_rendered_fence_label_line_parses(self):
+        """网页 DOM 形态：围栏被渲染掉，只剩 ``tool_call`` 标签行 + JSON。
+
+        这是本桥真实的取回形态（见 doc/code_block_fence.md），必须走裸标签兑底。
+        """
+        text = 'tool_call\n{"name": "get_weather", "arguments": {"city": "SF"}}'
+        calls = parse_tool_calls(text, {"get_weather"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["arguments"], {"city": "SF"})
+
+    def test_rendered_fence_preserves_escapes_and_indentation(self):
+        """载体保真：围栏内按字面保留，转义与缩进必须逐字节到达命令。
+
+        这是整个改造的全部理由：同一段 payload，只把“承载它的那半”从纯文本行换成代码
+        围栏，就能让 ``\\\"`` 与 4/8 空格缩进活着穿过网页渲染。
+        """
+        command = 'printf \"hi\"; echo done\n    x = 1\n        y = 2'
+        payload = json.dumps({"name": "bash", "arguments": {"command": command}})
+        for text in (
+            "```tool_call\n" + payload + "\n```",          # 围栏未渲染
+            "tool_call\n" + payload,                       # 只剩裸标签
+            "TOOL_CALL:\n\nCode snippet\n" + payload,      # 真机 DOM 形态
+        ):
+            calls = parse_tool_calls(text, {"bash"})
+            self.assertEqual(len(calls), 1, text)
+            self.assertEqual(calls[0]["arguments"]["command"], command)
+
+    def test_captured_gemini_dom_hybrid_is_byte_exact(self):
+        """真机样本（关键回归）：混合载体的 DOM 形态必须逐字节还原命令，
+
+        而且**不需要任何修复启发式**——围栏内取回的就是合法 JSON。
+        """
+        candidate = next(iter(_iter_balanced_objects(DOM_SAMPLE_HYBRID)), "")
+        self.assertEqual(json.loads(candidate)["arguments"]["command"], _CAPTURED_COMMAND_EXPECTED)
+        calls = parse_tool_calls(DOM_SAMPLE_HYBRID, {"bash"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["name"], "bash")
+        self.assertEqual(
+            calls[0]["arguments"]["command"], _CAPTURED_COMMAND_EXPECTED
+        )
+
+    def test_captured_gemini_dom_plain_line_is_not_valid_json(self):
+        """真机样本（反例）：同一 payload 走纯文本行载体，DOM 里转义已被消费。
+
+        这条锁住“为什么必须把载荷搬进围栏”：取回文本里 ``\\\"`` 已经全部消失，
+        严格 ``json.loads`` 直接失败——整条调用只能交给修复启发式去猜（而正文裸引号
+        在 JSON 里本质有歧义，长命令下会猜错、截断）。对比见
+        :meth:`test_captured_gemini_dom_hybrid_is_byte_exact`：换进围栏后连修复都不需要。
+        """
+        self.assertEqual(DOM_SAMPLE_PLAIN_LINE.count('\\"'), 0)
+        candidate = next(iter(_iter_balanced_objects(DOM_SAMPLE_PLAIN_LINE)), "")
+        self.assertTrue(candidate, "样本里应当能扫出一个括号平衡的对象")
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(candidate)
+        # 启发式确实能救回一条（护栏没误杀），但这条路径是“猜”出来的
+        calls = parse_tool_calls(DOM_SAMPLE_PLAIN_LINE, {"bash"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["arguments"]["command"], _CAPTURED_COMMAND_EXPECTED)
+
+    def test_captured_gemini_dom_code_only_has_no_marker(self):
+        """真机样本（反例）：只给围栏时，DOM 里连一个可用标记都没有 → 0 条。
+
+        网页版把围栏渲染成 code-snippet 组件，围栏与 info string 都不进 innerText
+        （只剩 UI 标题 ``Code snippet``）。因此**标记行不可省**——这条用例守的就是这
+        个前提，防止有人把注入格式“简化”回围栏单体。
+        """
+        self.assertNotIn("```", DOM_SAMPLE_CODE_ONLY)
+        self.assertNotIn("TOOL_CALL", DOM_SAMPLE_CODE_ONLY.upper())
+        self.assertEqual(parse_tool_calls(DOM_SAMPLE_CODE_ONLY, {"bash"}), [])
+
+    def test_multiline_json_inside_fence_parses(self):
+        """代码块保留换行 → 围栏内 JSON 合法跨行（token 之间的换行）也必须能解析。"""
+        text = (
+            "```tool_call\n"
+            "{\n"
+            '  "name": "get_weather",\n'
+            '  "arguments": {\n    "city": "SF"\n  }\n'
+            "}\n"
+            "```"
+        )
+        calls = parse_tool_calls(text, {"get_weather"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["arguments"], {"city": "SF"})
+
+    def test_rendered_json_label_is_not_taken_as_call(self):
+        """负向：DOM 只剩 ``json`` 标签行时必须**不**执行（安全取舍）。
+
+        对话里正常展示的 JSON 代码块若恰好有 name/arguments，被当成调用执行就是
+        「模型可控文本触发本机命令」。因此 info string 只认 tool_call。
+        """
+        text = 'json\n{"name": "get_weather", "arguments": {"city": "SF"}}'
+        self.assertEqual(parse_tool_calls(text, {"get_weather"}), [])
+
+    def test_warns_when_marker_but_no_call(self):
+        """可观测性：有载体标记却解析不出调用时，必须留下 warning（原先完全静默）。"""
+        with self.assertLogs("gemini_web.toolcalls", level="WARNING") as ctx:
+            calls = parse_tool_calls('```tool_call\n{"name": "get_weather", "argu', {"get_weather"})
+        self.assertEqual(calls, [])
+        self.assertTrue(any("未产出任何可用调用" in line for line in ctx.output))
+
+    def test_no_warning_for_plain_answer(self):
+        with self.assertNoLogs("gemini_web.toolcalls", level="WARNING"):
+            self.assertEqual(parse_tool_calls("just a normal answer"), [])
+
+    def test_legacy_plain_text_carrier_still_parses(self):
+        """历史数据兼容：旧纯文本行载体不再注入，但解析侧必须继续认。"""
+        text = 'TOOL_CALL: {"name": "get_weather", "arguments": {"city": "NY"}}'
+        calls = parse_tool_calls(text, {"get_weather"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["arguments"], {"city": "NY"})
 
 
 class ToolNamesTests(unittest.TestCase):

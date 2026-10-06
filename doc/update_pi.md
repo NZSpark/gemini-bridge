@@ -5,7 +5,7 @@
 GeminiBridge 是将 Gemini 网页版通过 Playwright 包装为 OpenAI 兼容接口（含 /v1/chat/completions 与 /v1/responses）的本地桥接服务。项目针对工具调用（function calling）模拟、流式 SSE 传输、会话隔离与任务快照续接等进行了专门设计。
 
 当前状态：
-- 核心模块完整，全套单元测试运行通过（193 passed, 19 skipped）。
+- 核心模块完整，全套单元测试运行通过（284 passed, 18 skipped, 31 subtests passed）。
 - 已新增 gemini_web/markdown_io.py 模块，为代码块与 Markdown 读写提供结构化安全解析能力。
 - 与 Pi Coding Agent (openai-completions API) 与 Codex CLI (responses Wire API) 实现无缝集成。
 
@@ -54,25 +54,25 @@ GeminiBridge 是将 Gemini 网页版通过 Playwright 包装为 OpenAI 兼容接
 
 ## 4. 后续进展（2026-10-06 复审轮，T10.3 复核）
 
-本文第 2 节的建议**已全部落地**，状态以 `doc/update.md`（全项目复审）与
-`doc/tasks.md`（v5 任务卡）为准：
+本文第 2 节的建议已全部落地，状态以 doc/update.md（全项目复审）与
+doc/tasks.md（v5 任务卡）为准：
 
 | 本文条目 | 现状 |
 | --- | --- |
-| §2.1-1 Responses 事件 ID / 索引一致 | ✅ 已实现（`tests/test_responses.py` 守护） |
+| §2.1-1 Responses 事件 ID / 索引一致 | ✅ 已实现（tests/test_responses.py 守护） |
 | §2.1-2 Tool Call JSON 收尾校验 | ✅ 已实现（流式收尾对账 + 工具模式缓冲；T6.1） |
-| §2.2-1 会话状态缓存有界 LRU | ✅ 已实现（`MAX_SESSION_STATE_CACHE`；T4.3） |
-| §2.2-2 `output/` 启动与后台清理 | ✅ 已实现（启动清理 + `OUTPUT_PRUNE_INTERVAL_S` 后台任务；T7.2） |
+| §2.2-1 会话状态缓存有界 LRU | ✅ 已实现（MAX_SESSION_STATE_CACHE；T4.3） |
+| §2.2-2 output/ 启动与后台清理 | ✅ 已实现（启动清理 + OUTPUT_PRUNE_INTERVAL_S 后台任务；T7.2） |
 | §2.3-1 Agent 元信息过滤与 goal 优先 | ✅ 已实现（环境包装块 / 元提示过滤 + 任务快照；T4.5 / T9.4） |
-| §2.3-2 到顶自动轮转续接 | ✅ 已实现（`SESSION_MAX_TURNS` / `SESSION_MAX_TOKENS` + 播种） |
-| §2.4-1 配置防漂移 | ✅ 已实现（`config.py` ↔ `.env.example` **双向**校验；T7.3） |
-| §2.4-2 选择器外置 | ✅ 已实现（含 `SEND_BUTTON_SELECTORS` / `CAP_NOTICE_PATTERNS`） |
+| §2.3-2 到顶自动轮转续接 | ✅ 已实现（SESSION_MAX_TURNS / SESSION_MAX_TOKENS + 播种） |
+| §2.4-1 配置防漂移 | ✅ 已实现（config.py ↔ .env.example 双向校验；T7.3） |
+| §2.4-2 选择器外置 | ✅ 已实现（含 SEND_BUTTON_SELECTORS / CAP_NOTICE_PATTERNS） |
 
 勘误两处：
 
-1. 本文「当前状态」写的 `193 passed, 19 skipped` 是当时的快照；现在统一入口是
-   `.venv/bin/python -m pytest -q`（最近一次：**279 passed, 19 skipped**）。
-2. §2.2-2 描述为「需在服务启动与后台定期任务中执行」——当时**只在落盘时触发**，
-   属于「已写但未接线」；该缺口已在 T7.2 补齐（`lifespan` 启动清理 + 周期任务）。
+1. 本文「当前状态」写的 193 passed, 19 skipped 是当时的快照；现在统一入口是
+   .venv/bin/python -m pytest -q（最近一次：284 passed, 18 skipped, 31 subtests passed）。
+2. §2.2-2 描述为「需在服务启动与后台定期任务中执行」——当时只在落盘时触发，
+   属于「已写但未接线」；该缺口已在 T7.2 补齐（lifespan 启动清理 + 周期任务）。
 
 本文其余判断（核心模块完整、与 Pi / Codex 集成正常）经真实联网实测仍然成立。

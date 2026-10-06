@@ -411,7 +411,8 @@ def generate_edit(doc: MdDoc, instruction: str, llm) -> Tuple[int, int, str]:
     """让模型基于“带行号视图”产出 (start, end, new_text)。
 
     ``llm`` 是可调用对象：接收 prompt 字符串，返回模型输出文本。
-    解析复用 ``toolcalls.parse_tool_calls`` 的 ``TOOL_CALL`` 通道，
+    解析复用 ``toolcalls.parse_tool_calls`` 的载体通道（``TOOL_CALL:`` 标记行 +
+    ``tool_call`` 代码围栏，与主注入块同源；参见 ``doc/code_block_fence.md``），
     工具名约定为 ``edit_markdown``，参数为 ``{start, end, new_text}``。
 
     返回前会校验行号范围，越界即抛 MarkdownError；调用方应据此拒绝写入。
@@ -444,8 +445,12 @@ def generate_edit(doc: MdDoc, instruction: str, llm) -> Tuple[int, int, str]:
 def _build_edit_prompt(doc: MdDoc, instruction: str) -> str:
     tools_doc = (
         "可用工具：edit_markdown\n"
-        "调用格式（一行，严格 JSON）：\n"
-        'TOOL_CALL: {"name": "edit_markdown", "arguments": {"start": <int>, "end": <int>, "new_text": "<替换内容>"}}\n'
+        "调用格式（先一行纯文本标记 TOOL_CALL: ，再一个 info string 为 tool_call 的代码围栏，"
+        "围栏内一条严格 JSON；不要把 JSON 与标记写成同一行，网页版会弄坏它）：\n"
+        "TOOL_CALL:\n"
+        "```tool_call\n"
+        '{"name": "edit_markdown", "arguments": {"start": <int>, "end": <int>, "new_text": "<替换内容>"}}\n'
+        "```\n"
         "start/end 为 1-based 闭区间行号，必须落在下面视图的行号范围内。\n"
         "代码围栏（[[fence...]] 标记的行）内部不要做结构改动，除非明确要求。"
     )

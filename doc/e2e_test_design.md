@@ -97,7 +97,7 @@ Gemini 是非确定性生成模型：同一 prompt 两次直连的回复也不�
 
 | ID | Prompt（要点） | 断言 | 覆盖的 bridge 风险 |
 | --- | --- | --- | --- |
-| A1 | `只回复 K7Q9` | 双侧含 `K7Q9`；bridge 回复无注入块泄漏（`[上下文重建]`/`[工具调用说明]`/`[任务状态]`/`TOOL_CALL`）；**同一次请求附带 B3 schema、B5 落盘断言、P1-5 token 预算护栏** | prompt 拼装污染、回复节点抓取错误、注入块泄漏进回复、**内置工具脚手架被无条件注入（~970 tokens 回归）** |
+| A1 | `只回复 K7Q9` | 双侧含 `K7Q9`；bridge 回复无注入块泄漏（`[上下文重建]`/`[工具调用说明]`/`[任务状态]`/`[Output Format Emphasis]`/`[edit_markdown notes]`/`TOOL_CALL`）；**同一次请求附带 B3 schema、B5 落盘断言、P1-5 token 预算护栏** | prompt 拼装污染、回复节点抓取错误、注入块泄漏进回复、**内置工具脚手架被无条件注入（~970 tokens 回归）** |
 | A4 | `写约 600 字短文，最后一行单独输出 END7` | 双侧 ≥300 字且 **`END7` 位于末尾 100 字内**；长度比 ∈ [0.4, 2.5]；双侧 CJK 占比 ≥0.3 | **结束判定过早收尾 → 截断**（update.md 双阈值/`_complete_text` 风险），以及重复/串台 |
 
 ### 组 B：协议正确性（仅 Bridge，静态规范）
@@ -115,7 +115,7 @@ Gemini 是非确定性生成模型：同一 prompt 两次直连的回复也不�
 
 | ID | 用例 | 断言 | 覆盖风险 |
 | --- | --- | --- | --- |
-| C1 | 带 `tools=[get_weather]` 的强制调用 prompt（非流式） | **直连基线**（`E2ECase.tool_call_baseline`，同源 `build_prompt(..., tools=)`）：原始回复须含 `TOOL_CALL` 与 `get_weather`（否则 SKIP=模型不配合）；**bridge**：`message.tool_calls[0].function.name == get_weather` 且 `arguments` 可 `json.loads` | 工具指令注入、**DOM 提取/markdown 转义破坏 JSON**、`parse_tool_calls` 主路径、护栏误杀 |
+| C1 | 带 `tools=[get_weather]` 的强制调用 prompt（非流式） | **直连基线**（`E2ECase.tool_call_baseline`，同源 `build_prompt(..., tools=)`）：原始回复须含载体标记 `TOOL_CALL`（```tool_call 围栏的 info string 大写后同样是 `TOOL_CALL`，因此新/旧载体共用同一条判定）与 `get_weather`（否则 SKIP=模型不配合）；**bridge**：`message.tool_calls[0].function.name == get_weather` 且 `arguments` 可 `json.loads` | 工具指令注入、**载体被网页渲染改写（转义被吃 / 围栏与 info string 不进 innerText）**、`parse_tool_calls` 主路径、护栏误杀。载体改造的真机证据见 `doc/code_block_fence.md` |
 | C2 | 同 C1 但 `stream=true` | 复用同一份直连基线；chunk 序列 `finish_reason=tool_calls`；`delta.tool_calls` 拼出的 name/arguments 完整可解析 | 流式工具缓冲（`RESPONSES_TOOL_BUFFER`）与分片编码（与 C1 是两条不同的编码路径） |
 
 > **基线共享（本次优化）**：C1/C2 之前各自决定“要不要直连基线”：C1 有、C2 没有。
@@ -158,7 +158,7 @@ E2E_PORT=8001    # bridge 端口（默认取 .env 的 PORT）
 E2E_FULL=1       # 额外启用 B8（openai SDK 联调）
 ```
 
-- 未设置 `GEMINI_E2E=1` 时全部 **skip**，常规套件（`pytest -q`，284 passed / 18 skipped）不受影响、不发起任何网络请求。
+- 未设置 `GEMINI_E2E=1` 时全部 **skip**，常规套件（`pytest -q`，303 passed / 18 skipped）不受影响、不发起任何网络请求。
 - bridge 子进程日志：临时目录 `gemini_e2e_uvicorn.log`（失败时查看）。
 
 ### 4.1 定向运行：只跑改动过的用例
@@ -179,6 +179,21 @@ GEMINI_E2E=1 .venv/bin/python -m unittest \
 - 只跑改过的用例时，**其余用例保持“未验证”状态**，不得当成通过；
 - 改动共享脚手架（`bridge.py` / `direct.py`）时，至少跑一个**同时用到两侧**的用例（如 A1）来覆盖那些路径；
 - 全量套件（约 15–20 分钟）只在发版前或大改后跑。
+
+### 4.2 载体保真探测（手工脚本，不进 pytest 收集）
+
+工具调用**载体**（模型把调用写成什么文本）被网页渲染改写的风险，不适合塞进对等用例（它测的是运输层，
+不是端到端能力）。单独用探测脚本做 A/B，结果固化成单测样本：
+
+```bash
+# 4 臂：纯文本行 / 只给围栏 / 标记行+围栏 / ```python 对照；每臂一次网页请求（约 1 分钟）
+GEMINI_E2E=1 .venv/bin/python -m tests.e2e.probe_carrier_fidelity
+PROBE_ARMS=hybrid,fence   # 只跑部分臂
+# → output/carrier_fidelity_probe.txt（含每一臂的 DOM 原文）
+```
+
+**关键约束**：探测**不带 `tools`**（桥就不会注入自己的格式指令），否则脚本指令与桥注入互相抢方向盘，
+会得到与前次相反的假结果（姊妹项目 ChatGPTBridge 复现过这种污染）。机制与真机数据见 `doc/code_block_fence.md`。
 
 ---
 

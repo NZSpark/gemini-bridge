@@ -4,7 +4,7 @@
 
 状态标记：`[ ]` 未开始、`[~]` 进行中、`[x]` 完成（实现 + 验收测试齐备）。
 
-核对时间：2026-10-06（实施轮 + 随行轮，阶段 6–10 已全部落地）；基线：`.venv/bin/python -m pytest -q` → **279 passed, 19 skipped, 31 subtests passed**（随行轮新增 41 个不联网用例，238 → 279）。
+核对时间：2026-10-07（实施轮 + 随行轮 + 载体改造轮，阶段 6–11 已全部落地）；基线：`.venv/bin/python -m pytest -q` → **303 passed, 18 skipped, 31 subtests passed**（随行轮 238 → 279；E2E 重组轮 284；载体改造轮 +19 用例 → 303）。
 
 **联网实测状态（见 `doc/update.md` 第 10 节，真实 Gemini 登录）**：chat（流式/非流式）、tools（流式/非流式）、Responses（流式/非流式）、长文本结束判定、多轮增量、session 分桶**均已实测通过**。两点关于 P0 的结论要分开看：
 
@@ -122,6 +122,21 @@
 
 ---
 
+## 阶段 11：工具调用载体改造（2026-10-07，本轮新增）
+
+- [x] **T11.1 载体从「纯文本 `TOOL_CALL:{}` 行」改为「标记行 + ```tool_call 代码围栏」**（参照姊妹项目 ChatGPTBridge 的 `doc/code_block_fence.md`）—— **已实施**
+  - 问题：旧载体把载荷全塞进一行纯文本，网页版按 markdown **段落**渲染，取回 DOM 时 `\"` 被消费 → 严格 `json.loads` 失败，只能靠修复启发式“猜”。
+  - **本条改动前的真机证伪（重要）**：照搬“只用 ```tool_call 围栏”在本桥**不可用**——Gemini 把代码块渲染成 code-snippet 组件，围栏与 info string 都**不进** `innerText`（DOM 里只剩 UI 标题 `Code snippet`），真机实测解析 **0 条**。
+  - 采用方案：**混合载体**——`TOOL_CALL:` 标记行只负责“可识别”（无载荷），```tool_call 围栏只负责“逐字节保真”（承载载荷），两者互补。
+  - 实现：注入侧 4 处（`format_tools_instruction` / `format_tool_call_emphasis` / `edit_markdown_spec` / `markdown_io._build_edit_prompt`）；解析侧把围栏提到分支 0、标记行分支降为分支 1（标注为 Gemini 渲染后的主路径，**无新增宽容分支**）；新增诊断 warning（有标记却 0 条调用时不再静默）；`_TOOL_CALL_FENCE_RE` 收紧 info string 行匹配。
+  - 兼容：历史一体化载体 `TOOL_CALL: {json}`、裸 `tool_call` 标签、DSML / ```json 兜底**全部保留**。
+  - 验收（本地）：`pytest -q` → **303 passed, 18 skipped, 31 subtests passed**（284 → 303，新增 19 个用例）；新增 `FencedCarrierTests`（含 3 个真机 DOM 固化样本）与 2 个 Markdown 编辑链载体用例；**区分力实验**：换回旧 `toolcalls.py` → `test_toolcalls.py` + `test_markdown_io.py` **7 failed / 117 passed**（恢复后 124 passed）。
+  - 验收（联网）：新增 `tests/e2e/probe_carrier_fidelity.py`（4 臂传输层回声，**不带 tools** 以避开桥注入污染）→ line 臂 `\"`=0、严格 JSON 失败；fence 臂严格 JSON OK 但**解析 0 条**；hybrid 臂严格 JSON OK + 命令逐字节一致 + 解析 1 条。定向回归 `TestCToolParity` → **2 tests OK（74.3s；措辞微调后复跑 72.1s 同样 OK）**；A1 / B2 同批通过（另见本轮首次运行的 SKIP 说明：属上游波动，已用措辞 A/B 排除回归）。
+  - 交付物：`doc/code_block_fence.md`（机制、真假附件对照、兼容矩阵、残留与后续方向）+ 固化样本用例 + 探测脚本。
+  - 未联网验证（按定向口径）：A4 / B1 / B4 / B6 / D1–D3 / B8 / `test_markdown_io_e2e` 本轮未跑（代码未改动）。
+
+---
+
 ## 推荐执行顺序
 
 | 批次 | 任务 | 理由 |
@@ -133,8 +148,9 @@
 | Phase 5 | T8.1 / T8.4 / T8.5 / T8.6 / T8.7 / T8.8 | ✅ 已完成（日志改造 / 依赖固定 / CI / 框架统一 / context_window / 注释） |
 | Phase 6 | T8.9 / T8.10 | ✅ 已完成（安全加固：edit_markdown 路径约束、可选 BRIDGE_TOKEN） |
 | 随行 | T9.3 / T9.4 / T9.5 / T10.3 | ✅ 已完成（responses 路由级测试 / tasks 表驱动单测 / 鉴权分支测试 / 历史文档复核） |
+| Phase 7 | T11.1 | ✅ 已完成（工具调用载体改造：标记行 + 代码围栏；真机证伪了“纯围栏”方案） |
 
-> 阶段 6–10 至此全部完成。后续若要继续推进，建议方向见 `doc/update.md` 的“仍未做”与 §8.1 / §4
+> 阶段 6–11 至此全部完成。后续若要继续推进，建议方向见 `doc/update.md` 的“仍未做”与 §8.1 / §4
 > 对照表中明确标注的「仍未做」两项（`ReplyWatcher` 重构、真实环境专属交付物）。
 
 ---

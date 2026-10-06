@@ -174,7 +174,12 @@ def tearDownModule() -> None:
 
 
 def _tool_predicate(text: str) -> bool:
-    """C 组判定：回复里出现 TOOL_CALL 标记且点名了 get_weather（两侧共用）。"""
+    """C 组判定：回复里出现工具调用载体且点名了 get_weather（两侧共用）。
+
+    载体已换成 ```tool_call 代码围栏（见 doc/code_block_fence.md）：围栏 info string
+    ``tool_call`` 大写后仍是 ``TOOL_CALL``，因此这一条判定同时覆盖新载体与历史
+    纯文本行载体，不需要分叉。
+    """
     upper = (text or "").upper()
     return "TOOL_CALL" in upper and "GET_WEATHER" in upper
 
@@ -330,7 +335,14 @@ class E2ECase(unittest.TestCase):
 
     def assert_no_injection_leak(self, text: str) -> None:
         """A6：注入块不得泄漏进模型回复（抓错节点时会整段带出 prompt）。"""
-        for token in ("[上下文重建]", "[工具调用说明]", "[任务状态]", "TOOL_CALL"):
+        for token in (
+            "[上下文重建]",
+            "[工具调用说明]",
+            "[任务状态]",
+            "[Output Format Emphasis]",
+            "[edit_markdown notes]",
+            "TOOL_CALL",
+        ):
             self.assertNotIn(token, text, f"回复中泄漏了注入块 {token!r}")
 
     def assert_prompt_budget(self, raw: Any) -> None:

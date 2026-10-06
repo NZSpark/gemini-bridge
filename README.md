@@ -8,7 +8,7 @@
 
 - **OpenAI 兼容端点**：`/v1/models`、`/v1/chat/completions`、`/v1/responses`。
 - **流式与非流式**：SSE 逐块输出，首块带 `role`，末块带 `finish_reason`，`data: [DONE]` 收尾。
-- **模拟 function calling**：把 OpenAI `tools` 注入提示词，解析模型输出的 `TOOL_CALL: {...}` 为 `tool_calls`；支持单引号 shell 命令引导与控制字符 / 双引号容错修复；解析失败按普通文本返回。
+- **模拟 function calling**：把 OpenAI `tools` 注入提示词，要求模型用「`TOOL_CALL:` 标记行 + ```tool_call 代码围栏」载体回话（围栏保逐字节、标记行保可识别，见 `doc/code_block_fence.md`），解析成 `tool_calls`；兼容历史纯文本 `TOOL_CALL: {...}` 行与 DSML 兜底；支持单引号 shell 命令引导与控制字符 / 双引号容错修复；解析失败按普通文本返回。
 - **会话分桶**：按 `X-Gemini-Session` → `user` → User-Agent 分优先级隔离会话，LRU 回收，可选同桶排队锁。
 - **不丢任务**：会话轮转时按任务快照 + 历史播种，任务目标不被字符预算截断。
 - **登录态持久化**：浏览器 profile 落在 `user_data/`，登录一次即可复用。
@@ -305,5 +305,7 @@ user_data/                浏览器 profile 与状态（gitignore）
 ## 状态
 
 配置、模型、prompting、toolcalls、driver、streaming、responses、server 均已实现；
-`doc/tasks.md` 的阶段 6–10 已全部落地（含日志改造、依赖固定、CI、鉴权开关与测试补全），
-真实联网对等测试见 `doc/e2e_test_design.md`（`GEMINI_E2E=1` 才跑）。
+doc/tasks.md 的阶段 6–10 已全部落地（含日志改造、依赖固定、CI、鉴权开关与测试补全），
+且已根据 doc/update_pi.md 完成最新分解与对账；
+真实联网对等测试见 doc/e2e_test_design.md（GEMINI_E2E=1 才跑）。
+

@@ -213,8 +213,14 @@ GeminiBridge/
 
 ### 5.4 `toolcalls.py`
 - 把 OpenAI `tools`（JSON Schema）注入提示词，给出明确输出契约。
-- 解析模型输出中的结构化调用块 -> `tool_calls`（含 `id`、`name`、`arguments`）。
-- 无法解析时不报错，按普通文本回复处理。
+- **载体（carrier）**：要求模型输出「`TOOL_CALL:` 纯文本标记行 + ```tool_call 代码围栏」——
+  标记行只负责“可识别”（本身无载荷），围栏只负责“逐字节保真”（承载全部载荷）。原因是
+  Gemini 把纯文本行当 markdown 段落渲染（吃掉 `\"` 转义），而代码块的围栏与 info string
+  又**不进** `innerText`（DOM 里只剩 UI 标题 `Code snippet`）：单用任何一种都会失效。
+  机制与真机对照见 `doc/code_block_fence.md`。
+- 解析模型输出中的结构化调用块 -> `tool_calls`（含 `id`、`name`、`arguments`）；优先级为
+  围栏 -> `TOOL_CALL:` 标记行 + 其后第一个平衡 JSON -> 裸 `tool_call` 标签 -> DSML / ```json 兜底。
+- 无法解析时不报错，按普通文本回复处理；但回复里出现载体标记却一条都没解析出来时会记 warning（可观测性）。
 - `RESPONSES_TOOL_BUFFER=true` 时先缓冲整段再解析。
 
 ### 5.5 `driver.py`

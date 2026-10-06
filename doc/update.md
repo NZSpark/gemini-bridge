@@ -345,3 +345,38 @@ T9.4 `tasks.py` 表驱动单测、T9.5 鉴权分支测试、T10.x 剩余文档�
 
 > 本轮为纯本地改动 + 不联网测试，未触碰浏览器 profile；`.env` 只插入了两个新键
 > （`BRIDGE_TOKEN=`、`EDIT_MARKDOWN_ROOT=`，均为空 = 保持现有行为），键数 61 = 61。
+
+---
+
+## 14. 载体改造轮：工具调用载体改为「标记行 + ```tool_call 代码围栏」（2026-10-07）
+
+**动因**：参照姊妹项目 ChatGPTBridge 的 `doc/code_block_fence.md`——纯文本 `TOOL_CALL: {json}` 行
+会被网页版当 markdown **段落**渲染，`\"` 转义被消费，JSON 不再合法。
+
+**先证伪（本条很重要）**：照搬“只用 ```tool_call 围栏”在本桥**不可用**。真机（Gemini，`HEADLESS=false`，
+不带 `tools` 的运输层回声）实测：围栏与 info string 都**不进** `innerText`，DOM 里只剩 UI 标题
+`Code snippet`；解析器实测 **0 条** —— 调用会被静默丢弃，比旧载体更糟。
+
+**采用方案**：混合载体。`TOOL_CALL:` 标记行只负责“可识别”（本身无载荷，渲染层无处可改），
+紧随其后的 ```tool_call 围栏只负责“逐字节保真”（承载全部载荷，不需要它携带标记）。
+
+**真机对照（同一 92 字节 payload）**：
+
+| 载体臂 | DOM 首行 | `\"` 计数 | 严格 `json.loads` | 解析器交付 |
+| --- | --- | --- | --- | --- |
+| `TOOL_CALL: {json}` 一行（旧） | `TOOL_CALL: {` | **0** | **FAIL** | 1 条，但必须靠修复启发式 |
+| 只有 ```tool_call 围栏 | `Code snippet` | 2 | OK | **0 条** |
+| **标记行 + 围栏（新）** | `TOOL_CALL:` | **2** | **OK** | **1 条，无需修复** |
+
+**实现**：注入侧 4 处（`format_tools_instruction` / `format_tool_call_emphasis` / `edit_markdown_spec` /
+`markdown_io._build_edit_prompt`）；解析侧围栏提到分支 0、标记行分支降为分支 1 并标注为
+“Gemini 渲染后的主路径”；新增诊断 warning（有标记却 0 条调用时不再静默）；历史载体与兜底全部保留。
+
+**验证**：`pytest -q` → **303 passed, 18 skipped, 31 subtests**（284 → 303，+19 用例）；区分力实验（换回旧代码）
+→ `test_toolcalls.py` + `test_markdown_io.py` **7 failed / 117 passed**；新增真机探测 `tests/e2e/probe_carrier_fidelity.py`（4 臂）；
+定向回归 `TestCToolParity` → **2 tests OK（74.3s）**。
+
+**代价**：注入文案变长（工具指令 +267 字符≈66 token、强调块 +278≈70、`edit_markdown` 说明 +21≈5）；
+**无工具请求仍为 0 增量**（不注入），P1-5 的 token 预算护栏不受影响。
+
+**详细报告**：`doc/code_block_fence.md`（机制、兼容矩阵、残留与后续方向）。

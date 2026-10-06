@@ -328,6 +328,7 @@ class RenderViewTests(unittest.TestCase):
 
 class GenerateEditTests(unittest.TestCase):
     def test_parses_tool_call(self):
+        """历史一体化载体（``TOOL_CALL: {json}`` 全写一行）仍兼容。"""
         doc = parse_md("a" + NL + "b" + NL + "c" + NL)
 
         def fake_llm(prompt):
@@ -335,6 +336,33 @@ class GenerateEditTests(unittest.TestCase):
             return 'TOOL_CALL: {"name": "edit_markdown", "arguments": {"start": 2, "end": 2, "new_text": "B"}}'
 
         start, end, new_text = generate_edit(doc, "把 b 改成 B", fake_llm)
+        self.assertEqual((start, end, new_text), (2, 2, "B"))
+
+    def test_parses_fenced_carrier(self):
+        """新载体（标记行 + ```tool_call 围栏，见 doc/code_block_fence.md）。"""
+        doc = parse_md("a" + NL + "b" + NL + "c" + NL)
+
+        def fake_llm(prompt):
+            # 注入块自己也得给对载体（提示词与解析器同源）
+            self.assertIn("TOOL_CALL:" + NL + F + "tool_call", prompt)
+            return (
+                "TOOL_CALL:" + NL + F + "tool_call" + NL
+                + '{"name": "edit_markdown", "arguments": {"start": 2, "end": 2, "new_text": "B"}}'
+                + NL + F
+            )
+
+        start, end, new_text = generate_edit(doc, "把 b 改成 B", fake_llm)
+        self.assertEqual((start, end, new_text), (2, 2, "B"))
+
+    def test_parses_rendered_hybrid_dom_form(self):
+        """真机 DOM 形态（标记行 + `Code snippet` 标题 + 保真 JSON）。"""
+        doc = parse_md("a" + NL + "b" + NL + "c" + NL)
+        reply = (
+            "TOOL_CALL:" + NL + NL + "Code snippet" + NL
+            + '{"name": "edit_markdown", "arguments": {"start": 2, "end": 2, "new_text": "B"}}'
+        )
+
+        start, end, new_text = generate_edit(doc, "把 b 改成 B", lambda prompt: reply)
         self.assertEqual((start, end, new_text), (2, 2, "B"))
 
     def test_rejects_out_of_range(self):

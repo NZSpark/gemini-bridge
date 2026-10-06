@@ -2,9 +2,22 @@
 
 Gemini 网页版并不原生支持 OpenAI 的 function calling，因此这里采用
 “提示词注入 + 结构化解析”的方式模拟：
-  1. 把客户端传来的 tools 描述注入到 prompt，要求模型用 ```tool_call 代码块回话；
-  2. 解析模型输出里的代码块，还原为 OpenAI 的 tool_calls；
+  1. 把客户端传来的 tools 描述注入到 prompt，要求模型用「`TOOL_CALL:` 标记行 +
+     ```tool_call 代码块」回话；
+  2. 解析模型输出里的标记与代码块，还原为 OpenAI 的 tool_calls；
   3. 下一轮请求里 role=tool 的执行结果再拼回 prompt 喂给网页版。
+
+载体（carrier）为什么是「纯文本标记行 + 代码围栏」的混合形态：
+
+* 纯文本 ``TOOL_CALL: {...}`` 一行装全部内容会被网页版当 markdown **段落**渲染——
+  反斜杠转义被消费、连续空白被折叠，JSON 直接不再合法；
+* 只用 ```tool_call 围栏也不够：Gemini 把代码块渲染成 code-snippet 组件，**围栏与
+  info string 都不会进 innerText**（DOM 里只剩 UI 标题 ``Code snippet``），
+  于是回复里连一个可识别的标记都没有，整条调用被静默丢弃。
+
+所以：**标记行只负责“可识别”（载有无载荷，弄坏也没关系），围栏只负责“逐字节保真”**
+（载有全部载荷，不需要它携带任何标记）。真机对照与兼容矩阵见 ``doc/code_block_fence.md``；
+纯文本行 + JSON 的历史一体化载体仍在解析侧兼容，但不再被注入。
 """
 
 import json
@@ -18,13 +31,27 @@ from .models import FunctionCall, ToolCall
 
 logger = logging.getLogger(__name__)
 
-# 当前注入格式：行首 ``TOOL_CALL:`` 纯文本标记（大小写不敏感）。
+# ``TOOL_CALL:`` 标记行（大小写不敏感）。两重用途：
+#   * 当前注入载体的**标记行**（见 parse_tool_calls 分支 1）：后面跟的往往不是同一个
+#     段落里的 JSON，而是网页版渲染后的 ``Code snippet`` 标题 + 围栏内容——直接对它
+#     后面那段文字做平衡扫描就能拿到 JSON；
+#   * 历史一体化载体（``TOOL_CALL: {json}`` 全写一行）的兼容路径。
 # 只认行首（允许前导空白），避免正文里偶然出现的 "TOOL_CALL:" 被误触发；
 # 后续 JSON 由 _iter_balanced_objects 从冒号之后开始扫。
 _TOOL_CALL_LINE_RE = re.compile(r"^[ \t]*TOOL_CALL\s*:\s*", re.IGNORECASE | re.MULTILINE)
-# 仅匹配 "tool_call" / "tool-call" 围栏，避免误伤普通 ```json 代码块。
+# ```tool_call 代码围栏（围栏内一条 JSON）。这是注入载体里**承载载荷**的那一半。
+# 它只在“围栏没有被网页版渲染掉”时命中（客户端把回复原样贴回、或别的 DOM 形态）；
+# 被渲染掉时靠标记行 + 裸标签兑底两条路径接手（见 doc/code_block_fence.md §4）。
+#
+# 只匹配 "tool_call" / "tool-call"，**刻意不认** ```json：客户端与模型的正常对话里
+# 经常展示 JSON 代码块，只要其中恰好有 name/arguments 就会被当调用执行——模型可控
+# 文本触发本机命令，这是不可接受的安全面，因此 info string 必须唯一。
 # 允许围栏被 DOM/引用符号包裹： ``> ```tool_call `` 这类形态也要能识别。
-_TOOL_CALL_FENCE_RE = re.compile(r"```\s*(tool[-_]call)\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+_TOOL_CALL_FENCE_RE = re.compile(
+    r"```[ \t]*(tool[-_]call)[ \t]*\r?\n(.*?)```", re.DOTALL | re.IGNORECASE
+)
+# 诊断用：回复里是否出现了任何一种工具调用载体标记（含被渲染成裸标签的形态）。
+_CARRIER_MARKER_RE = re.compile(r"tool[_\- ]?call", re.IGNORECASE)
 # Gemini 网页版 markdown 渲染会在标识符里插入转义反斜杠：
 #   TOOL_CALL -> TOOL\_CALL, exec_command -> exec\_command
 # 取回 inner_text 时就带着这些反斜杠。解析前先去掉“反斜杠 + 下划线”的转义，
@@ -131,11 +158,25 @@ def should_register_edit_markdown(client_tools: Optional[List[Dict[str, Any]]]) 
 
 def edit_markdown_spec() -> str:
     """Usage notes for edit_markdown injected into the prompt (anchors / fences caveats)."""
+    example = json.dumps(
+        {
+            "name": "edit_markdown",
+            "arguments": {
+                "path": "README.md",
+                "start": "<int>",
+                "end": "<int>",
+                "new_text": "<replacement text>",
+            },
+        },
+        ensure_ascii=False,
+    )
     return "\n".join([
         "[edit_markdown notes]",
         "When editing a Markdown file, prefer edit_markdown over rewriting the whole file and doing plain-text matching:",
-        'TOOL_CALL: {"name": "edit_markdown", "arguments": {"path": "README.md", '
-        '"start": <int>, "end": <int>, "new_text": "<replacement text>"}}',
+        "TOOL_CALL:",
+        "```tool_call",
+        example,
+        "```",
         "start/end are 1-based inclusive line numbers; content outside the range (including blank lines, indentation, trailing whitespace) is preserved verbatim.",
         "Do not touch ``` fence lines; content inside a fence does not participate in structural positioning.",
         "By default only a diff is returned; once confirmed, pass write=true to persist to disk.",
@@ -257,24 +298,31 @@ def format_tools_instruction(tools: List[Dict[str, Any]]) -> str:
         if params:
             lines.append(f"  parameters (JSON Schema): {json.dumps(params, ensure_ascii=False)}")
 
-    # Always use a plain-text `TOOL_CALL: {json}` line, **never** a ```tool_call code fence.
-    # Reason: the Gemini web UI renders markdown code fences as a Code snippet component,
-    # corrupting the fence/newlines when the DOM text is retrieved and breaking tool_call
-    # parsing; plain text lines are not rendered as code blocks and come back verbatim.
-    # The parser (_TOOL_CALL_LINE_RE) already treats that form as the preferred one.
+    # 载体：```tool_call 代码围栏（围栏内一条 JSON）。**不要**改回纯文本行：
+    # 网页版会把它当 markdown 段落渲染——吃掉反斜杠转义、折叠缩进，长行还会丢收尾
+    # 花括号，整条调用被静默丢弃（机制与真机对照见 doc/code_block_fence.md）。
     lines += [
         "",
-        "When you need to call a tool, output only one or more of the following format as **plain text lines** (no code fences, "
-        "do not add ```):",
-        "TOOL_CALL: {\"name\": \"tool name\", \"arguments\": {arguments object}}",
-        "arguments must be valid JSON: double quotes inside strings must be escaped as \\\" (backslash+quote), "
-        "never write a bare double quote;",
-        "if an argument is a shell command, **switch to single quotes** inside the command (e.g. git commit -m 'msg'), "
-        "to avoid a clash between double quotes in the command and the JSON boundary quotes;",
-        "if an argument contains multi-line content or markdown code fences, escape every newline as \\n and every "
-        "double quote as \\\" inside the string; never emit a raw newline or a bare double quote inside a JSON string;",
-        "one call per line; you may output multiple lines to call multiple tools in parallel; do not output extra explanation outside the TOOL_CALL lines.",
-        "If you do not need to call any tool, just give the final answer directly; do not output a TOOL_CALL line.",
+        "To call a tool, output a plain-text marker line, then a fenced code block whose info "
+        "string is exactly `tool_call`, containing ONE JSON object and nothing else:",
+        "TOOL_CALL:",
+        "```tool_call",
+        '{"name": "TOOL_NAME", "arguments": {"ARG_NAME": "ARG_VALUE"}}',
+        "```",
+        "Rules:",
+        "- Output BOTH parts, in this order: the marker line must be exactly `TOOL_CALL:` on its "
+        "own line, and the fence label must be exactly `tool_call` (not json / text / empty). "
+        "The JSON must live inside the fence. A call written as a single plain-text line "
+        "(e.g. `TOOL_CALL: {...}` all on one line) will NOT be executed: the web UI eats its "
+        "backslash escapes there (and may collapse indentation), so the JSON stops being valid.",
+        "- Inside JSON strings, escape double quotes as \\\" and newlines as \\n; keep the JSON on one "
+        "line inside the fence.",
+        "- Paste command/script text into the JSON string verbatim - the fenced block preserves it. "
+        "As a supplementary precaution, prefer single quotes inside shell commands "
+        "(e.g. git commit -m 'msg'), so the command needs no escaped double quote at all.",
+        "- You may output several fenced blocks to call several tools in parallel; do not output "
+        "extra explanation outside the fenced blocks.",
+        "If you do not need to call any tool, just give the final answer directly; do not output a fence.",
     ]
     return "\n".join(lines)
 
@@ -288,12 +336,18 @@ def format_tool_call_emphasis() -> str:
     """
     return "\n".join([
         "[Output Format Emphasis] This is a new session (or one that was just reset); the following rules stay in effect for this whole session:",
-        "When you need to call a tool, output only the following format as **plain text lines** (no code fences, do not add ```):",
-        "TOOL_CALL: {\"name\": \"tool name\", \"arguments\": {arguments object}}",
-        "arguments must be valid JSON: double quotes inside strings must be escaped as \\\" (backslash+quote), "
-        "never write a bare double quote; otherwise the web UI renders the content as code and the arguments get truncated.",
-        "if an argument is a shell command, **switch to single quotes** inside the command (e.g. git commit -m 'msg'), "
-        "to avoid a clash between double quotes in the command and the JSON boundary quotes.",
+        "To call a tool, output a plain-text marker line, then a fenced code block whose info string is exactly `tool_call`, holding ONE JSON object:",
+        "TOOL_CALL:",
+        "```tool_call",
+        '{"name": "TOOL_NAME", "arguments": {"ARG_NAME": "ARG_VALUE"}}',
+        "```",
+        "Output BOTH parts in this order (marker line first, then the fence); the marker line must "
+        "be exactly `TOOL_CALL:` and the fence label must be exactly `tool_call`. The JSON must "
+        "live inside the fence: a call written as a single plain-text line (e.g. `TOOL_CALL: {...}`) "
+        "will NOT be executed, because the web UI eats its backslash escapes there.",
+        "Inside JSON strings, escape double quotes as \\\" and newlines as \\n, and keep the JSON on one "
+        "line inside the fence. Paste command text verbatim - the fenced block preserves it.",
+        "As a supplementary precaution, prefer single quotes inside shell commands (e.g. git commit -m 'msg').",
         "Use the tool names exactly as listed in [Tool Calling Instructions]; do not invent generic names like bash / shell.",
         "Do not output XML/DSL markers such as <｜DSML｜ ...>, <invoke>/<parameter>, <tool_calls> - they will not be executed.",
     ])
@@ -749,12 +803,13 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
     """从模型回复中解析出工具调用列表。返回 [{"name": ..., "arguments": {...}}, ...]
 
     需要兼容多种形态（新→旧）：
-      0. **首选**：行首 ``TOOL_CALL: {...}`` 纯文本标记（当前注入格式，无尖括号、
-         无围栏，模型无法脑补出 ``>`` 造成历史污染）；
-      1. 带围栏的 ```tool_call ... ```代码块（模型直接输出 markdown 时）；
-      2. **无围栏**的 ``tool_call`` 标签 + JSON 对象——这是从 Gemini 网页 DOM
-         提取 inner_text 后的常见形态：代码块被渲染成 <pre>，围栏退化为标题文字，
-         于是只剩 ``tool_call`` 标签与裸 JSON。
+      0. ```tool_call 代码围栏（注入载体中**承载载荷**的那一半；围栏没被渲染掉时的主路径）；
+      1. ``TOOL_CALL:`` 标记行 + 其后第一个平衡 JSON 对象——**Gemini 渲染后的主路径**：
+         围栏与 info string 都不会进 innerText，DOM 里只剩标记行、UI 标题 ``Code snippet``
+         和保真保留的 JSON 本体，于是“标记忆号行的段”里扫出 JSON 就是调用。
+         历史一体化载体（``TOOL_CALL: {json}`` 全写一行）也走同一条分支；
+      2. **无围栏**的 ``tool_call`` 标签 + JSON 对象（另一些 DOM/引用形态下的兑底）；
+      3. DSML / ```json 兑底（网页版偶发输出 / 历史数据）。
     """
     if not text:
         return []
@@ -798,7 +853,21 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
             if normalized:
                 calls.append(normalized)
 
-    # 0. 首选形态：行首 TOOL_CALL: 后跟一个平衡 JSON 对象。
+    # 0. 首选载体：```tool_call 围栏（当前注入格式，未渲染时的主路径）。
+    #    每个围栏一条调用，多个围栏＝并行多调用。围栏内不是单个 JSON（几个对象
+    #    并列 / 夹着说明文字）时再退到平衡扫描，避免把合法单对象重复消费成两条。
+    for match in _TOOL_CALL_FENCE_RE.finditer(text):
+        before = len(calls)
+        _consume(match.group(2), allow_bare_object=True)
+        if len(calls) == before:
+            for obj in _iter_balanced_objects(match.group(2)):
+                _consume(obj, allow_bare_object=True)
+
+    # 1. TOOL_CALL: 标记行 + 其后第一个平衡 JSON 对象。
+    #
+    #    这是 Gemini 渲染后**最常用**的一条：标记行之后跟的不是同一段落的 JSON，
+    #    而是被渲染成代码块的内容（DOM 里表现为 ``Code snippet`` 标题 + 原样 JSON）；
+    #    平衡扫描会跳过中间那些非 JSON 文字，直接拿到对象。
     #
     #    契约：**每个 TOOL_CALL: 标记只取其后第一个平衡 JSON 对象；一行一调用；
     #    多个调用必须写成多行**。同行第二个对象会被丢弃（这是有意为之——
@@ -807,7 +876,7 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
     #    segment 必须截到**下一个 TOOL_CALL 标记之前**：否则某个标记后面若没跟
     #    对象（模型写了标记又改主意），它会把下一个标记的对象当成自己的消费掉，
     #    轮到下一个标记时又消费同一个对象 → 同一次调用重复出现两次。
-    matches = list(_TOOL_CALL_LINE_RE.finditer(text))
+    matches = list(_TOOL_CALL_LINE_RE.finditer(text)) if not calls else []
     for index, match in enumerate(matches):
         next_start = matches[index + 1].start() if index + 1 < len(matches) else len(text)
         segment = text[match.end():next_start]
@@ -827,10 +896,6 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
         for obj in objs:
             _consume(obj, allow_bare_object=True)
             break
-
-    if not calls:
-        for match in _TOOL_CALL_FENCE_RE.finditer(text):
-            _consume(match.group(2), allow_bare_object=True)
 
     if not calls:
         # DSML 风格 XML 包裹的工具调用（网页版偶发输出）
@@ -883,6 +948,16 @@ def parse_tool_calls(text: str, valid_names: Optional[set] = None) -> List[Dict[
                 break
             if not parsed:
                 pos = match.end()
+
+    # 可观测性：回复里分明出现了载体标记/围栏（``tool_call`` / ``TOOL_CALL:``），却一条
+    # 可用调用都没交出去。以前这条路径**完全静默**——客户端只收到一段纯文本就当任务
+    # 结束，日志也没线索。这里至少留下一行 warning 便于事后定位（截断 / 格式违规 /
+    # 工具名不在客户端 tools 里）。
+    if not calls and _CARRIER_MARKER_RE.search(text):
+        logger.warning(
+            "回复含工具调用标记/围栏，但未产出任何可用调用（截断、格式违规或工具名不合法）：%s",
+            text[:200].replace("\n", "\\n"),
+        )
 
     # 护栏：若传入了 valid_names，则过滤掉不在其中的幻觉工具名；否则保留全部解析出的工具调用。
     if valid_names is not None:
