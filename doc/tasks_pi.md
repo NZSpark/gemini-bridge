@@ -60,6 +60,7 @@
   - **状态**：已完成（实现于 Lifespan 周期任务）。
   - **验收**：`tests/test_sessions.py` 及相关测试通过。
 
-- [ ] **T3.3 网页 DOM 结构外置诊断与自愈日志**
-  - **说明**：增强 `_composer_diag` 的 DOM 结构快照输出，方便输入框或发送按钮改版时快速排查。
-  - **验收**：在输入框定位失败时，日志中能完整输出包含 `child_nodes` 与 activeElement 的 JSON 结构。
+- [x] **T3.3 网页 DOM 结构外置诊断与自愈日志**
+  - **说明**：增强 `_composer_diag` 的 DOM 结构快照输出（包含 id、className、parent_tag、activeElement 及 caret_in_composer 等），方便输入框或发送按钮改版时快速排查。
+  - **状态**：已完成（实现于 `gemini_web/chat_io.py`）。
+  - **验收**：在输入框定位失败或写入异常时，日志中能完整输出包含 DOM 属性与层级关系的 JSON 结构。
