@@ -42,9 +42,10 @@
   - **状态**：已完成（实现于 `gemini_web/toolcalls.py`）。
   - **验收**：`tests/test_parsing.py::test_truncated_json_repair_with_missing_braces` 通过。
 
-- [ ] **T2.3 长文本多轮会话上限到顶自动无缝轮转**
+- [x] **T2.3 长文本多轮会话上限到顶自动无缝轮转**
   - **说明**：当触发 `SESSION_MAX_TURNS` / `SESSION_MAX_TOKENS` 时自动创建新会话并重新播种任务快照。
-  - **验收**：模拟会话爆页，断言在新会话中 Agent 无感续接 Task Goal。
+  - **状态**：已完成（实现于 `gemini_web/session_store.py` 和 `gemini_web/chat_io.py`）。
+  - **验收**：`tests/test_sessions.py::test_session_over_budget_triggers_rotation` 及相关单元测试通过。
 
 ---
 
