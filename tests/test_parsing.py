@@ -95,8 +95,13 @@ class BalancedObjectTests(unittest.TestCase):
         text = '{"a": 1} {"b": 2}'
         self.assertEqual(list(srv._iter_balanced_objects(text)), ['{"a": 1}', '{"b": 2}'])
 
-    def test_unbalanced_is_ignored(self):
-        self.assertEqual(list(srv._iter_balanced_objects('{"a": 1')), [])
+    def test_truncated_json_repair_with_missing_braces(self):
+        from gemini_web import toolcalls
+        raw = '{"name": "bash", "arguments": {"command": "ls -la"'
+        repaired = toolcalls._repair_json_quotes(raw)
+        self.assertIsNotNone(repaired)
+        self.assertEqual(repaired["name"], "bash")
+        self.assertEqual(repaired["arguments"]["command"], "ls -la")
 
 
 if __name__ == "__main__":

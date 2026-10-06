@@ -682,6 +682,15 @@ def _repair_json_quotes(raw: str) -> Optional[Any]:
         except Exception:
             raw = ctrl_fixed  # 控制字符已修，继续尝试引号修复
 
+    # 针对未闭合或中间断点的 HTML/Markdown 字符做简易收尾修复守护
+    try:
+        fixed_raw = raw.rstrip()
+        if fixed_raw.count('{') > fixed_raw.count('}'):
+            fixed_raw += '}' * (fixed_raw.count('{') - fixed_raw.count('}'))
+        return json.loads(fixed_raw)
+    except Exception:
+        pass
+
     # 说明：曾尝试用"结构定位"重写值内嵌套引号，但 JSON 值内嵌 shell 双引号
     # 本质有歧义（无法区分"值的边界引号"与"正文引号"），实验版本会产出"合法
     # 但错误"的截断命令。改为在 prompt 层要求命令内部用单引号从源头消除歧义，
