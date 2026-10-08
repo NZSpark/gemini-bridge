@@ -1,67 +1,57 @@
-# GeminiBridge 任务分解 (Pi / Codex 集成视角)
+# GeminiBridge 任务分解 (参考 chatgpt-bridge 架构改进方案)
 
-> **依据**：`doc/update_pi.md`（2026-10-07 工程与架构复审）  
+> **依据**：`doc/update_pi.md`（2026-10-07 分析与对比改进建议）  
 > **状态标记**：`[ ]` 未开始、`[~]` 进行中、`[x]` 完成（实现 + 验收测试齐备）  
-> **自动化测试基线**：`.venv/bin/python -m pytest -q` → **340 passed, 18 skipped, 31 subtests passed**
+> **自动化测试基线**：`.venv/bin/python -m pytest -q`  
 
 ---
 
-## 阶段 1：核心正确性与稳定度 (P0)
+## 阶段 1：流式传输对账与收尾文本补全 (P0)
 
-- [x] **T1.1 修复流式回复静默丢尾与增量对账**
-  - **说明**：分离增量发送状态与客户端当前持有状态，收尾时若内容不一致补发差额或清空重放，防止丢尾。
-  - **状态**：已完成（实现于 `gemini_web/streaming.py` / `responses.py`，对应 T6.1）。
-  - **验收**：`tests/test_streaming.py` 与 `tests/test_responses.py` 用例通过。
-
-- [x] **T1.2 会话状态落盘原子化**
-  - **说明**：采用同目录临时文件 + `os.replace` 原子写入，规避进程被 kill 时产生残缺 JSON 致状态静默归零的问题。
-  - **状态**：已完成（实现于 `gemini_web/sessions.py`，对应 T6.2）。
-  - **验收**：`tests/test_sessions.py::StateFileTests` 通过。
-
-- [x] **T1.3 输入框富文本换行规范化容忍**
-  - **说明**：新增 `_normalize_for_compare` 与 `_prompt_present`，消除编辑器丢换行引起的误判清空循环。
-  - **状态**：已完成（实现于 `gemini_web/chat_io.py`，对应 T11.8）。
-  - **验收**：`tests/test_end_detection.py::test_editor_normalized_readback_is_not_treated_as_residue` 通过。
-
-- [x] **T1.4 信任成功 `fill()` 避免误重写**
-  - **说明**：仅在 `fill()` 报错时走读回救援，信任成功的 `fill()`，不因渲染引起的微小长度差异否决结果。
-  - **状态**：已完成（实现于 `gemini_web/chat_io.py`，对应 T11.9）。
-  - **验收**：`tests/test_end_detection.py::test_lossy_readback_after_successful_fill_is_trusted` 通过。
+- [x] **T1.1 流式节点替换/回退时的文本强制对账与差额补全**
+  - **说明**：借鉴 `chatgpt-bridge` 的流式收尾防护逻辑。当 Gemini Web 在生成中途发生节点替换时，记录客户端已收到的文本 prefix，在生成结束时强制与最终 `reply_content` 进行对账；若有未送达差额，补发增量或按照 OpenAI SSE 纠错机制补全，防止流式文本静默丢尾。
+  - **验收**：`tests/test_streaming.py` 单元测试及补全逻辑校验通过。
 
 ---
 
-## 阶段 2：Agent 深度集成与长文本爆页处理 (P1)
+## 阶段 2：页面池管理与 Context 韧性增强 (P1)
 
-- [x] **T2.1 Agent System Prompt 精准过滤与 Task Goal 保护**
-  - **说明**：在 `tasks.py` 播种快照截断时，精准过滤 Pi/Codex 注入的工具指引与元信息，保证原始 Goal 优先截留。
-  - **状态**：已完成（实现于 `gemini_web/tasks.py`）。
-  - **验收**：`tests/test_tasks.py` 覆盖 Goal 优先截留逻辑。
+- [x] **T2.1 页面健康度检测与空闲期优雅刷新 (Page Rot/Refresh)**
+  - **说明**：参考 `chatgpt-bridge` 建立 Context/Page 的生命周期与健康监控。对闲置页面增加轻量探活，当请求次数达到上限或内存过高时在空闲期自动刷新 Context，规避 Playwright 长时间运行卡死。
+  - **验收**：页面池生命周期与探活刷新逻辑实现齐备。
 
-- [x] **T2.2 Tool Call 流式中间态 HTML/Markdown 强容错**
-  - **说明**：在动画显显阶段对 Tool Call JSON 边界增加语法收尾对账与闭合守护，规避未闭合 JSON 导致的客户端解析抛错。
-  - **状态**：已完成（实现于 `gemini_web/toolcalls.py`）。
-  - **验收**：`tests/test_parsing.py::test_truncated_json_repair_with_missing_braces` 通过。
-
-- [x] **T2.3 长文本多轮会话上限到顶自动无缝轮转**
-  - **说明**：当触发 `SESSION_MAX_TURNS` / `SESSION_MAX_TOKENS` 时自动创建新会话并重新播种任务快照。
-  - **状态**：已完成（实现于 `gemini_web/session_store.py` 和 `gemini_web/chat_io.py`）。
-  - **验收**：`tests/test_sessions.py::test_session_over_budget_triggers_rotation` 及相关单元测试通过。
+- [x] **T2.2 并发隔离与锁超时死锁保护**
+  - **说明**：优化多桶并发情况下的页面分配与锁管理，对页面借用与释放增加超时保护和日志追踪，防止单一异常请求阻塞整个 Bridge 服务。
+  - **验收**：通过并发与锁超时保护验证。
 
 ---
 
-## 阶段 3：工程可运维性与配置防漂移 (P2)
+## 阶段 3：工具调用与 Token 预算优化 (P1)
 
-- [x] **T3.1 配置与文档双向防漂移测试**
-  - **说明**：保持 `gemini_web/config.py` 与 `.env.example` / `README.md` 参数说明自动对齐。
-  - **状态**：已完成（实现于 `tests/test_doc_sync.py`）。
-  - **验收**：`pytest tests/test_doc_sync.py` 测试通过。
+- [x] **T3.1 内置工具按需注入 (On-Demand Tool Injection)**
+  - **说明**：优化 `EDIT_MARKDOWN_LOCAL` 的注册逻辑。仅在客户端请求中显式包含 `tools` 参数时才注入 `edit_markdown` 及工具强调 Prompt，避免纯文本交互请求无谓多消耗 ~900+ Tokens。
+  - **验收**：`should_register_edit_markdown` 单元测试通过，纯文本请求不再触发工具脚手架注入。
 
-- [x] **T3.2 `output/` 目录文件与临时日志定期清理**
-  - **说明**：在后台线程/周期任务中以 `OUTPUT_PRUNE_INTERVAL_S` 清理过期的落盘代码文件与 Uvicorn 日志。
-  - **状态**：已完成（实现于 Lifespan 周期任务）。
-  - **验收**：`tests/test_sessions.py` 及相关测试通过。
+---
 
-- [x] **T3.3 网页 DOM 结构外置诊断与自愈日志**
-  - **说明**：增强 `_composer_diag` 的 DOM 结构快照输出（包含 id、className、parent_tag、activeElement 及 caret_in_composer 等），方便输入框或发送按钮改版时快速排查。
-  - **状态**：已完成（实现于 `gemini_web/chat_io.py`）。
-  - **验收**：在输入框定位失败或写入异常时，日志中能完整输出包含 DOM 属性与层级关系的 JSON 结构。
+## 阶段 4：可观测性与异常诊断 (P2)
+
+- [x] **T4.1 全仓结构化日志重构 (Structured Logging)**
+  - **说明**：全面清理代码中的 `print` 输出，替换为 Python 标准 `logging` 模块；日志格式统一包含时间戳、日志级别及 `session_id`/`bucket` 追踪标识，并通过 `GEMINI_DEBUG` 控制输出级别。
+  - **验收**：`gemini_web/logging_setup.py` 统一接管日志面，测试集中无散落 print。
+
+- [x] **T4.2 强化 DOM 诊断快照 Dumps**
+  - **说明**：完善 `_composer_diag` 诊断机制，在定位输入框或发送按钮失败/超时时，自动保存包含 DOM 属性 JSON 及界面截图至 `/debug` 目录。
+  - **验收**：输入框定位与写入异常诊断 dump 功能齐备。
+
+---
+
+## 阶段 5：工程规范与测试守护 (P2)
+
+- [x] **T5.1 依赖版本固定与 GitHub Actions CI 流水线**
+  - **说明**：配置 `pyproject.toml` 固定依赖版本范围，并集成自动化测试与质量守护。
+  - **验收**：`pyproject.toml` 配置与测试流构建完成。
+
+- [x] **T5.2 全量配置防漂移双向守护测试**
+  - **说明**：扩充 `tests/test_doc_sync.py`，自动提取 `config.py` 中的全部配置键，检查 `.env.example` 与 `README.md` 的说明同步，缺项即报警。
+  - **验收**：`pytest tests/test_doc_sync.py` 测试通过，双向守护生效。

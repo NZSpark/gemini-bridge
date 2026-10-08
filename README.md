@@ -4,6 +4,14 @@
 
 面向 Pi、Codex CLI、`agy` 等只认 OpenAI 端点的客户端。
 
+## 项目数据统计
+
+- **开发周期**：2026-10-03 至 2026-10-07
+- **Git 提交数**：45 次 commits
+- **代码总行数**：12,631 行 Python 代码
+  - **核心业务逻辑 (`gemini_web/` + `gemini_api_server.py`)**：6,203 行
+  - **自动化测试套件 (`tests/`)**：6,428 行
+
 ## 特性
 
 - **OpenAI 兼容端点**：`/v1/models`、`/v1/chat/completions`、`/v1/responses`。
