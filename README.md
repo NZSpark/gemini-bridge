@@ -2,7 +2,7 @@
 
 把 Gemini 网页版包装成 **OpenAI 兼容 API** 的本地桥接服务。用 Playwright 驱动一个持久化的浏览器会话，把 `/v1/chat/completions`（以及可选 `/v1/responses`）请求转发到 Gemini 网页界面，再把回复转回标准 OpenAI 结构。
 
-面向 Pi、Codex CLI、`agy` 等只认 OpenAI 端点的客户端。
+面向 OpenAI SDK、Pi、Codex CLI 等只认 OpenAI 端点的客户端与应用。
 
 ## 项目数据统计
 
