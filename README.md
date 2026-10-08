@@ -6,11 +6,11 @@
 
 ## 项目数据统计
 
-- **开发周期**：2026-10-03 至 2026-10-07
-- **Git 提交数**：45 次 commits
-- **代码总行数**：12,631 行 Python 代码
-  - **核心业务逻辑 (`gemini_web/` + `gemini_api_server.py`)**：6,203 行
-  - **自动化测试套件 (`tests/`)**：6,428 行
+- **开发周期**：2026-10-03 至 2026-10-08
+- **Git 提交数**：47 次 commits
+- **代码总行数**：12,989 行 Python 代码
+  - **核心业务逻辑 (`gemini_web/` + `gemini_api_server.py`)**：6,368 行
+  - **自动化测试套件 (`tests/`)**：6,621 行
 
 ## 特性
 
@@ -61,13 +61,25 @@ curl http://127.0.0.1:8001/v1/models
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://127.0.0.1:8001/v1", api_key="unused")
+client = OpenAI(
+    base_url="http://127.0.0.1:8001/v1",
+    api_key="unused",                                     # 未设 BRIDGE_TOKEN 时随便填
+    default_headers={"X-Gemini-Session": "python-sdk"},   # 可选：固定会话桶，见下
+)
 resp = client.chat.completions.create(
-    model="gemini",
+    model="gemini-chat",                                  # /v1/models 返回的 id
     messages=[{"role": "user", "content": "你好"}],
 )
 print(resp.choices[0].message.content)
 ```
+
+- `model` 用 `/v1/models` 返回的 `gemini-chat` / `gemini-reasoner`。
+- **会话桶**：不传 `X-Gemini-Session` 时，桥按 User-Agent 自动分桶——SDK 的
+  `OpenAI/Python x.y.z` 会落到 `ua:openai` 桶。每个桶持有**独立的网页页面与会话**；
+  固定一个桶名（如 `python-sdk`，或用请求字段 `user="python-sdk"`）可让同一客户端
+  稳定复用同一条网页会话，也便于 `/healthz` 按桶排查。
+- 想让所有客户端共用默认会话（不按 UA 自动隔离）：`.env` 设 `SESSION_SCOPING_BY_UA=false`。
+- 流式/非流式都支持；`temperature`、`max_tokens` 等字段会被忽略（网页版接口没有这些旋钮）。
 
 ### Pi 接入
 
@@ -300,6 +312,7 @@ user_data/                浏览器 profile 与状态（gitignore）
 | profile 被占用 | 同一时间只允许一个实例，先 `pkill` 旧进程 |
 | Codex 连接断开 | 调大客户端 `stream_idle_timeout_ms`，或调小 `RESPONSES_KEEPALIVE_S` |
 | 抓不到回复节点 | `/debug/dom` 定位，改 `.env` 里的选择器 |
+| 某个会话桶一直 502「无法找到对话输入框」，其它桶正常 | 该桶的标签被手工关闭或崩溃（句柄已失效）。桥会在下一次请求时**自动重建该桶的页面并重新播种**；若报的是默认桶，或版本还不含该修复，重启服务即可（登录态在 `user_data/`，重启不丢）。排查先看 `curl -s http://127.0.0.1:8001/healthz` 的 `session_keys` / `open_pages`，并用 `X-Gemini-Session: default` 发一次请求对比 |
 | 有头模式下报「无法找到对话输入框」/ 输入焦点丢失 | 有头 Chromium 是真实窗口，切到其它 App 会失焦，甚至被系统挂起或降级为后台标签。后台标签的 `requestAnimationFrame` 被节流，Gemini 懒渲染会卸载或延迟挂载输入框，`chat_io.py` 的 `wait_for_selector(INPUT_SELECTORS, timeout=3000)` 三个候选全部超时，于是抛「无法找到对话输入框」；窗口不在前台时 `fill()` + `press("Enter")` 的按键也会落到别的窗口。对策：在 `.env` 设 `HEADLESS=1`（解析器认 `1`/`true`/`yes`/`on`），无头不参与窗口焦点竞争，首次登录仍用有头，之后切无头；仍用有头时，发送前先 `page.bring_to_front()` 并 `focus()` 输入框，给定位加整体重试（如 3 次 × 2s，期间 `bring_to_front()`），并可加 `--disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows` 缓解后台节流 |
 
 ## 安全

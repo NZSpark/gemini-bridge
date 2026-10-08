@@ -228,7 +228,11 @@ GeminiBridge/
 - 首次请求 / 轮转时点击 `NEW_CHAT_SELECTOR` 开一个干净对话，不尝试恢复旧会话。
 - `READY_SELECTOR` 判定可输入后，向 `INPUT_SELECTORS` 首个命中元素输入文本并发送。
 - 按 `RESPONSE_SELECTORS` 抓取最后一条回复；每 `POLL_INTERVAL_S` 轮询一次。
-- 结束判定：文本不变连续 `STABLE_POLLS` 次，或长度不变连续 `LEN_STABLE_POLLS` 次。
+  发送前的基线与轮询**同一口径**：都取「最后一个**有正文**的节点」（末尾空容器不能把基线带偏）。
+- 结束判定：文本不变连续 `STABLE_POLLS` 次，或长度不变连续 `LEN_STABLE_POLLS` 次；
+  但**只有「新正文」才可收尾**——读到的内容若仍是发送前的旧回复，或只是刚提交 prompt 的回显
+  （选择器可能命中用户消息节点），判为「网页端没有产生新回复」：按超时中止并标记轮转，
+  由重试阶梯重开对话 + 重新播种（否则旧指令会被返回给客户端重复执行，形成提示词叠加死循环）。
 - 超时用 `GEMINI_TIMEOUT`，重试 `GEMINI_RETRIES` 次，退避 `RETRY_BACKOFF_S * n`。
 - profile 被占用、等待超时等情况给出可操作提示。
 
@@ -284,7 +288,8 @@ GeminiBridge/
 - **网页版改版**：选择器集中在 `.env`，改版时只改配置。
 - **登录态失效**：`HEADLESS=false` 手动重登，登录态存 `user_data/`。
 - **profile 被占用**：同一时间只允许一个实例，重复启动给出提示并建议 `pkill`。
-- **结束判定误判**：双阈值（`STABLE_POLLS` / `LEN_STABLE_POLLS`），偏保守。
+- **结束判定误判**：双阈值（`STABLE_POLLS` / `LEN_STABLE_POLLS`），偏保守；
+  且收尾必须拿到**新正文**（旧内容 / prompt 回显会被判为「网页端未产生新回复」并按超时轮转）。
 - **Codex 连接断开**：`RESPONSES_KEEPALIVE_S` 保活，客户端侧调大 `stream_idle_timeout_ms`。
 - **安全**：只监听 `127.0.0.1`，不提交 `user_data/`；`RESET_TOKEN` / `BRIDGE_TOKEN` 可给有副作用的端点加门槛；
   本地 `edit_markdown` 只能改 `EDIT_MARKDOWN_ROOT` 内的文件（默认项目根），`../` 与根外绝对路径均被拒绝。

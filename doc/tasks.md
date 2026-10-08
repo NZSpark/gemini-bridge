@@ -205,6 +205,24 @@
   - 修法：`_send_chat_locked` 增加 `seeded` 参数，`[发送] bucket=X 用{播种|增量} prompt=N 字符`；`send_chat` 把 `use_seed = not has_history` 一并传下去（与实际选择同一变量，不会说一套做一套）。
   - 验收：`pytest -q` → **341 passed**；新增 `test_send_log_distinguishes_seed_from_delta`（同一 driver 连发两次，断言第一行是「用播种 prompt=12 字符」、第二行是「用增量 prompt=9 字符」——长度不同，证明标注与实际发出的是同一份）。
 
+- [x] **T11.12 会话桶页面被关闭后自动重建（OpenAI SDK 的 `ua:openai` 桶永久 502）**（2026-10-09，用户报告）
+  - **真机现象**：OpenAI SDK 调用 chat completion 报 `502 无法找到对话输入框（请在登录状态）`，而 `/v1/models` 200。逐项排除（同一请求换桶）：`X-Gemini-Session: default` → 200 `pong`；新建桶 `diag-probe` → 200 `pong`；对 `ua:openai` 调 `/session/reset` 后再请求 → `500 Page.goto: Target page, context or browser has been closed`。
+  - **根因**：`ua:openai` 桶的标签已被手工关闭 / 崩溃，句柄却一直留在 `_pages`；`_ensure_page` 只看 `bucket in self._pages`、从不检查 `page.is_closed()`。死页面上的 `wait_for_selector` 抛错被当成“选择器没命中”，最终误报「未登录 / 找不到输入框」，且该桶永久 502。
+  - 修法：新增 `_page_closed`；`_ensure_page` 发现句柄失效就摘除并重建（并置 `has_history=False` → 下一轮播种，对话不丢）；新建后的导航失败不把半死句柄留在池里；`_send_chat_locked` 对已关闭页面给出指向真因的报错（默认桶不参与重建，需重启）。
+  - 验收：`pytest -q` → **351 passed, 18 skipped, 31 subtests**（新增 5 例：`ClosedPageRecoveryTests` 4 + `ClosedPageGuardTests` 1）。
+  - **区分力实验**：换回改动前的 `page_pool.py` + `chat_io.py` → 3 failed（重建 / 导航失败清理 / 报错指向真因），恢复后 52 passed。
+  - **未验证**：真机自动重建（运行中的实例需重启）。详见 `doc/update.md` §25。
+
+- [x] **T11.11 回显 / 旧内容不得当作本轮回复：结束判定加固（提示词反复叠加死循环）**（2026-10-08，用户真机报告）
+  - **真机现象**（用户贴出日志）：`[发送] bucket=default 用增量 prompt=7126 字符` → `[输入] fill 完成：读回 7044 字符` → `[长度] 播种内容超出 SEED_MAX_CHARS=6000` → `POST /v1/chat/completions 200 OK`，每 14~15s 一轮、prompt 恒为 7126 字符，无限重复。用户判断：**网页端失去响应，但桥仍然把「指令」交回客户端，导致提示词反复叠加**。
+  - **根因（两条判据同时失守）**：
+    1. 发送前的基线取 `nodes[-1]`，而轮询取「最后一个**有正文**的节点」。网页端不响应时 `nodes[-1]` 常是尚未渲染的空容器 → 基线成空串，轮询回退读到的**上一轮旧回复**（很可能正是上次的工具调用指令）就成了“新回复”；
+    2. 收尾判据不校验内容是否真的更新：`reply_seen` 的「节点数变多」、稳定性判据、以及“生成中信号消失即收尾”都允许 `normalized == before_text`；`stalled` 计数器又用 `normalized or ...` 复位——只要页面上留着旧回复就永不失败。于是桥在 14s 内把上一轮的指令当成本轮回复返回，客户端再执行一遍 → 同一 prompt 反复提交进网页会话（上下文叠加），网页端更不响应。
+  - 修法（`chat_io.py`）：新增 `_latest_reply`（基线与轮询**同一口径**：最后一个有正文的节点）与 `_text_fingerprint` / `_looks_like_prompt_echo`（去空白比较 + 前 120 字符与长度比，容忍编辑器有损渲染）；`text_is_new = 有正文 and 非旧内容 and 非 prompt 回显`，**所有收尾路径都要求 `text_is_new`**；生成信号消失但无新正文连续 `_NO_NEW_TEXT_END_POLLS=2` 轮即 `pending_rotation=True` + `GeminiTimeoutError`；`stalled` 改为只在 `text_is_new or generating` 时复位；流式增量与 `last_text` 也只对新正文生效。下一次重试阶梯因此会**重开对话 + 重新播种**，而不是继续往卡死的会话里灌同一段 prompt。
+  - 验收：`pytest -q`（不含 E2E）→ **337 passed, 23 subtests**；完整套 → **346 passed, 18 skipped, 31 subtests**。
+  - **区分力实验**：换回改动前的 `chat_io.py` → 新增的 4 例守护**全部 failed**（各自的断言都是“没有返回旧内容/回显”），恢复后 38 passed（`test_end_detection.py`）。
+  - **未验证**：真机（需重启服务）。详见 `doc/update.md` §24。
+
 ---
 
 ## 推荐执行顺序
@@ -219,6 +237,7 @@
 | Phase 6 | T8.9 / T8.10 | ✅ 已完成（安全加固：edit_markdown 路径约束、可选 BRIDGE_TOKEN） |
 | 随行 | T9.3 / T9.4 / T9.5 / T10.3 | ✅ 已完成（responses 路由级测试 / tasks 表驱动单测 / 鉴权分支测试 / 历史文档复核） |
 | Phase 7 | T11.1 / T11.2 / T11.3 / T11.4 | ✅ 已完成（工具调用载体改造：标记行 + 代码围栏；fill 超时/重试修复；长度链可观测性；提交链修复 + 成品预算落地） |
+| Phase 8 | T11.5 – T11.12 | ✅ 已完成（分块写入 / 原语与光标 / 空白规范化 / `fill()` 信任 / 发送日志标注 / **结束判定：旧内容与回显不得当回复** / **关闭页面自动重建**） |
 
 > 阶段 6–11 至此全部完成。后续若要继续推进，建议方向见 `doc/update.md` 的“仍未做”与 §8.1 / §4
 > 对照表中明确标注的「仍未做」两项（`ReplyWatcher` 重构、真实环境专属交付物）。

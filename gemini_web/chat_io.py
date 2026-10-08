@@ -23,6 +23,12 @@ from .prompting import _delta_piece, estimate_tokens
 
 logger = logging.getLogger(__name__)
 
+# 「停止生成」信号已经消失、但末节点读到的还不是本轮新正文时，连续容忍的轮询次数：
+# 超过即认定网页端这一轮没有产生新回复——按超时中止，由 ``send_chat`` 的重试阶梯
+# 重开对话 + 重新播种。取 2：给回复正文渲染进 DOM 留约一个轮询周期的余量，
+# 又远小于 ``STALL_POLLS`` 的兜底阈值（默认 20）。
+_NO_NEW_TEXT_END_POLLS = 2
+
 
 def prune_output_dir(output_dir: str) -> int:
     """按 config 的保留策略清理落盘目录（0 = 不限）。返回删除的文件数。
@@ -277,6 +283,26 @@ class ChatIOMixin:
             return await node.inner_text()
         except Exception:
             return ""
+
+    async def _latest_reply(self, page):
+        """取「最后一个有正文的回复节点」的 ``(节点, 文本, 命中节点总数)``。
+
+        发送前的基线快照与轮询判定必须用**同一口径**。旧实现的基线取
+        ``nodes[-1]``：Web 端失去响应时最后一个命中节点常是尚未渲染的空容器，
+        基线于是变成空串，而轮询会跳过空节点、回退读到上一轮的旧回复——
+        旧回复被当成「本轮新回复」返回给客户端（客户端会把旧指令再执行一遍）。
+
+        没有正文时返回 ``(None, "", 节点数)``。
+        """
+        nodes = await page.query_selector_all(config.RESPONSE_SELECTORS)
+        for node in reversed(nodes):
+            try:
+                text = await self._complete_text(node)
+            except Exception:
+                continue
+            if text and text.strip():
+                return node, text, len(nodes)
+        return None, "", len(nodes)
 
     async def _has_pending_tokens(self, node) -> bool:
         """回复节点里是否还有尚未显现的 token（span.pending 等）。
@@ -904,6 +930,41 @@ class ChatIOMixin:
         return re.sub(r"\s+", " ", text).strip()
 
     @classmethod
+    def _text_fingerprint(cls, text: str) -> str:
+        """比较用文本指纹：**删掉所有空白**。
+
+        与 ``_normalize_for_compare``（空白折成单个空格）不同：回复节点读回时
+        换行可能整个消失（编辑器把每条换行渲染成独立块级节点，块之间没有换行符），
+        折成空格反而让两边对不上。删掉空白后，换行 / 缩进 / 空格的差异都不再影响判断。
+        """
+        return re.sub(r"\s+", "", text or "")
+
+    @classmethod
+    def _looks_like_prompt_echo(cls, text: str, prompt: str) -> bool:
+        """末节点内容是不是「刚提交 prompt 的回显」？
+
+        Gemini 对话区里用户消息也会渲染成节点，``RESPONSE_SELECTORS``
+        （``message-content`` 等容器）可能命中它。此时若把回显当成本轮回复返回，
+        客户端会看到自己的指令被原样「回答」了一遍——线上表现为提示词反复叠加的
+        死循环（网页端失去响应时每轮都命中）。
+
+        读回是有损的，所以判据是「去掉空白后前 120 字符一致 + 长度相差 ≤10%」；
+        短 prompt（<200 字符）只做精确比较，避免把「回复恰好以同样的问候语开头」
+        误判成回显。
+        """
+        have = cls._text_fingerprint(text)
+        want = cls._text_fingerprint(prompt)
+        if not have or not want:
+            return False
+        if have == want:
+            return True
+        if len(want) < 200:
+            return False
+        if not have.startswith(want[:120]):
+            return False
+        return 0.9 <= len(have) / len(want) <= 1.1
+
+    @classmethod
     def _prompt_present(cls, prompt: str, current: str) -> bool:
         """输入框里已经是我们这条 prompt 吗？（**容忍**编辑器对空白/换行的规范化）
 
@@ -1067,6 +1128,15 @@ class ChatIOMixin:
         async with self._session_lock(bucket):
             if page is None:
                 raise RuntimeError("浏览器尚未初始化：找不到可用于发送的会话页面。")
+            if self._page_closed(page):
+                # 标签被手工关闭 / 崩溃。额外桶在 _ensure_page 里已自动重建；
+                # 走到这里通常是默认桶（self.page 不参与重建）。旧的报错会把这种
+                # 情况说成「未登录 / 找不到输入框」，把排查方向完全带偏。
+                raise RuntimeError(
+                    f"会话桶 {bucket} 的页面已关闭（标签被手工关闭或崩溃）："
+                    "额外会话桶会在下一次请求时自动重建页面；"
+                    "若是默认桶，请重启服务恢复。"
+                )
             self._touch_page(bucket)  # 正在用的页面不会被空闲回收 / LRU 淘汰
 
             # 1. 先确认输入框存在（快速失败，给出明确的“没登录/没打开”提示）；
@@ -1079,15 +1149,16 @@ class ChatIOMixin:
             # Gemini 的消息列表会回收/替换节点，长会话下节点数可能恒为 2，
             # 新回复只会把旧节点内容改掉而不会让数量增长，
             # 那样会导致永远读不到本轮回复直接等到超时。
+            # 基线必须与轮询判定**同一口径**（都取最后一个**有正文**的节点）：
+            # 旧实现取 nodes[-1]，而 Web 端失去响应时它常是尚未渲染的空容器，
+            # 基线成了空串，轮询再回退读到上一轮旧回复时就会被当成「本轮新回复」。
             before_text = ""
             before_count = 0
             try:
-                before_nodes = await page.query_selector_all(config.RESPONSE_SELECTORS)
-                before_count = len(before_nodes)
-                if before_nodes:
-                    before_text = (await self._complete_text(before_nodes[-1])).strip()
+                _before_node, before_text, before_count = await self._latest_reply(page)
             except Exception:
                 before_text = ""
+            before_key = self._text_fingerprint(before_text)
 
             prompt = self._clamp_prompt(prompt)
             # 每次发送都留一行长度：这是回答「长 prompt 是否导致上游不响应」的现场证据
@@ -1111,6 +1182,8 @@ class ChatIOMixin:
             stable_count = 0
             saw_generating = False      # 本轮是否观测到过页面「生成中」状态
             latest_node = None          # 本轮最新的回复节点
+            stale_noted = False         # 旧内容 / prompt 回显只记一次 warning
+            ended_without_text = 0      # 生成信号消失后仍无新正文的连续次数
             poll = 0
             deadline = asyncio.get_event_loop().time() + config.RESPONSE_TIMEOUT_S
 
@@ -1123,37 +1196,49 @@ class ChatIOMixin:
 
             while True:
                 poll += 1
-                responses = await page.query_selector_all(config.RESPONSE_SELECTORS)
-                current_text = ""
                 generating = None
-                # 取「最后一个有正文的回复节点」而不是裸的 responses[-1]：
+                # 取「最后一个有正文的回复节点」而不是裸的节点列表末尾：
                 # RESPONSE_SELECTORS 里 div[class*="response"] 之类会命中大量只有
                 # 布局、没有文本的容器节点，排在真正的回复节点之后，inner_text()
                 # 恒为空——若直接取 [-1] 会永远读到空串，导致轮询空转到超时。
-                for node in reversed(responses):
-                    try:
-                        node_text = await self._complete_text(node)
-                    except Exception:
-                        continue
-                    if node_text and node_text.strip():
-                        latest_node = node
-                        current_text = node_text
-                        break
+                latest_node, current_text, node_count = await self._latest_reply(page)
                 normalized = current_text.strip()
 
-                # 1. 本轮回复是否已经出现。判据（满足其一即可）：
-                #    a) 末节点文本 != 发送前文本；
-                #    b) 节点数变多（短会话常见）；
+                # 本轮的候选文本必须**是新内容**才可能是回复：
+                #   * 仍是发送前的旧回复 —— Web 端失去响应时节点不更新，读到的一直
+                #     是上一轮的内容（可能正是一条「执行指令」的工具调用）；
+                #   * 是刚提交 prompt 的回显 —— 选择器可能命中对话区里的用户消息节点。
+                # 这两类内容一旦被当成本轮回复返回，客户端会据此再执行一遍旧指令，
+                # 同一 prompt 被反复提交进网页会话，形成死循环（线上实测）。
+                current_key = self._text_fingerprint(normalized)
+                is_stale = bool(current_key) and current_key == before_key
+                is_echo = self._looks_like_prompt_echo(normalized, prompt)
+                text_is_new = bool(normalized) and not is_stale and not is_echo
+                nodes_grew = node_count > before_count
+                stale_reason = (
+                    "末节点仍是发送前的旧回复" if is_stale
+                    else "末节点是刚提交 prompt 的回显" if is_echo
+                    else ""
+                )
+                if stale_reason and not stale_noted:
+                    stale_noted = True
+                    logger.warning(
+                        "[结束判定] 本轮%s（%s 字符），不作为回复采纳：继续等待网页端"
+                        "产生新内容；若持续如此将按超时处理并轮转会话。",
+                        stale_reason, len(normalized),
+                    )
+
+                # 1. 「本轮已开始」的进度信号（只用于决定要不要探测「生成中」/「到顶」
+                #    以及继续轮询，**不能**单独作为收尾依据）：
+                #    a) 出现了新正文（text_is_new）；
+                #    b) 节点数变多（新容器出现了，正文可能还没渲染）；
                 #    c) 已经观测到过「生成中」——这说明本轮确已开始，
-                #       此时即使文本暂时等于 before_text（首帧还没渲染完）也算已出现。
+                #       此时即使文本暂时还是旧内容（首帧还没渲染完）也继续等。
                 #    注意：不能只看节点数——长会话下新回复会原地替换旧节点，数量不增长。
                 #    也不能要求文本非空——选择器可能命中一批尚未渲染出文本的节点
                 #    （表现为 nodes 很多但 len=0），那样会永远判不到「已出现」、空转到超时。
-                reply_seen = (
-                    (bool(normalized) and normalized != before_text)
-                    or (len(responses) > before_count)
-                    or saw_generating
-                )
+                #    反过来：**节点变多 / 观测到生成中 / 读到的内容非空，都不等于有新回复**。
+                reply_seen = text_is_new or nodes_grew or saw_generating
 
                 # 1.1 还没有新回复时，周期性检查是否“会话到顶”，
                 #     并主动探测「生成中」：这是唯一能证明本轮已开始、
@@ -1175,7 +1260,7 @@ class ChatIOMixin:
                     generating = await self._page_is_generating(bucket)
                     if generating:
                         saw_generating = True
-                    elif generating is False and saw_generating and normalized:
+                    elif generating is False and saw_generating:
                         # 停止按钮消失也要确认没有尚未显现的 token，
                         # 否则会读到被截断的半截回复（如 TOOL_CALL 的 JSON 参数）。
                         if await self._has_pending_tokens(latest_node):
@@ -1184,18 +1269,41 @@ class ChatIOMixin:
                                     "poll=%s 停止按钮已消失，但仍有 pending token，继续等待", poll
                                 )
                             # 落到下面的稳定判定 / 下一轮轮询
-                        else:
+                        elif text_is_new:
                             last_text = current_text
                             if config.DEBUG:
                                 logger.debug("poll=%s 停止按钮已消失且无 pending，判定结束", poll)
                             break
+                        else:
+                            # 生成信号已消失，但末节点仍不是新正文：这一轮网页端
+                            # **没有产生新回复**。绝不能把旧内容当结果返回（客户端会
+                            # 把旧指令再执行一遍，形成死循环）；连续确认几次后按超时
+                            # 中止，由重试阶梯重开对话 + 重新播种。
+                            ended_without_text += 1
+                            if ended_without_text >= _NO_NEW_TEXT_END_POLLS:
+                                self._state(bucket).pending_rotation = True
+                                await self._remember_session(bucket)
+                                logger.warning(
+                                    "[结束判定] 网页端停止生成但没有产生新回复"
+                                    "（%s；prompt %s 字符）：按超时处理，"
+                                    "下一轮将重开对话并重新播种。",
+                                    stale_reason or "末节点没有正文", len(prompt),
+                                )
+                                raise GeminiTimeoutError(
+                                    "网页端已停止生成，但没有产生新的回复内容"
+                                    f"（{stale_reason or '末节点没有正文'}）。"
+                                    f"本轮 prompt {len(prompt)} 字符。"
+                                    "为避免把上一轮的回复当成新回复返回（客户端会重复执行"
+                                    "旧指令），已按超时中止；重试会重开对话并重新播种上下文。"
+                                )
 
                     # 2.2 兜底判定：文本一模一样算一轮不变；
                     #     仅长度不再增长也算，但要更保守（多等几轮），
                     #     以免尾部重排 / 工具栏插入导致永远等不到逐字相等
-                    # 空文本（首帧未渲染）不算「稳定」，否则会把空串当结果收尾
-                    same_text = bool(normalized) and normalized == last_normalized
-                    same_len = bool(normalized) and len(normalized) == last_len
+                    # 判据只对**本轮新正文**生效：旧内容 / prompt 回显再“稳定”
+                    # 也不能收尾——那等于把上一轮的回复当成这一轮的答案。
+                    same_text = text_is_new and normalized == last_normalized
+                    same_len = text_is_new and len(normalized) == last_len
                     if same_text or same_len:
                         stable_count += 1
                         threshold = config.STABLE_POLLS if same_text else config.LEN_STABLE_POLLS
@@ -1211,42 +1319,53 @@ class ChatIOMixin:
                         stable_count = 0
 
                     # 2.3 生成过程中吐出增量，供 SSE 使用。
-                    #     用「已发送内容」的公共前缀做 diff，即使节点中途重排也不会漏字
-                    if on_delta is not None:
+                    #     用「已发送内容」的公共前缀做 diff，即使节点中途重排也不会漏字。
+                    #     只下发**本轮新正文**：旧内容 / prompt 回显不应出现在流里。
+                    if on_delta is not None and text_is_new:
                         piece, streamed = _delta_piece(streamed, current_text)
                         if piece:
                             await on_delta(piece)
 
-                    last_text = current_text
-                    last_normalized = normalized
-                    last_len = len(normalized)
+                    if text_is_new:
+                        last_text = current_text
+                        last_normalized = normalized
+                        last_len = len(normalized)
 
-                # 卡死检测：既没有正文，也没有任何「生成中」信号 -> 累计；
+                # 卡死检测：没有**新正文**、也没有任何「生成中」信号 -> 累计；
                 # 一旦达到阈值即可快速失败，而不是把 180s 全部耗在空转上。
-                if normalized or saw_generating or generating:
+                # 旧条件是 `normalized or saw_generating or ...`：只要页面上还留着
+                # 上一轮的旧回复（非空），计数器就永远被重置——Web 端失去响应时
+                # 既不失败也不收尾，只能干等总超时。旧内容 / 回显不算进度。
+                if text_is_new or generating:
                     stalled = 0
+                    ended_without_text = 0
                 else:
                     stalled += 1
                 if stalled >= stall_limit:
+                    self._state(bucket).pending_rotation = True
                     await self._remember_session(bucket)
                     if await self._page_shows_context_limit(bucket):
                         self._mark_context_limit(bucket)
                         raise self._context_limit_error()
                     raise GeminiTimeoutError(
-                        f"页面连续 {stalled} 次未产生任何回复内容（疑似未登录或会话失效），"
-                        f"已提前中止。本轮 prompt {len(prompt)} 字符。"
+                        f"页面连续 {stalled} 次未产生新的回复内容"
+                        f"（{stale_reason or '末节点没有正文'}；"
+                        "疑似未登录、会话失效或网页端未响应），已提前中止。"
+                        f"本轮 prompt {len(prompt)} 字符。"
                         "请检查 Gemini 登录状态或 RESPONSE_SELECTORS 配置。"
                     )
 
                 if config.DEBUG:
                     logger.debug(
-                        "poll=%s nodes=%s len=%s stable=%s generating=%s saw=%s stalled=%s before_len=%s",
-                        poll, len(responses), len(normalized), stable_count,
-                        generating, saw_generating, stalled, len(before_text),
+                        "poll=%s nodes=%s len=%s new=%s stale=%s echo=%s stable=%s "
+                        "generating=%s saw=%s stalled=%s before_len=%s",
+                        poll, node_count, len(normalized), text_is_new, is_stale, is_echo,
+                        stable_count, generating, saw_generating, stalled, len(before_text),
                     )
 
-                # 总超时判定：若这期间其实已经读到实质回复，就直接返回已产生的内容，
-                # 绝不再把同一句 prompt 重发一遍（避免网页多出一轮、与客户端状态错位）
+                # 总超时判定：若这期间其实已经读到**本轮新正文**，就直接返回已产生的
+                # 内容，绝不再把同一句 prompt 重发一遍（避免网页多出一轮、与客户端状态错位）。
+                # last_text 只在 text_is_new 时更新，因此旧内容 / 回显不会被当成「已读到回复」。
                 if asyncio.get_event_loop().time() > deadline:
                     await self._remember_session(bucket)
                     if last_text:

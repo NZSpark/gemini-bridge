@@ -847,3 +847,132 @@ prompt = seeded_prompt if driver.needs_seed(session_key) else delta_prompt
   （`seeded_prompt="SEED-BODY-XY"` 12 字符、增量 `delta-one`/`delta-two` 9 字符），
   断言第一行是「用播种 prompt=12 字符」、第二行是「用增量 prompt=9 字符」——
   **长度不同**，证明标注指向的确实是本轮真正发出的那份文本。
+
+## 24. 结束判定加固：回显 / 旧内容不得当作本轮回复（提示词反复叠加死循环，2026-10-08）
+
+### 24.1 真机现象（用户贴出的日志）
+
+```
+06:20:16 INFO gemini_web.chat_io: [发送] bucket=default 用增量 prompt=7126 字符
+06:20:20 INFO gemini_web.chat_io: [输入] fill 完成：读回 7044 字符 / prompt 7126 字符（编辑器有损渲染，属正常）
+06:20:30 INFO gemini_web.prompting: [长度] 播种内容超出 SEED_MAX_CHARS=6000：已从最旧的开始丢弃历史…
+INFO:     127.0.0.1:56064 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+06:20:30 INFO gemini_web.chat_io: [发送] bucket=default 用增量 prompt=7126 字符
+…
+```
+
+每 14~15s 完成一轮 `200 OK`、**prompt 恒为 7126 字符**，无限重复。用户判断：
+**网页端失去响应，但桥仍然把「指令」交回客户端，导致提示词反复叠加。**
+
+日志读法（先排除误读）：
+
+- `[长度] 播种内容超出…` 是**构建期**日志（`server.py` / `responses.py` 每轮无条件构建增量 + 播种两份，
+  `needs_seed()` 只决定发哪份），它出现在 `fill` 之后、`200 OK` 之前，属于**下一个请求构建**的那份
+  （同秒交错），不能证明本轮发了播种——真正发出去的是 `[发送] … 用增量`；
+- 没有 WARNING/ERROR（`GEMINI_DEBUG=false` 只隐藏 DEBUG），所以桥每一轮都**自认为成功**：
+  它确实从页面上读到了**一段非空文本**并当作回复返回。
+
+### 24.2 根因：两条判据同时失守，旧内容被当成新回复
+
+时间线（`fill` 完成 → 约 10s 后判定结束 → 立刻 200）与「内容稳定」收尾完全吻合：
+`POLL_INTERVAL_S=1.5 × STABLE_POLLS=5` ≈ 7.5s。也就是说，桥把**发送前就存在的内容**
+读成了本轮的回复。两条判据同时失守才会如此：
+
+| # | 代码事实 | 后果 |
+| --- | --- | --- |
+| 1 | 发送前基线取 `before_nodes[-1]`，轮询却取「最后一个**有正文**的节点」 | 网页端不响应时 `[-1]` 常是尚未渲染的空容器 → 基线成空串；轮询回退读到**上一轮旧回复**时，`normalized != before_text` 成立 → 「新回复已出现」 |
+| 2 | 收尾路径（`len(responses) > before_count`、稳定性判据、生成信号消失即收尾）都不要求内容更新 | 上一轮的回复（可能正是一条 `TOOL_CALL`「执行指令」）被原样返回；`stalled` 又用 `normalized or …` 复位，只要页面上留着旧回复就**永远不失败也不超时** |
+
+于是形成闭环：网页端不响应 → 桥把**上一轮的指令**当成本轮回复返回 →
+客户端照做 / 重试 → 同一段 prompt 再次提交进**同一个卡死的网页会话**（上下文叠加）→
+网页端更不响应。既不放行也不失败的循环，就是用户看到的「提示词反复叠加」。
+
+### 24.3 修法
+
+| 位置 | 改动 |
+| --- | --- |
+| `chat_io._latest_reply`（新） | 基线与轮询**同一口径**：都取「最后一个有正文的节点」的 `(节点, 文本, 节点数)`。基线不再可能被末尾空容器“带偏” |
+| `chat_io._text_fingerprint` / `_looks_like_prompt_echo`（新） | 比较用指纹 = **删掉所有空白**（编辑器会丢换行）；回显判据 = 指纹相等，或「前 120 字符一致 + 长度相差 ≤10%」（长 prompt 的有损回显）；短 prompt 只做精确比较，避免误判 |
+| `_send_chat_locked`（改） | `text_is_new = 有正文 and 非旧内容 and 非 prompt 回显`，**所有收尾路径都要求 `text_is_new`**（生成信号消失即收尾、稳定性、超时返回 `last_text`）；流式增量也只发新正文 |
+| 同上 | 生成信号消失但连续 `_NO_NEW_TEXT_END_POLLS=2` 轮仍无新正文：`pending_rotation=True` + `GeminiTimeoutError`（带原因），交由 `send_chat` 的重试阶梯**重开对话 + 重新播种** |
+| 同上 | `stalled` 复位条件改为 `text_is_new or generating`（旧内容 / 回显不算进度），stall 报错也点名末节点状态并标记轮转 |
+
+设计取舍：**宁可失败，也不返回旧内容**。「模型这次恰好回了与上一轮逐字相同的答案」这类罕见情形，
+现在会按超时失败（随后轮转 + 播种，下一次在新会话里基线为空，可正常返回）——代价是偶尔多一轮重试，
+换来的是绝不再把上一轮的指令当成新回复交给客户端。
+
+### 24.4 验收与区分力实验
+
+- `pytest -q`（不含 E2E）→ **337 passed, 23 subtests passed**；完整套（含脚手架单测）→ **346 passed, 18 skipped, 31 subtests**。改动集中在 `tests/test_end_detection.py`：新增 4 例 + 改写 1 例（原例断言的是“返回旧内容”，正是要消灭的行为）：
+  - `test_generating_without_new_text_fails_instead_of_returning_stale`：生成信号出现又消失、末节点仍是旧内容 → 必须超时失败；
+  - `test_generating_with_new_text_still_finishes`（改写）：生成信号 + 新正文 → 照常收尾（原保护不丢）；
+  - `test_trailing_empty_container_does_not_blind_the_stale_guard`：基线不能取末尾空容器；
+  - `test_prompt_echo_is_not_accepted_as_reply` / `test_lossy_prompt_echo_is_still_recognized`：回显（含有损渲染）不得当回复。
+- **区分力实验**：把 `gemini_web/chat_io.py` 换回改动前版本 → 上述**4 例全部 failed**
+  （每例的失败原因都是「返回了旧内容 / 回显」）；恢复后 38 passed（`test_end_detection.py`）。
+- **未验证**：真机（运行中的 8001 实例需重启才会带上本轮修复）。本轮没有起第二实例；
+  「网页端失去响应」的触发条件未能在本地稳定复现，修复的证据全部来自假 page 回归与日志时间线推演。
+
+### 24.5 剩余风险
+
+- `_looks_like_prompt_echo` 的前缀 + 长度比是启发式：若模型的真实回复恰好「以 prompt 前 120 字符开头
+  且总长在 ±10% 内」，会被误判为回显并按超时处理（随后轮转 + 播种，仍能拿到答案，只是慢一轮）。
+- 若网页端整体失效（登录态丢失等），修复后的行为是**快速失败 + 轮转一次后报 504**，
+  客户端能看到明确错误，而不是继续无声地空转。
+
+## 25. 会话桶页面被关闭后不再永久 502（OpenAI SDK 的 `ua:openai` 桶，2026-10-09）
+
+### 25.1 真机现象（用户报告 + 本地实测）
+
+用户用 OpenAI SDK 调用 bridge：`/v1/models` 返回 200，但 chat completion 返回
+`502 {"message": "无法找到对话输入框，请检查 Gemini 网页是否打开或处于登录状态。"}`。
+
+本地按同一路径复现并逐项排除：
+
+| 复现/验证 | 结果 |
+| --- | --- |
+| `curl -H 'User-Agent: OpenAI/Python 1.0.0' /v1/chat/completions`（SDK 默认 UA → 自动分桶 `ua:openai`） | **502 无法找到对话输入框**（复现） |
+| `X-Gemini-Session: default` 同一请求 | **200，回复 `pong`** → 不是登录问题、浏览器可用 |
+| `X-Gemini-Session: diag-probe`（全新桶，现场新建页面） | **200，回复 `pong`** → 新建页面也正常 |
+| `POST /session/reset?session=ua:openai` → 再请求 | `500 Page.goto: Target page, context or browser has been closed` |
+
+最后一条是决定性证据：**`ua:openai` 桶持有的页面早已被关闭**（有头窗口里的标签被手工关闭，
+或标签崩溃），但句柄一直留在 `_pages` 池里。`_ensure_page` 只判断 `bucket in self._pages`，
+从不检查 `page.is_closed()`，于是：
+
+* `_locate_input` 在死页面上调 `wait_for_selector`，抛错被 `except Exception: continue` 吞掉，
+  三个候选全部“没命中” → 报「无法找到对话输入框，请检查登录状态」——**把排查方向带偏**；
+* 该桶此后**每一个**请求都 502，重启前无法自愈。
+
+### 25.2 修法
+
+| 位置 | 改动 |
+| --- | --- |
+| `page_pool._page_closed`（新） | 页面句柄是否已失效：包一层 `page.is_closed()`；假 page / 无该 API 时按“未关闭”处理（不因诊断能力缺失改变行为） |
+| `page_pool._ensure_page`（改） | 池里的句柄已关闭 → 记 warning、从池里摘除、**重建页面**（新建 + `goto` + 新开对话 + 等就绪），并把该桶 `has_history=False`，让本轮用**播种** prompt 重放上下文（页面丢了但对话不丢） |
+| `page_pool._ensure_page`（改） | 新建后的导航失败（页面崩溃 / 网络中断）**不把半死句柄留在池里**：摘除 + 关闭 + 原样抛错，避免下一个请求继续命中坏页面 |
+| `chat_io._send_chat_locked`（改） | 取到已关闭的页面时直接报「页面已关闭（标签被手工关闭或崩溃）+ 处理方式」，不再误报「未登录 / 找不到输入框」（额外桶会被 `_ensure_page` 自动重建；默认桶不参与重建，需重启服务） |
+
+### 25.3 验收与区分力实验
+
+- `pytest -q` → **351 passed, 18 skipped, 31 subtests passed**（新增 5 例守护）：
+  - `tests/test_sessions.py::ClosedPageRecoveryTests`（4 例）：关闭的桶页面被重建且置为“待播种”、
+    存活的页面不被无谓重建、导航失败不残留坏句柄、默认桶（`self.page`）行为不变；
+  - `tests/test_end_detection.py::ClosedPageGuardTests`（1 例）：已关闭页面的报错必须指向“已关闭”，
+    且**不得**再提「登录」。
+- **区分力实验**：把 `page_pool.py` + `chat_io.py` 换回改动前版本 → 上述 5 例中
+  **3 failed**（重建、导航失败清理、报错指向真因）；另外 2 例是不变量守护（存活页面复用 / 默认桶不动），
+  两版都应通过。恢复后 52 passed（两个文件）。
+
+### 25.4 与 SDK 调用方式的关系
+
+SDK 侧本身没有问题：`base_url` 指向 `/v1`、`api_key` 随便填、`model` 用 `/v1/models` 的 id 即可。
+真正的坑是**自动分桶**：不传 `X-Gemini-Session` 时，SDK 的 `OpenAI/Python x.y.z` UA 会把请求分到
+`ua:openai` 桶（独立页面）。想稳定复用同一条网页会话，用
+`default_headers={"X-Gemini-Session": "..."}`（或请求字段 `user=...`）固定桶名；
+想让所有客户端共用默认会话则设 `SESSION_SCOPING_BY_UA=false`。README 已补上这两点与故障排查行。
+
+### 25.5 未验证
+
+- 运行中的 8001 实例仍是旧代码（本轮未重启用户进程）：自动重建的**真机**效果待重启后确认。
+  重启前对同一个坏桶的临时办法：换一个新桶名调用（实测可用），或重启服务。

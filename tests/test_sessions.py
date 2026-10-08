@@ -147,5 +147,96 @@ class StateFileTests(unittest.TestCase):
         self.assertEqual(state.turns, 0)  # 回退为无状态，不得抛错
 
 
+class _FakeContextPage:
+    """最小假页面：只实现 ``_ensure_page`` 用到的接口。"""
+
+    def __init__(self, closed=False, fail_goto=False):
+        self._closed = closed
+        self.fail_goto = fail_goto
+        self.goto_calls = []
+
+    def is_closed(self):
+        return self._closed
+
+    async def goto(self, url, wait_until=None):
+        if self.fail_goto:
+            raise RuntimeError("Page.goto: net::ERR_FAILED")
+        self.goto_calls.append(url)
+
+    async def wait_for_selector(self, selector, timeout=None, **kwargs):
+        return None  # 找不到新建对话按钮 / 输入框时只警告，不影响重建流程
+
+    async def close(self):
+        self._closed = True
+
+
+class _FakeContext:
+    def __init__(self, pages=None):
+        self.created = 0
+        self._queue = list(pages or [])
+
+    async def new_page(self):
+        self.created += 1
+        return self._queue.pop(0) if self._queue else _FakeContextPage()
+
+
+class ClosedPageRecoveryTests(unittest.TestCase):
+    """真机回归：会话桶的标签被手工关闭 / 崩溃后，该桶不能永久 502。
+
+    现象：OpenAI SDK 请求（自动分桶 ``ua:openai``）一直报 502「无法找到对话输入框」
+    而其它桶正常——因为已关闭的页面句柄永远留在 ``_pages`` 里，
+    ``wait_for_selector`` 在死页面上抛错又被当成“选择器没命中”。
+    """
+
+    def setUp(self):
+        self._patch = mock.patch.object(
+            config, "SESSION_FILE", Path("/tmp/gemini-test-closed-page-state.json")
+        )
+        self._patch.start()
+        self.addCleanup(self._patch.stop)
+        self.addCleanup(lambda: Path("/tmp/gemini-test-closed-page-state.json").unlink(missing_ok=True))
+        self.driver = GeminiWebDriver(user_data_dir="/tmp/gemini-test-noprofile")
+        self.driver.context = _FakeContext()
+
+    def test_closed_bucket_page_is_recreated_and_seeded(self):
+        dead = _FakeContextPage(closed=True)
+        self.driver._pages["ua:openai"] = dead
+        self.driver._page_last_used["ua:openai"] = 0.0
+
+        asyncio.run(self.driver._ensure_page("ua:openai"))
+
+        fresh = self.driver._pages["ua:openai"]
+        self.assertIsNot(fresh, dead)
+        self.assertFalse(fresh.is_closed())
+        self.assertEqual(fresh.goto_calls, [config.WEBSITE])
+        # 页面丢了 = 网页端上下文没了：必须让下一轮重新播种
+        self.assertFalse(self.driver._state("ua:openai").has_history)
+
+    def test_live_bucket_page_is_reused(self):
+        live = _FakeContextPage()
+        self.driver._pages["ua:x"] = live
+
+        asyncio.run(self.driver._ensure_page("ua:x"))
+
+        self.assertIs(self.driver._pages["ua:x"], live)
+        self.assertEqual(self.driver.context.created, 0)
+
+    def test_failed_navigation_does_not_keep_dead_handle(self):
+        self.driver.context = _FakeContext(pages=[_FakeContextPage(fail_goto=True)])
+
+        with self.assertRaises(RuntimeError):
+            asyncio.run(self.driver._ensure_page("ua:boom"))
+
+        self.assertNotIn("ua:boom", self.driver._pages)
+
+    def test_default_bucket_page_is_not_touched(self):
+        sentinel = object()
+        self.driver.page = sentinel
+
+        asyncio.run(self.driver._ensure_page(DEFAULT_SESSION_KEY))
+
+        self.assertIs(self.driver.page, sentinel)
+
+
 if __name__ == "__main__":
     unittest.main()

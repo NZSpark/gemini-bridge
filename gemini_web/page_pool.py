@@ -78,6 +78,25 @@ class PagePoolMixin:
     def _touch_page(self, key: Optional[str] = None) -> None:
         self._page_last_used[key or DEFAULT_SESSION_KEY] = time.monotonic()
 
+    @staticmethod
+    def _page_closed(page) -> bool:
+        """页面句柄是否已经失效（标签被手工关闭 / 崩溃）。
+
+        真机实测：有头窗口里把某个会话桶的标签关掉后，句柄会永远留在池里，
+        该桶此后**每一个**请求都返回 502「无法找到对话输入框」——因为
+        ``wait_for_selector`` 在已关闭的页面上抛错，被当作“选择器没命中”。
+
+        假 page / 旧版本 Playwright 没有 ``is_closed`` 时按“未关闭”处理
+        （绝不因为诊断能力缺失而改变行为）。
+        """
+        checker = getattr(page, "is_closed", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker())
+        except Exception:  # noqa: BLE001
+            return False
+
     def _bucket_busy(self, bucket: str) -> bool:
         """该桶是否正在生成回复（锁被持有）。用它代替额外的“活跃桶”标志。"""
         return self._lock_for(bucket).locked()
@@ -141,18 +160,34 @@ class PagePoolMixin:
             return False
 
     async def _ensure_page(self, key: Optional[str]) -> None:
-        """为额外会话桶惰性创建页面并回到它上次的会话（如存在）。
+        """为额外会话桶惰性创建页面（句柄失效时重建）并回到它上次的会话（如存在）。
 
         桶数量达到 ``MAX_SESSION_BUCKETS`` 时**不再直接报错**：先回收空闲页面，
         再按 LRU 淘汰最久未用的页面（**只关页面、状态保留**，下次会自动重开同一会话
         并按需播种）。只有显式把 ``MAX_SESSION_BUCKETS=0`` 设成“不允许额外桶”时才拒绝。
+
+        **页面关闭也要重建**（真机实测：OpenAI SDK 的 ``ua:openai`` 桶就这么坏的）：
+        句柄一旦失效，不重建的话该桶会永久 502「无法找到对话输入框」。
         """
         bucket = key or DEFAULT_SESSION_KEY
-        if bucket == DEFAULT_SESSION_KEY or bucket in self._pages:
+        if bucket == DEFAULT_SESSION_KEY:
             return
+        existing = self._pages.get(bucket)
+        if existing is not None and not self._page_closed(existing):
+            return
+        if existing is not None:
+            logger.warning(
+                "[会话] key=%s 的页面已关闭（标签被手工关闭或崩溃），将重建页面。", bucket
+            )
+            self._pages.pop(bucket, None)
+            self._page_last_used.pop(bucket, None)
         async with self._page_lock:
-            if bucket in self._pages:  # 并发请求可能已经建好了
-                return
+            existing = self._pages.get(bucket)
+            if existing is not None:
+                if not self._page_closed(existing):  # 并发请求可能刚重建好
+                    return
+                self._pages.pop(bucket, None)
+                self._page_last_used.pop(bucket, None)
             if self.context is None:
                 raise RuntimeError("浏览器尚未初始化，无法创建新的会话页面。")
             limit = config.MAX_SESSION_BUCKETS
@@ -173,9 +208,20 @@ class PagePoolMixin:
             self._pages[bucket] = page
             self._touch_page(bucket)
             state = self._state(bucket)
-            # 每桶始终新开对话；上下文靠本轮的「播种」重建
-            await page.goto(HOME_URL, wait_until="domcontentloaded")
-            await self._open_new_chat(page)
-            await self._wait_ready(page)
+            try:
+                # 每桶始终新开对话；上下文靠本轮的「播种」重建
+                await page.goto(HOME_URL, wait_until="domcontentloaded")
+                await self._open_new_chat(page)
+                await self._wait_ready(page)
+            except Exception:
+                # 导航失败（页面崩溃 / 网络中断等）：不要把半死的句柄留在池里，
+                # 否则该桶后续请求会一直命中一个不可用的页面。
+                self._pages.pop(bucket, None)
+                self._page_last_used.pop(bucket, None)
+                try:
+                    await page.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
             state.has_history = False
         logger.info("[会话] 已为 key=%s 创建独立会话页面（%s）", bucket, HOME_URL)

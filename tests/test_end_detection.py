@@ -7,6 +7,9 @@
     只有把「已观测到生成中」也算作已出现，才能正确收尾。
   * 结束判定：观测到生成中、随后停止按钮消失即结束。
   * 永远判不到结束（也无生成中信号）时，必须超时报错而非无限空转。
+  * Web 端失去响应时末节点读到的仍是发送前的旧回复 / 刚提交 prompt 的回显：
+    绝不能当成本轮回复返回（客户端会把旧指令再执行一遍 → 提示词反复叠加的死循环），
+    必须按超时中止并让重试阶梯轮转会话。
   * 写入输入框失败（重挂载导致的失效句柄）：必须**重新定位再试**，
     且单次超时用 FILL_TIMEOUT_MS 而不是 Playwright 默认的 30s。
   * 长度护栏的可观测性：`PROMPT_MAX_CHARS` 截断时必须留下 warning，
@@ -152,20 +155,108 @@ class EndDetectionTestCase(unittest.TestCase):
 
 
 class ReplySeenViaGeneratingTests(EndDetectionTestCase):
-    """真实故障回归：末节点文本始终等于 before_text，靠「生成中」判定本轮已出现。"""
+    """真实故障回归：末节点文本等于 before_text，靠「生成中」判定本轮已开始。
 
-    def test_generating_proves_reply_seen_and_finishes(self):
-        # 末节点文本始终为「旧答案」（== before_text），节点数也不变。
-        # 旧代码：reply_seen 永远 False → 空转到超时。
-        # 新代码：观测到 generating=True 后 reply_seen=True，
-        #         随后 generating 变 False 即判定结束并返回内容。
+    同时守住一条底线：**没有新正文就不能收尾**。旧实现在生成信号消失后
+    会把 `before_text`（上一轮的回复）当成本轮结果返回——Web 端失去响应时，
+    上一轮回复往往正是一条「执行指令」（工具调用），客户端于是把同一条指令
+    再执行一遍，同一 prompt 被反复提交进网页会话，形成提示词叠加的死循环。
+    """
+
+    def test_generating_without_new_text_fails_instead_of_returning_stale(self):
+        # 末节点始终是「旧答案」（== before_text）、节点数不变，generating 过后变 False：
+        # 绝不能把「旧答案」当本轮回复返回，必须按超时失败。
         page = FakePage(
             baseline=["旧答案"],
-            script=[["旧答案"], ["旧答案"], ["旧答案"], ["旧答案"]],
+            script=[["旧答案"], ["旧答案"], ["旧答案"], ["旧答案"], ["旧答案"]],
+            generating=[True, True, False, False, False],
+        )
+        with unittest.mock.patch.object(config, "MAX_UPSTREAM_RETRIES", 1):
+            with self.assertRaises(GeminiTimeoutError):
+                self.run_chat(self.driver_for(page))
+
+    def test_generating_with_new_text_still_finishes(self):
+        # 观测到生成中，且末节点确实变成了新正文：照常收尾（原保护不丢）。
+        page = FakePage(
+            baseline=["旧答案"],
+            script=[["旧答案"], ["新答案"], ["新答案"], ["新答案"]],
             generating=[True, True, False, False],
         )
         text, _ = self.run_chat(self.driver_for(page))
-        self.assertEqual(text, "旧答案")
+        self.assertEqual(text, "新答案")
+
+
+class StaleContentGuardTests(EndDetectionTestCase):
+    """Web 端失去响应（没有新回复）时，旧内容 / prompt 回显绝不能当作回复返回。"""
+
+    def test_trailing_empty_container_does_not_blind_the_stale_guard(self):
+        """基线必须取「最后一个有正文的节点」。
+
+        旧实现的基线取 nodes[-1]：末尾若是尚未渲染的空容器（Web 端不响应时的
+        常见形态），基线就成了空串，轮询回退读到上一轮旧回复时会被当成新回复返回。
+        """
+        page = FakePage(
+            baseline=["旧答案", ""],
+            script=[["旧答案", ""]],
+            generating=[False],
+        )
+        driver = self.driver_for(page)
+        with unittest.mock.patch.object(config, "MAX_UPSTREAM_RETRIES", 1):
+            with unittest.mock.patch.object(config, "STALL_POLLS", 2):
+                with self.assertRaises(GeminiTimeoutError):
+                    self.run_chat(driver)
+
+    def test_prompt_echo_is_not_accepted_as_reply(self):
+        """末节点若是刚提交 prompt 的回显（选择器命中用户消息节点），不能当回复。"""
+        echo = "请执行以下指令：" + "x" * 400
+        page = FakePage(
+            baseline=["旧答案"],
+            script=[[echo], [echo], [echo], [echo]],
+            generating=[False],
+        )
+        driver = self.driver_for(page)
+        with unittest.mock.patch.object(config, "MAX_UPSTREAM_RETRIES", 1):
+            with unittest.mock.patch.object(config, "STALL_POLLS", 2):
+                with self.assertLogs("gemini_web.chat_io", level="WARNING") as ctx:
+                    with self.assertRaises(GeminiTimeoutError):
+                        self.run_chat(driver, prompt=echo)
+        self.assertIn("回显", "\n".join(ctx.output))
+
+    def test_lossy_prompt_echo_is_still_recognized(self):
+        """回显可能被编辑器有损渲染（丢换行 / 少量字符）：仍须识别为回显。"""
+        prompt = ("请执行以下指令：\n" + "step\n" * 100).strip()
+        flattened = prompt.replace("\n", "")
+        lossy = flattened[: int(len(flattened) * 0.95)]
+        page = FakePage(
+            baseline=["旧答案"],
+            script=[[lossy], [lossy]],
+            generating=[False],
+        )
+        driver = self.driver_for(page)
+        with unittest.mock.patch.object(config, "MAX_UPSTREAM_RETRIES", 1):
+            with unittest.mock.patch.object(config, "STALL_POLLS", 2):
+                with self.assertRaises(GeminiTimeoutError):
+                    self.run_chat(driver, prompt=prompt)
+
+
+class ClosedPageGuardTests(EndDetectionTestCase):
+    """页面已被关闭（标签被手工关闭 / 崩溃）时，报错要指向真因。
+
+    旧行为：已关闭的页面上 ``wait_for_selector`` 抛错被当作“选择器没命中”，
+    最终报「无法找到对话输入框，请检查登录状态」——排查方向完全被带偏
+    （真机：OpenAI SDK 的 ``ua:openai`` 桶永久 502，而其它桶正常）。
+    """
+
+    def test_closed_page_reports_closed_not_login(self):
+        page = FakePage(baseline=["旧"], script=[["旧"]])
+        page.is_closed = lambda: True
+
+        with self.assertRaises(RuntimeError) as ctx:
+            self.run_chat(self.driver_for(page))
+
+        message = str(ctx.exception)
+        self.assertIn("已关闭", message)
+        self.assertNotIn("登录", message)
 
 
 class GeneratingStateTests(EndDetectionTestCase):
@@ -695,10 +786,14 @@ class _ChunkyPage(FakePage):
         self, *, max_chunk=4000, fail_at=None, unreadable=False, enter_works=True,
         require_caret=True, ignore_inserts=False, fill_writes_then_raises=False,
         normalize_on_read=False, lossy_readback=False,
+        baseline=None, script=None, generating=None,
     ):
+        # baseline / script / generating 可按需覆盖：默认是「发送前只有旧回复，
+        # 提交后出现新回复」这一轮；连发多轮的用例需要自带每轮的基线快照。
         super().__init__(
-            baseline=["旧"], script=[["新答案"], ["新答案"]],
-            generating=[True, False, False],
+            baseline=["旧"] if baseline is None else list(baseline),
+            script=[["新答案"], ["新答案"]] if script is None else [list(p) for p in script],
+            generating=[True, False, False] if generating is None else list(generating),
         )
         self.store = {"text": ""}
         self.input = _ChunkyInput(self, self.store)
@@ -916,11 +1011,18 @@ class ChunkedInsertTests(unittest.TestCase):
         # 可观测性守护：`[长度] 播种内容超出 SEED_MAX_CHARS` 是**构建期**日志，每轮都会打
         # （server.py 无条件 build 两份：增量 + 播种），不能据此判断本轮用了哪一份。
         # 真正发出去的是哪份、有多长，必须由 `[发送]` 行自己说清楚。
-        page = _ChunkyPage()
         driver = GeminiWebDriver()
-        driver.page = page
+        driver.page = _ChunkyPage()
         with self.assertLogs("gemini_web.chat_io", level="INFO") as logs:
             asyncio.run(driver.send_chat("delta-one", seeded_prompt="SEED-BODY-XY"))
+            # 第二轮：同一个网页会话里上一条回复还在（基线），提交后出现**新**回复。
+            # FakePage 的 script 按 query 次数推进，所以这里换一个带正确基线的假页面
+            # ——若让第二轮复用同一页，它会把上一轮的回复当基线（新判定下不属新正文）。
+            driver.page = _ChunkyPage(
+                baseline=["新答案"],
+                script=[["新答案", "第二个答案"], ["新答案", "第二个答案"]],
+                generating=[False, False],
+            )
             asyncio.run(driver.send_chat("delta-two", seeded_prompt="SEED-BODY-XY"))
         sent = [r.getMessage() for r in logs.records if r.getMessage().startswith("[发送]")]
         # 首次：桶里没有历史 -> 发播种（长度是播种那份的）
