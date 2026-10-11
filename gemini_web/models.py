@@ -118,3 +118,12 @@ SUPPORTED_MODELS = [
     {"id": "gemini-chat"},
     {"id": "gemini-reasoner"},
 ]
+
+
+def advertised_models() -> List[Dict[str, Any]]:
+    """本桥对外公布的模型清单。
+
+    ``GET /v1/models`` 与聊天命令 ``/bridge models`` 共用这一份数据，避免两边各写
+    一套清单后悄悄漂移（帮助 / 回执文本里硬编码的模型名最容易过期）。
+    """
+    return [dict(card) for card in SUPPORTED_MODELS]

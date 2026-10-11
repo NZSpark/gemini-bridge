@@ -20,6 +20,41 @@ def _chunk_text(text: str, size: int = 64) -> List[str]:
     return [text[i:i + size] for i in range(0, len(text), size)] or [""]
 
 
+def _chunk_payload(
+    chat_id: str,
+    created: int,
+    model: str,
+    delta: Optional[Dict[str, Any]],
+    finish: Optional[str] = None,
+) -> str:
+    """一条 OpenAI 兼容的 chat.completion.chunk（``data: ...`` 行）。"""
+    payload = {
+        "id": chat_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "delta": delta or {}, "finish_reason": finish}],
+    }
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+async def _stream_command_reply(request: ChatCompletionRequest, reply: str):
+    """桥内命令（``/bridge ...``）的 SSE 应答。
+
+    与普通回复同形（role 头 → 内容增量 → ``finish_reason=stop`` → ``[DONE]``），
+    因此客户端不需要为命令做任何特例；区别只在于内容由桥本地给出，**不发给网页版**。
+    命令的应答不走工具解析：它一定是纯文本。
+    """
+    chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created = int(time.time())
+    model = getattr(request, "model", "gemini-chat")
+    yield _chunk_payload(chat_id, created, model, {"role": "assistant"})
+    for piece in _chunk_text(reply):
+        yield _chunk_payload(chat_id, created, model, {"content": piece})
+    yield _chunk_payload(chat_id, created, model, None, finish="stop")
+    yield "data: [DONE]\n\n"
+
+
 async def _stream_chat_completion(
     request: ChatCompletionRequest,
     prompt: str,

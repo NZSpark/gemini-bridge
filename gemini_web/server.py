@@ -10,7 +10,7 @@ from typing import List, Optional
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from . import config
+from . import bridge_commands, config
 from .driver import (
     DEFAULT_SESSION_KEY,
     GeminiBusyError,
@@ -19,19 +19,19 @@ from .driver import (
     GeminiWebDriver,
 )
 from .models import (
+    advertised_models,
     ChatCompletionRequest,
     ChatCompletionResponse,
     Choice,
     ChoiceMessage,
     ModelCard,
     ModelListResponse,
-    SUPPORTED_MODELS,
     Usage,
 )
 from .prompting import build_prompt, estimate_tokens
 from .responses import ResponsesRequest, handle_responses
 from . import tasks
-from .streaming import _stream_chat_completion
+from .streaming import _stream_chat_completion, _stream_command_reply
 from .toolcalls import (
     _tool_names,
     EDIT_MARKDOWN_TOOL,
@@ -244,7 +244,7 @@ async def list_models():
     return ModelListResponse(
         data=[
             ModelCard(id=m["id"], context_window=config.SESSION_MAX_TOKENS)
-            for m in SUPPORTED_MODELS
+            for m in advertised_models()
         ]
     )
 
@@ -368,7 +368,9 @@ async def chat_completions(
     if not request.messages:
         return _error_response(400, "messages 不能为空", "invalid_request_error")
 
-    if driver.page is None:
+    # 桥内命令（``/bridge ...``）由桥自己应答、**不经过网页版**：浏览器没起来也必须能答，
+    # 页面失效 / 登录过期时它们正是用户唯一的排障入口。普通提问仍按下面的检查 503。
+    if driver.page is None and not bridge_commands.is_command(request.messages):
         return _error_response(
             503,
             "浏览器尚未就绪，请确认已完成登录、且没有另一个实例占用 user_data。"
@@ -380,9 +382,25 @@ async def chat_completions(
     session_key = _session_key(request, x_gemini_session, user_agent)
     if config.DEBUG:
         logger.debug("session_key=%r", session_key)
+    bucket = session_key or DEFAULT_SESSION_KEY
+
+    # 命令在这里求值一次（有副作用的命令不能被求值两次）：命中就由桥直接回、不走上游。
+    command_reply = await bridge_commands.handle_command(request.messages, driver, session_key)
+    if command_reply is not None:
+        logger.info("[命令] %s 已由桥直接应答（session_key=%r）。", bridge_commands.BRIDGE_COMMAND, bucket)
+        if request.stream:
+            return StreamingResponse(
+                _stream_command_reply(request, command_reply),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+        return bridge_commands.command_chat_response(request, command_reply)
 
     # 任务快照：记录本轮 messages，供轮转播种时续接任务（不丢任务目标）。
-    bucket = session_key or DEFAULT_SESSION_KEY
     tasks.record(bucket, request.messages)
     task_block = tasks.resume_block(bucket)
 
@@ -467,8 +485,8 @@ async def chat_completions(
         )
 
     saved_files = []
-    # None = 客户端未指定，回落到 config.SAVE_FILES（默认 false）；显式传入才覆盖
-    save_files = config.SAVE_FILES if request.save_files is None else request.save_files
+    # 优先级：请求里显式的 save_files > 本桶偏好（/bridge settings save-files）> SAVE_FILES
+    save_files = bridge_commands.save_files_enabled(driver, session_key, request.save_files)
     if save_files:
         saved_files = driver.save_extracted_files(
             reply_content, code_blocks, request.output_dir or config.OUTPUT_DIR

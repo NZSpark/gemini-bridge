@@ -150,6 +150,37 @@ codex --profile gemini
 - 工具调用（function calling）会被桥接层解析为 Responses 的 function_call 事件。
 - 关闭 `ENABLE_RESPONSES_API` 后该端点返回 404，但 Pi 的 chat 路径不受影响。
 
+### Bridge 聊天命令（`/bridge ...`）
+
+把一条**整行**的消息发给任意生成端点，桥就会本地应答这条命令，**不发给 Gemini 网页版**。
+页面失效、登录过期、浏览器还没起来时，它是唯一还能用的排障入口。
+
+```bash
+curl -s -X POST http://127.0.0.1:8001/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gemini-chat","messages":[{"role":"user","content":"/bridge status"}]}'
+```
+
+| 命令 | 说明 | 影响范围 |
+| --- | --- | --- |
+| `/bridge` / `/bridge help [session\|settings]` | 列出已注册命令与只读 / 改状态标记 | 只读 |
+| `/bridge status` | 桥接、浏览器与当前桶页面的状态摘要 | 只读 |
+| `/bridge models` | 本桥对外公布的模型名（与 `GET /v1/models` 同源） | 只读 |
+| `/bridge session [status]` | 当前桶的会话状态（播种 / 重置 / 轮数 / 预算 / 上次错误） | 只读 |
+| `/bridge session reset` | 当前桶下一轮**新开网页会话**并把历史播种进去（同 `POST /session/reset`） | 改当前桶 |
+| `/bridge session reseed` | 当前桶下一轮把完整历史**再播种一遍**（不换会话，会出现重复内容） | 改当前桶 |
+| `/bridge settings save-files [on\|off\|default\|status]` | 代码块落盘偏好，**按桶持久化**，不改全局 `SAVE_FILES` | 改当前桶 |
+
+- 只识别「整条消息就是这一行」：历史消息里的旧命令不重放，正文 / 多行 / 代码块里的命令
+  字样照旧当普通提问发给模型；`/bridge` 之外的 `/` 开头文本一律不拦截。
+- 命令只作用于当前会话桶（`X-Gemini-Session` → `user` → User-Agent），**没有**「指定别的桶」
+  的参数；Coding Agent 多开时互不干扰。
+- 落盘生效顺序：请求里的 `save_files` 字段 > 本桶偏好 > `SAVE_FILES` 配置；目前只有
+  `/v1/chat/completions` 的非流式回复会落盘。
+- `chat` 与 `responses` 两条路径行为一致（含流式）；命令的 `prompt_tokens` / `input_tokens` 计 0。
+
+命令的完整设计与取舍见 [doc/bridge_command.md](doc/bridge_command.md)。
+
 ## API 端点
 
 | 方法 | 路径 | 说明 |
@@ -160,6 +191,7 @@ codex --profile gemini
 | GET | `/healthz` | 健康检查与 cluster 状态 |
 | POST | `/session/reset` | 重置指定会话桶 |
 | GET | `/debug/dom` | DOM 调试（受 `GEMINI_DEBUG` 控制，不回显正文） |
+| — | `/bridge ...`（聊天消息） | 桥本地命令，见上文「Bridge 聊天命令」 |
 | GET | `/` | 服务信息 |
 
 ## 配置
@@ -280,6 +312,7 @@ gemini_web/
   session_store.py        会话状态落盘与持久化管理
   page_pool.py            Playwright Page 实例池管理
   completion.py           Chat Completions 逻辑处理与重试驱动
+  bridge_commands.py      /bridge 聊天命令的解析、执行、帮助与状态摘要
   streaming.py            SSE 流式编码
   responses.py            Responses API 映射
   tasks.py                会话桶任务快照
@@ -301,6 +334,8 @@ user_data/                浏览器 profile 与状态（gitignore）
   避免读到被截断的半截回复（读取文本走 `_complete_text`，克隆节点去动画后取全文）。
 - **到顶可区分**：用 `CAP_NOTICE_PATTERNS` 与轮次/token 双阈值判定对话长度上限，不伪装成超时。
 - **选择器外置**：全部集中在 `.env`，网页版改版只改配置、不改代码。
+- **命令本地应答**：`/bridge` 命令由桥自己处理，浏览器不可用时仍可查询状态、重置会话
+  （见 [doc/bridge_command.md](doc/bridge_command.md)）。
 
 ## 故障排查
 
@@ -328,7 +363,7 @@ user_data/                浏览器 profile 与状态（gitignore）
 
 ## 状态
 
-配置、模型、prompting、toolcalls、driver、streaming、responses、server 均已实现；
+配置、模型、prompting、toolcalls、driver、streaming、responses、server、bridge_commands 均已实现；
 doc/tasks.md 的阶段 6–10 已全部落地（含日志改造、依赖固定、CI、鉴权开关与测试补全），
 且已根据 doc/update_pi.md 完成最新分解与对账；
 真实联网对等测试见 doc/e2e_test_design.md（GEMINI_E2E=1 才跑）。

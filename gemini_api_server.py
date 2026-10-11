@@ -8,6 +8,7 @@
     gemini_web/prompting.py   消息 -> 网页输入框文本
     gemini_web/driver.py      Playwright 浏览器 Driver
     gemini_web/streaming.py   SSE 流式编码
+    gemini_web/bridge_commands.py  /bridge 聊天命令（解析 / 执行 / 帮助 / 状态摘要）
     gemini_web/server.py      FastAPI 应用与路由
 
 本文件仅做两件事：把历史公开名字重新导出，以及在直接运行时启动服务。
@@ -52,6 +53,7 @@ from gemini_web.config import (  # noqa: F401
 
 # ---- 数据模型 ----
 from gemini_web.models import (  # noqa: F401
+    advertised_models,
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatMessage,
@@ -81,6 +83,15 @@ from gemini_web.prompting import (  # noqa: F401
     _delta_piece,
     build_prompt,
     estimate_tokens,
+)
+
+# ---- 聊天命令（``/bridge ...``）----
+from gemini_web import bridge_commands  # noqa: F401
+from gemini_web.bridge_commands import (  # noqa: F401
+    BRIDGE_COMMAND,
+    handle_command,
+    is_command,
+    parse_command,
 )
 
 # ---- Driver / 流式 / 路由 ----

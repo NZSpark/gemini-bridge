@@ -27,6 +27,10 @@ class SessionState:
     cap_hit: bool = False
     pending_rotation: bool = False
     last_error: Optional[str] = None
+    # 代码块落盘偏好（``/bridge settings save-files``，按桶持久化）：
+    # None = 未设置（跟随 config.SAVE_FILES），True / False = 该桶显式偏好。
+    # 只影响这个桶的请求参数解析，**不**改进程全局配置。
+    save_files: Optional[bool] = None
     updated_at: int = 0
 
     def to_payload(self) -> Dict[str, Any]:
@@ -47,6 +51,9 @@ class SessionState:
                 setattr(state, name, 0)
         last_error = payload.get("last_error")
         state.last_error = last_error if isinstance(last_error, str) else None
+        # 三态：只认真正的 bool，其余（缺失 / 脏数据）一律回落成“未设置”
+        save_files = payload.get("save_files")
+        state.save_files = save_files if isinstance(save_files, bool) else None
         return state
 
 
@@ -86,6 +93,10 @@ class SessionStoreMixin:
         if bucket == DEFAULT_SESSION_KEY:
             return self.page
         return self._pages.get(bucket)
+
+    def bucket_page(self, key: Optional[str] = None):
+        """``_page_for`` 的公开别名（``/bridge status`` 等只读诊断用）。"""
+        return self._page_for(key)
 
     def sent_prompt(self, key: Optional[str] = None) -> Optional[str]:
         """某个会话桶最近一次真正发给网页版的 prompt（可能因轮转由增量改选播种版）。"""
@@ -232,6 +243,7 @@ class SessionStoreMixin:
             "cap_hit": state.cap_hit,
             "pending_rotation": state.pending_rotation,
             "last_error": state.last_error,
+            "save_files": state.save_files,
             "buckets": self.session_keys(),
         }
 
@@ -243,6 +255,36 @@ class SessionStoreMixin:
         if config.SESSION_MAX_TOKENS and state.est_tokens >= config.SESSION_MAX_TOKENS:
             return True
         return False
+
+    def reseed_session(self, key: Optional[str] = None) -> None:
+        """排队「下一轮把完整历史重新播种一遍」（``/bridge session reseed``）。
+
+        只改状态、不碰页面。``has_history=False`` 就是「下一轮必须播种」的唯一权威
+        标记：它落盘（跨重启有效）、在下一轮成功发送后由 ``chat_io`` 置回 True，
+        因此天然是**一次性**语义——不需要再引入一个临时变量或第二个标志位。
+
+        与 :meth:`reset_session` 的区别：本方法**不换网页会话**，只是把完整历史
+        再发一遍到当前会话里（那条会话会出现重复内容）。
+        """
+        bucket = key or DEFAULT_SESSION_KEY
+        self._state(bucket).has_history = False
+        self._save_session_state(key=bucket)
+        logger.info("[会话] 已排队 key=%s 下一轮重新播种完整历史。", bucket)
+
+    def save_files_preference(self, key: Optional[str] = None) -> Optional[bool]:
+        """该桶的代码块落盘偏好（``None`` = 未设置，跟随 ``config.SAVE_FILES``）。"""
+        return self._state(key).save_files
+
+    def set_save_files_preference(self, value: Optional[bool], key: Optional[str] = None) -> None:
+        """写入该桶的代码块落盘偏好（``None`` = 恢复“跟随全局配置”）。
+
+        只改本桶状态、**不碰全局 config**：否则一条来自单个客户端的聊天命令会改变
+        其它所有客户端的落盘行为。
+        """
+        bucket = key or DEFAULT_SESSION_KEY
+        self._state(bucket).save_files = None if value is None else bool(value)
+        self._save_session_state(key=bucket)
+        logger.info("[命令] key=%s 的代码块落盘偏好已改为 %s。", bucket, value)
 
     def reset_session(self, key: Optional[str] = None) -> None:
         """把某个会话桶标记为“下一轮开新会话”（手动逃生口）。

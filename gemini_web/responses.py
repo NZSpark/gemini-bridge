@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from . import config
+from . import bridge_commands, config
 from .driver import (
     GeminiBusyError,
     GeminiContextLimitError,
@@ -281,10 +281,17 @@ async def run_chat(
     session_key: Optional[str],
     on_delta=None,
 ):
-    """执行一次上游对话，返回 (reply, code_blocks, tool_calls)。
+    """执行一次上游对话，返回 (reply, code_blocks, tool_calls, sent_prompt)。
 
     与 server.py 的 chat 路径共用 driver / prompting / toolcalls，但不改其代码。
+    桥内命令（``/bridge ...``）在这里被识别：整条消息就是那一行命令时，直接返回桥
+    自己的应答，**不发给网页版**（非流式与流式两条路径都经过本函数）。
     """
+    command_reply = await bridge_commands.handle_command(request.messages, driver, session_key)
+    if command_reply is not None:
+        # sent_prompt 用空串：命令没有上游 prompt，usage 里的 prompt_tokens 应计 0
+        return command_reply, [], [], ""
+
     # 任务快照：记录本轮 messages，轮转播种时用它续接任务（不丢任务目标）。
     bucket = session_key or DEFAULT_SESSION_KEY
     tasks.record(bucket, request.messages)
@@ -326,20 +333,22 @@ async def handle_responses(
     """处理 /v1/responses。返回 dict 或 StreamingResponse。"""
     from fastapi.responses import JSONResponse
 
-    if driver.page is None:
-        return JSONResponse(
-            status_code=503,
-            content=_error_payload(
-                "浏览器尚未就绪，请确认已完成登录。", "upstream_error"
-            ),
-        )
-
     chat_req = to_chat_request(req)
     _maybe_register_edit_markdown(chat_req)
     if not chat_req.messages:
         return JSONResponse(
             status_code=400,
             content=_error_payload("input 不能为空", "invalid_request_error"),
+        )
+
+    # 桥内命令（``/bridge ...``）由桥自己应答、不经过网页版：浏览器没起来也必须能答，
+    # 页面失效 / 登录过期时它们正是用户唯一的排障入口。普通提问仍按下面的检查 503。
+    if driver.page is None and not bridge_commands.is_command(chat_req.messages):
+        return JSONResponse(
+            status_code=503,
+            content=_error_payload(
+                "浏览器尚未就绪，请确认已完成登录。", "upstream_error"
+            ),
         )
 
     if req.stream:
