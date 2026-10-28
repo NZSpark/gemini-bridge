@@ -1,0 +1,56 @@
+{
+  "family": "web-to-openai-api",
+  "version": "1.2.4",
+  "description": "把任意 Web 页面包装成 OpenAI 兼容 API 的四阶段工程 skill 家族。**这是 GeminiBridge 的成员侧视图**：共享源（canonical）唯一在 ChatGPTBridge，本文件只提供「共享源在哪、谁是成员」的映射，使 SKILL.md 里记录的命令（check / diff / sync）在**本仓库内**可直接执行。",
+  "canonical_skill": "../../../ChatGPTBridge/skills/web-to-openai-api",
+  "pin_field": "family-source",
+  "frontmatter_stripped": [
+    "SKILL.md"
+  ],
+  "shared": [
+    "SKILL.md",
+    "references/*.md",
+    "scripts/*.py",
+    "tests/*.py"
+  ],
+  "site_specific": [
+    "references/case-study-*.md",
+    "assets/config.template.env",
+    "family.json",
+    "family.local.json",
+    "family-drift-report.md"
+  ],
+  "members": [
+    {
+      "name": "ChatGPTBridge",
+      "skill": ".",
+      "role": "canonical"
+    },
+    {
+      "name": "DeepseekBridge",
+      "skill": "../../../DeepseekBridge/skills/web-to-openai-api",
+      "role": "member"
+    },
+    {
+      "name": "ClaudeBridge",
+      "skill": "../../../ClaudeBridge/skills/web-to-openai-api-skill",
+      "role": "member"
+    },
+    {
+      "name": "GeminiBridge",
+      "skill": "../../../GeminiBridge/skills/web-to-openai-api",
+      "role": "member"
+    },
+    {
+      "name": "GrokBridge",
+      "skill": "../../../GrokBridge/skills/web-to-openai-bridge",
+      "role": "member"
+    }
+  ],
+  "notes": [
+    "共享文件（SKILL.md 正文 / references / scripts / tests）只在 canonical（ChatGPTBridge）里改；",
+    "本仓库是成员：改共享文件只会让 check 报 DRIFT，下一次 sync 会把改动覆盖掉。",
+    "站点专属内容（本项目的 case-study-*.md、assets/config.template.env）就留在这里，不参与共享指纹。",
+    "家族版本号需与 canonical 的 family.json 手动保持一致，否则 check 会按旧版本算期望钉而误报 STALE-PIN。"
+  ]
+}

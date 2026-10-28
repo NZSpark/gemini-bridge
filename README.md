@@ -366,5 +366,6 @@ user_data/                浏览器 profile 与状态（gitignore）
 配置、模型、prompting、toolcalls、driver、streaming、responses、server、bridge_commands 均已实现；
 doc/tasks.md 的阶段 6–10 已全部落地（含日志改造、依赖固定、CI、鉴权开关与测试补全），
 且已根据 doc/update_pi.md 完成最新分解与对账；
+图片上传功能设计见 doc/image_upload.md；
 真实联网对等测试见 doc/e2e_test_design.md（GEMINI_E2E=1 才跑）。
 
