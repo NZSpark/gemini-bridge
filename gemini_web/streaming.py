@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 from . import config
 from .driver import GeminiBusyError, GeminiContextLimitError, GeminiTimeoutError
 from .models import ChatCompletionRequest
-from .prompting import estimate_tokens
+from .prompting import estimate_tokens, extract_images
 from .toolcalls import _tool_names, parse_tool_calls
 
 logger = logging.getLogger(__name__)
@@ -94,6 +94,11 @@ async def _stream_chat_completion(
     async def on_delta(piece: str):
         await queue.put(("delta", piece))
 
+    # 图片：只抽「本轮新增消息」里的图（历史图片已带 [图片] 文本引用行，不重复粘贴）
+    images = []
+    if config.IMAGE_PASTE_ENABLED:
+        images = extract_images(request.messages, only_delta=True)[: config.IMAGE_PASTE_MAX]
+
     async def runner():
         try:
             # 需要工具时先缓冲（等解析出 tool_calls 再决定输出形态），因此不实时吐字
@@ -102,6 +107,7 @@ async def _stream_chat_completion(
                 on_delta=None if wants_tools else on_delta,
                 seeded_prompt=seeded_prompt,
                 key=session_key,
+                images=images,
             )
             await queue.put(("done", (reply, blocks, None, None)))
         except GeminiContextLimitError as exc:

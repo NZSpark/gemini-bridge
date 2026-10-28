@@ -1,6 +1,8 @@
 """把客户端的消息数组转换成网页输入框里的一整段文本，以及若干纯文本工具函数。"""
 
+import base64
 import logging
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from . import config
@@ -10,6 +12,83 @@ from .toolcalls import format_tool_call_emphasis, format_tools_instruction
 logger = logging.getLogger(__name__)
 
 
+# 文本里图片引用的标记（历史图片的兜底锚点，**不含任何字节**）
+MARK_IMAGE = "[图片]"
+
+
+@dataclass(slots=True)
+class ImageAttachment:
+    """一张要粘贴进网页输入框的图片。
+
+    base64 data URI 进来时 ``data`` 已解码为原始字节；远程 URL 进来时只有 ``url``，
+    由 ``chat_io._paste_images`` 惰性下载（走浏览器上下文，复用登录态 / cookie）。
+    """
+
+    name: str
+    mime: str
+    data: Optional[bytes] = None
+    url: Optional[str] = None
+
+
+def _is_image_part(part: Dict[str, Any]) -> bool:
+    """该内容分片是不是一张图片？
+
+    兼容 ``{"type": "image_url", "image_url": ...}``、``{"type": "image"}``
+    以及裸 ``{"image_url": ...}`` 三种写法（不同客户端各写各的）。
+    """
+    if not isinstance(part, dict):
+        return False
+    ptype = part.get("type")
+    if ptype in {"image_url", "image"}:
+        return True
+    return "image_url" in part or "image" in part
+
+
+def _image_url(part: Dict[str, Any]) -> Optional[str]:
+    """从图片分片里取出 URL 字符串（兼容 dict / str / 裸 url 三种形态）。"""
+    if not isinstance(part, dict):
+        return None
+    raw = part.get("image_url")
+    if raw is None:
+        raw = part.get("image")
+    if isinstance(raw, dict):
+        raw = raw.get("url")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    url = part.get("url")
+    if isinstance(url, str) and url.strip():
+        return url.strip()
+    return None
+
+
+def _parse_data_uri(url: str) -> Optional[tuple]:
+    """解析 ``data:<mime>;base64,<payload>`` -> (mime, bytes)；非法返回 None。"""
+    header, _, payload = url.partition(",")
+    if ";base64" not in header or not payload:
+        return None
+    mime = header.removeprefix("data:").split(";", 1)[0] or "application/octet-stream"
+    try:
+        return mime, base64.b64decode(payload, validate=False)
+    except (ValueError, TypeError):
+        return None
+
+
+def _image_reference(part: Dict[str, Any]) -> Optional[str]:
+    """图片在纯文本 prompt 里的引用行（兜底锚点）。
+
+    **绝不写入完整 base64**：只记类型与估算大小，避免 prompt 爆炸与隐私泄漏。
+    """
+    url = _image_url(part)
+    if url is None:
+        return None
+    if url.startswith("data:"):
+        header, _, payload = url.partition(",")
+        media = header.removeprefix("data:").split(";", 1)[0] or "image"
+        approx_kb = max(1, len(payload) * 3 // 4 // 1024)
+        return f"{MARK_IMAGE} ({media}, ~{approx_kb}KB base64)"
+    return f"{MARK_IMAGE} {url}"
+
+
 def _content_to_text(content: Any) -> str:
     """把 OpenAI 的 content 归一化为纯文本。
 
@@ -17,6 +96,8 @@ def _content_to_text(content: Any) -> str:
       - None
       - 字符串
       - 内容分片数组，例如 [{"type": "text", "text": "hi"}]
+
+    图片分片在这里变成一行 ``[图片] …`` 引用（不含字节），文本分片照常拼接。
     """
     if content is None:
         return ""
@@ -28,6 +109,11 @@ def _content_to_text(content: Any) -> str:
             if isinstance(part, str):
                 pieces.append(part)
             elif isinstance(part, dict):
+                if _is_image_part(part):
+                    reference = _image_reference(part)
+                    if reference:
+                        pieces.append(reference)
+                    continue
                 text = part.get("text")
                 if isinstance(text, str):
                     pieces.append(text)
@@ -194,6 +280,67 @@ def _render_message(message: ChatMessage) -> str:
     if message.role == "assistant":
         return f"[你之前的回复]\n{content}"
     return content
+
+
+def _messages_since_last_assistant(messages: List[Any]) -> List[Any]:
+    """返回最后一条 assistant 消息之后的「本轮新增」消息（兼容 dict / 对象）。
+
+    图片只在它**首次出现的那一轮**被粘贴一次：之后轮次重发整段 messages 时，
+    历史图片只保留 ``[图片]`` 文本引用行，不再重复粘进输入框（否则同一张图
+    每轮都被贴一次，输入框里堆满重复附件）。
+    """
+    last = -1
+    for index, message in enumerate(messages):
+        role = message.get("role") if isinstance(message, dict) else getattr(message, "role", None)
+        if role == "assistant":
+            last = index
+    if last < 0 or last + 1 >= len(messages):
+        # 无 assistant / 无新增：退回全部（宁多贴不漏）
+        return list(messages)
+    return list(messages[last + 1:])
+
+
+def extract_images(messages: List[Any], only_delta: bool = False) -> List[ImageAttachment]:
+    """从消息里收集图片分片；base64 解码为字节，URL 保留待惰性下载。
+
+    :param only_delta: True 时只看「本轮新增消息」——图片只粘贴一次（见
+                       ``_messages_since_last_assistant``）。
+    """
+    if not messages:
+        return []
+    if only_delta:
+        messages = _messages_since_last_assistant(messages)
+    attachments: List[ImageAttachment] = []
+    for message in messages:
+        content = (
+            message.get("content")
+            if isinstance(message, dict)
+            else getattr(message, "content", None)
+        )
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not (isinstance(part, dict) and _is_image_part(part)):
+                continue
+            url = _image_url(part)
+            if not url:
+                continue
+            if url.startswith("data:"):
+                parsed = _parse_data_uri(url)
+                if parsed is None:
+                    continue
+                mime, data = parsed
+                if not data:
+                    # 空 / 非法 base64 解出 b""：跳过，不贴 0 字节文件
+                    continue
+                ext = mime.split("/")[-1] or "png"
+                attachments.append(
+                    ImageAttachment(name=f"image.{ext}", mime=mime, data=data)
+                )
+            else:
+                name = url.rsplit("/", 1)[-1].split("?", 1)[0] or "image.png"
+                attachments.append(ImageAttachment(name=name, mime="image/png", url=url))
+    return attachments
 
 
 def _last_assistant_index(messages: List[ChatMessage]) -> int:

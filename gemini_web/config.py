@@ -276,6 +276,16 @@ TASK_KEEP_MESSAGES = env_int("TASK_KEEP_MESSAGES", 8)
 TASK_RECENT_ITEM_MAX_CHARS = env_int("TASK_RECENT_ITEM_MAX_CHARS", 500)
 
 
+# ==================== 图片直传 ====================
+# 是否把请求里的图片（image_url / base64 data URI）以**真实文件**粘贴进网页输入框。
+# 关闭时全部退回纯文本引用行（`[图片] …`），不粘贴。
+IMAGE_PASTE_ENABLED = env_bool("IMAGE_PASTE_ENABLED", True)
+# 单轮最多粘贴几张（0 = 全部降级为文本引用）。
+IMAGE_PASTE_MAX = max(0, env_int("IMAGE_PASTE_MAX", 4))
+# 远程图片 URL 的下载超时（毫秒，走浏览器上下文以便复用登录态）。
+IMAGE_DOWNLOAD_TIMEOUT_MS = max(500, env_int("IMAGE_DOWNLOAD_TIMEOUT_MS", 10_000))
+
+
 # ==================== DOM 选择器 ====================
 # 统一集中在这里，网页版改版时只需改这一处（也可用 .env 覆盖而无需改代码）。
 # 回复节点的候选选择器（逗号分隔的 CSS 列表，直接交给 query_selector_all）

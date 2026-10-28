@@ -28,7 +28,7 @@ from .models import (
     ModelListResponse,
     Usage,
 )
-from .prompting import build_prompt, estimate_tokens
+from .prompting import build_prompt, estimate_tokens, extract_images
 from .responses import ResponsesRequest, handle_responses
 from . import tasks
 from .streaming import _stream_chat_completion, _stream_command_reply
@@ -439,10 +439,16 @@ async def chat_completions(
             },
         )
 
+    # 图片：只抽「本轮新增消息」里的图（历史图片已带 [图片] 文本引用行，不重复粘贴），
+    # 再按 IMAGE_PASTE_MAX 裁剪。关闭开关时 images 为空，全部退回文本引用。
+    images = []
+    if config.IMAGE_PASTE_ENABLED:
+        images = extract_images(request.messages, only_delta=True)[: config.IMAGE_PASTE_MAX]
+
     # ---------- 非流式分支 ----------
     try:
         reply_content, code_blocks = await driver.send_chat(
-            prompt, seeded_prompt=seeded_prompt, key=session_key
+            prompt, seeded_prompt=seeded_prompt, key=session_key, images=images
         )
     except GeminiContextLimitError as exc:
         logger.warning("网页会话已达上下文长度上限：%s", exc)

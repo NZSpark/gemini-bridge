@@ -26,8 +26,13 @@ class ContentToTextTests(unittest.TestCase):
     def test_plain_string_parts(self):
         self.assertEqual(srv._content_to_text(["a", "b"]), "a\nb")
 
-    def test_non_text_parts_are_ignored(self):
+    def test_image_parts_become_reference_line(self):
+        # 图片分片不再被静默丢弃：它变成一行不含字节的 [图片] 引用（兜底锚点）。
         content = [{"type": "image_url", "image_url": {"url": "x"}}, {"text": "kept"}]
+        self.assertEqual(srv._content_to_text(content), "[图片] x\nkept")
+
+    def test_unknown_non_text_parts_are_ignored(self):
+        content = [{"type": "input_audio"}, {"text": "kept"}]
         self.assertEqual(srv._content_to_text(content), "kept")
 
     def test_dict_without_text(self):

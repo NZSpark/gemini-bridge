@@ -128,6 +128,13 @@ class ModelListTests(unittest.TestCase):
         self.assertEqual(card.object, "model")
         self.assertEqual(card.owned_by, "gemini-web-bridge")
 
+    def test_model_card_declares_image_modality(self):
+        """不声明图片输入，客户端会在**请求构建阶段**就把图片静默剥离。"""
+        card = ModelCard(id="gemini-chat")
+        self.assertEqual(card.input_modalities, ["text", "image"])
+        self.assertEqual(card.output_modalities, ["text"])
+        self.assertEqual(card.architecture, {"modality": "text+image->text"})
+
     def test_model_list_object(self):
         listing = ModelListResponse(data=[ModelCard(id="x")])
         self.assertEqual(listing.object, "list")

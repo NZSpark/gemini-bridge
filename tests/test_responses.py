@@ -48,7 +48,7 @@ class FakeDriver:
     def sent_prompt(self, key=None):
         return "prompt"
 
-    async def send_chat(self, prompt, on_delta=None, seeded_prompt=None, key=None):
+    async def send_chat(self, prompt, on_delta=None, seeded_prompt=None, key=None, images=None):
         if on_delta:
             await on_delta(self.reply)
         return self.reply, []
@@ -170,7 +170,7 @@ class PartialStreamDriver(FakeDriver):
         super().__init__(final_reply)  # FakeDriver.reply = final_reply
         self.streamed_piece = streamed_piece
 
-    async def send_chat(self, prompt, on_delta=None, seeded_prompt=None, key=None):
+    async def send_chat(self, prompt, on_delta=None, seeded_prompt=None, key=None, images=None):
         if on_delta:
             await on_delta(self.streamed_piece)
         return self.reply, []

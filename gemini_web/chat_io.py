@@ -88,12 +88,80 @@ class ChunkedInsertUnavailable(RuntimeError):
 
 
 class ChatIOMixin:
+    # 把真实图片文件以**合成 paste 事件**塞进 contenteditable 编辑器。
+    #
+    # 输入框是 contenteditable，不是 <input type=file>，无法用 set_input_files；
+    # 而服务环境没有系统剪贴板，只能在页面内合成事件：
+    #   原始字节 -> File -> DataTransfer -> ClipboardEvent('paste')。
+    # bubbles/composed 让事件穿过 shadow DOM 冒泡到编辑器监听器，cancelable
+    # 允许编辑器 preventDefault，行为更接近真实粘贴。
+    _PASTE_IMAGE_JS = """
+    ([name, mime, bytesArray]) => {
+      const el = document.activeElement
+        || document.querySelector('[contenteditable="true"]');
+      if (!el) return false;
+      const file = new File([new Uint8Array(bytesArray)], name, {type: mime});
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      el.dispatchEvent(new ClipboardEvent('paste', {
+        clipboardData: dt, bubbles: true, cancelable: true, composed: true,
+      }));
+      return true;
+    }
+    """
+
+    async def _download_image(self, url: str) -> Optional[bytes]:
+        """下载远程图片（走浏览器上下文，复用登录态 / cookie）。失败返回 None。"""
+        context = getattr(self, "context", None)
+        if context is None:
+            return None
+        try:
+            response = await context.request.get(
+                url, timeout=config.IMAGE_DOWNLOAD_TIMEOUT_MS
+            )
+            if response.ok:
+                return await response.body()
+            logger.warning("[图片] 下载失败 status=%s url=%s", response.status, url[:80])
+        except Exception as exc:  # noqa: BLE001 下载失败一律降级
+            logger.warning("[图片] 下载异常 %s: url=%s", type(exc).__name__, url[:80])
+        return None
+
+    async def _paste_images(self, page, composer, images: Optional[list]) -> int:
+        """把真实图片文件以合成 paste 事件粘进输入框，返回成功派发的张数。
+
+        任何一步失败（下载失败 / 聚焦失败 / 派发异常）都**只记录日志**，不阻断文本
+        提交：文本 prompt 已带 ``[图片] …`` 引用行，最差情况退回「文本引用」语义。
+        """
+        if not images or not config.IMAGE_PASTE_ENABLED:
+            return 0
+        pasted = 0
+        for image in images:
+            data = getattr(image, "data", None)
+            if data is None and getattr(image, "url", None):
+                data = await self._download_image(image.url)
+            if not data:
+                continue
+            name = getattr(image, "name", None) or "image.png"
+            mime = getattr(image, "mime", None) or "image/png"
+            try:
+                # 粘贴前确保输入框聚焦：否则 document.activeElement 不是编辑器。
+                if composer is not None:
+                    await self._focus_composer(page, composer)
+                ok = await page.evaluate(self._PASTE_IMAGE_JS, [name, mime, list(data)])
+                if ok:
+                    pasted += 1
+                    logger.debug("[图片] 已粘贴 %s（%s, %s 字节）", name, mime, len(data))
+            except Exception as exc:  # noqa: BLE001 粘贴失败一律降级，不阻断提交
+                logger.warning("[图片] 粘贴失败 %s: name=%s", type(exc).__name__, name)
+        return pasted
+
     async def send_chat(
         self,
         prompt: str,
         on_delta=None,
         seeded_prompt: Optional[str] = None,
         key: Optional[str] = None,
+        images: Optional[list] = None,
     ) -> tuple[str, List[dict]]:
         """发送单条消息并获取响应。
 
@@ -102,6 +170,8 @@ class ChatIOMixin:
                               未提供则退回 ``prompt``）
         :param key: 会话桶标识（按任务隔离会话）。不同 key 各自持有一条独立
                     的网页会话与页面，互不污染上下文；None 表示默认桶。
+        :param images: 要粘贴进输入框的图片（``prompting.ImageAttachment`` 列表，
+                       已由上层按 ``IMAGE_PASTE_MAX`` 裁剪、按 only_delta 去重）。
 
         **重试阶梯**（本项目不做 URL 恢复，重试即重开对话 + 播种）：
 
@@ -144,7 +214,7 @@ class ChatIOMixin:
             await self._remember_session(bucket)
             try:
                 return await self._send_chat_locked(
-                    active_prompt, on_delta, key=bucket, seeded=use_seed
+                    active_prompt, on_delta, key=bucket, seeded=use_seed, images=images
                 )
             except GeminiContextLimitError as exc:
                 # 到顶了：下次不要再恢复同一个会话，直接轮转
@@ -1115,7 +1185,8 @@ class ChatIOMixin:
 
     async def _send_chat_locked(self, prompt: str, on_delta=None,
                                 key: Optional[str] = None,
-                                seeded: bool = False) -> tuple[str, List[dict]]:
+                                seeded: bool = False,
+                                images: Optional[list] = None) -> tuple[str, List[dict]]:
         """发送单条消息并获取响应及提取的代码块。
 
         :param on_delta: 可选异步回调，生成过程中实时吐出增量文本（用于 SSE 流式）。
@@ -1171,6 +1242,10 @@ class ChatIOMixin:
                 bucket, "播种" if seeded else "增量", len(prompt),
             )
             chat_input = await self._fill_prompt(page, prompt)
+            # 图片必须在文本写进输入框之后、按 Enter 之前粘进去：编辑器此时已聚焦、
+            # 文本已在框内，合成 paste 会把图片附加到同一条消息上。失败非致命。
+            if images:
+                await self._paste_images(page, chat_input, images)
             await self._submit_prompt(page, chat_input, bucket)
 
             # 2. 轮询等待回复完成

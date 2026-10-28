@@ -33,7 +33,7 @@ class FakeDriver:
     def sent_prompt(self, key=None):
         return "prompt"
 
-    async def send_chat(self, prompt, on_delta=None, seeded_prompt=None, key=None):
+    async def send_chat(self, prompt, on_delta=None, seeded_prompt=None, key=None, images=None):
         return "pong", []
 
     def reset_session(self, key=None):

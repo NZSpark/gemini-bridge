@@ -89,6 +89,16 @@ class ChatCompletionResponse(BaseModel):
     saved_files: List[str] = []
 
 
+# 输入 / 输出模态声明。
+#
+# **这一步不可省略**：若只实现「把图片粘进网页」却不声明能力，OpenAI 兼容客户端
+# （Pi 等）会在**请求构建阶段就把图片静默剥离**——图片根本到不了桥接服务，
+# 用户只会看到「Current model does not support images」。
+INPUT_MODALITIES = ["text", "image"]
+OUTPUT_MODALITIES = ["text"]
+MODALITY = "text+image->text"
+
+
 class ModelCard(BaseModel):
     """模型卡。
 
@@ -103,6 +113,10 @@ class ModelCard(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     owned_by: str = "gemini-web-bridge"
     context_window: Optional[int] = None
+    # 声明支持图片输入，客户端才会把图片真的发过来（见上方 INPUT_MODALITIES 注释）。
+    input_modalities: List[str] = Field(default_factory=lambda: list(INPUT_MODALITIES))
+    output_modalities: List[str] = Field(default_factory=lambda: list(OUTPUT_MODALITIES))
+    architecture: Dict[str, Any] = Field(default_factory=lambda: {"modality": MODALITY})
 
 
 class ModelListResponse(BaseModel):
